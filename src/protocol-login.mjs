@@ -411,7 +411,8 @@ async function run() {
       }
       return;
     }
-    if (args.setupTotp) {
+    if (args.setupTotp || args.replaceTotp) {
+      const replaceExisting = Boolean(args.replaceTotp);
       const resultPath = path.resolve(args.totpResult || DEFAULT_TOTP_RESULT);
       const rl = readline.createInterface({ input, output });
       try {
@@ -450,6 +451,7 @@ async function run() {
               rl,
               deviceId: web?.deviceId || client.jar.value("oai-did", `${chatgptBase}/`) || crypto.randomUUID(),
               resultPath,
+              replaceExisting,
             });
           } catch (error) {
             if (!isExpiredCheckpointError(error)) throw error;
@@ -474,6 +476,7 @@ async function run() {
             rl,
             deviceId: web.deviceId,
             resultPath,
+            replaceExisting,
           });
         }
         console.log(
@@ -822,8 +825,11 @@ function isNewPasswordPage(value) {
   }
 }
 
-async function setupChatgptTotp(client, { chatgptBase, email, rl, deviceId, resultPath }) {
-  console.log("[2/3] Check current 2FA status");
+async function setupChatgptTotp(
+  client,
+  { chatgptBase, email, rl, deviceId, resultPath, replaceExisting = false },
+) {
+  console.log(replaceExisting ? "[2/4] Check current 2FA status before replacement" : "[2/3] Check current 2FA status");
   const enablePage = await client.follow(`${chatgptBase}/?action=enable&factor=totp`, {
     referer: `${chatgptBase}/`,
   });
@@ -833,44 +839,119 @@ async function setupChatgptTotp(client, { chatgptBase, email, rl, deviceId, resu
   }
 
   const infoUrl = `${chatgptBase}/backend-api/accounts/mfa_info`;
-  const { data: currentInfo } = await client.getJson("GET", infoUrl, {
-    headers: chatgptMfaHeaders({ chatgptBase, accessToken, deviceId }, "/backend-api/accounts/mfa_info"),
-    referer: `${chatgptBase}/`,
-  });
-  if (hasEnabledTotp(currentInfo)) {
+  const mfaContext = { chatgptBase, accessToken, deviceId };
+  const currentInfo = await getChatgptMfaInfo(client, infoUrl, mfaContext);
+  const currentFactorId = getNativeTotpFactorId(currentInfo);
+  const previousRotation = replaceExisting ? await readTotpRotationResult(resultPath) : null;
+  const canResumeDisabledRotation = Boolean(
+    replaceExisting
+    && previousRotation?.operation === "replace_totp"
+    && previousRotation?.activation_succeeded !== true
+    && (
+      previousRotation?.remote_disabled === true
+      // The process can stop after the remote disable succeeds but before the
+      // follow-up result write. In that window the durable marker is still
+      // `stage=disabling`; mfa_info is the source of truth on the next run.
+      || previousRotation?.stage === "disabling"
+    )
+    && !hasEnabledTotp(currentInfo),
+  );
+  if (hasEnabledTotp(currentInfo) && !replaceExisting) {
     await writePrivateJson(resultPath, { version: 1, already_enabled: true, email });
     console.log("[2fa-already-enabled] This account already has TOTP 2FA enabled.");
     return;
   }
+  if (replaceExisting && !hasEnabledTotp(currentInfo) && !canResumeDisabledRotation) {
+    throw new Error("TOTP_REPLACE_NOT_ENABLED: The account does not have an enabled TOTP factor to replace");
+  }
+  if (replaceExisting && !canResumeDisabledRotation && !currentFactorId) {
+    throw new Error("TOTP_REPLACE_FACTOR_MISSING: The current TOTP factor ID was not returned by mfa_info");
+  }
 
-  const { data: enrollment } = await client.getJson(
-    "POST",
-    `${chatgptBase}/backend-api/accounts/mfa/enroll`,
-    {
-      headers: chatgptMfaHeaders({ chatgptBase, accessToken, deviceId }, "/backend-api/accounts/mfa/enroll"),
-      origin: chatgptBase,
-      referer: `${chatgptBase}/`,
-      json: { factor_type: "totp" },
-    },
-  );
+  const operation = replaceExisting ? "replace_totp" : "setup_totp";
+  let rotationState = {
+    ...(canResumeDisabledRotation ? previousRotation : {}),
+    version: 1,
+    already_enabled: false,
+    operation,
+    activation_mode: "automatic",
+    activation_succeeded: false,
+    confirmation_succeeded: false,
+    email,
+  };
+
+  if (replaceExisting && !canResumeDisabledRotation) {
+    rotationState = {
+      ...rotationState,
+      previous_factor_id: currentFactorId,
+      remote_disabled: false,
+      stage: "disabling",
+    };
+    await writePrivateJson(resultPath, rotationState);
+    console.log("[2/4] Disable the current TOTP factor");
+    await disableChatgptTotp(client, chatgptBase, mfaContext, currentFactorId);
+    rotationState = {
+      ...rotationState,
+      remote_disabled: true,
+      disabled_at: new Date().toISOString(),
+      stage: "disabled",
+    };
+    await writePrivateJson(resultPath, rotationState);
+
+    const { data: afterDisable } = await getChatgptMfaInfo(client, infoUrl, mfaContext, { raw: true });
+    if (hasEnabledTotp(afterDisable)) {
+      rotationState = { ...rotationState, stage: "disable_unconfirmed" };
+      await writePrivateJson(resultPath, rotationState);
+      throw new Error("TOTP_REPLACE_DISABLE_UNCONFIRMED: mfa_info still reports the previous TOTP factor");
+    }
+  } else if (canResumeDisabledRotation) {
+    rotationState = {
+      ...rotationState,
+      remote_disabled: true,
+      disabled_at: rotationState.disabled_at || new Date().toISOString(),
+      stage: "disabled",
+    };
+    await writePrivateJson(resultPath, rotationState);
+    console.log("[2fa] Resuming replacement after the previous factor was disabled.");
+  }
+
+  const enrollStep = replaceExisting ? "[3/4] Enroll a new TOTP factor" : "[2/3] Enroll a new TOTP factor";
+  console.log(enrollStep);
+  let enrollment;
+  try {
+    ({ data: enrollment } = await client.getJson(
+      "POST",
+      `${chatgptBase}/backend-api/accounts/mfa/enroll`,
+      {
+        headers: chatgptMfaHeaders(mfaContext, "/backend-api/accounts/mfa/enroll"),
+        origin: chatgptBase,
+        referer: `${chatgptBase}/`,
+        json: { factor_type: "totp" },
+      },
+    ));
+  } catch (error) {
+    rotationState = { ...rotationState, stage: "enroll_failed", enrollment_error: String(error?.message || "") };
+    await writePrivateJson(resultPath, rotationState);
+    throw error;
+  }
   const secret = normalizeEnrolledTotpSecret(enrollment?.secret);
   const sessionId = typeof enrollment?.session_id === "string" ? enrollment.session_id : "";
   if (!secret || !sessionId) {
+    rotationState = { ...rotationState, stage: "enroll_invalid" };
+    await writePrivateJson(resultPath, rotationState);
     throw new Error("TOTP_ENROLL_INVALID: The 2FA enrollment response did not include a valid key and session ID");
   }
   const otpauthUri = buildTotpUri(email, secret);
-  await writePrivateJson(resultPath, {
-    version: 1,
-    already_enabled: false,
-    activation_mode: "automatic",
-    activation_succeeded: false,
-    email,
+  rotationState = {
+    ...rotationState,
+    stage: "activation_pending",
     secret,
     otpauth_uri: otpauthUri,
-  });
+  };
+  await writePrivateJson(resultPath, rotationState);
   console.log("[2fa-setup-ready] 2FA key created; activating it automatically.");
 
-  console.log("[3/3] Activate TOTP 2FA");
+  console.log(replaceExisting ? "[4/4] Activate and confirm the replacement TOTP factor" : "[3/3] Activate TOTP 2FA");
   let code = generateTotp(secret);
   let generatedFromSecret = true;
   console.log("[2fa] Generated a current 6-digit activation code from the new 2FA key.");
@@ -880,27 +961,21 @@ async function setupChatgptTotp(client, { chatgptBase, email, rl, deviceId, resu
         "POST",
         `${chatgptBase}/backend-api/accounts/mfa/user/activate_enrollment`,
         {
-          headers: chatgptMfaHeaders({
-            chatgptBase,
-            accessToken,
-            deviceId,
-          }, "/backend-api/accounts/mfa/user/activate_enrollment"),
+          headers: chatgptMfaHeaders(mfaContext, "/backend-api/accounts/mfa/user/activate_enrollment"),
           origin: chatgptBase,
           referer: `${chatgptBase}/`,
           json: { code, factor_type: "totp", session_id: sessionId },
         },
       );
       if (activation?.success === true) {
-        await writePrivateJson(resultPath, {
-          version: 1,
-          already_enabled: false,
-          activation_mode: "automatic",
+        rotationState = {
+          ...rotationState,
+          stage: "activated",
           activation_succeeded: true,
+          ...(replaceExisting ? { remote_disabled: false } : {}),
           activated_at: new Date().toISOString(),
-          email,
-          secret,
-          otpauth_uri: otpauthUri,
-        });
+        };
+        await writePrivateJson(resultPath, rotationState);
         break;
       }
       console.log(
@@ -909,7 +984,11 @@ async function setupChatgptTotp(client, { chatgptBase, email, rl, deviceId, resu
           : "[warn] 2FA setup code was rejected; enter a new code or type q to quit.",
       );
     } catch (error) {
-      if (!/activate_enrollment failed with HTTP 400/i.test(String(error?.message || ""))) throw error;
+      if (!/activate_enrollment failed with HTTP 400/i.test(String(error?.message || ""))) {
+        rotationState = { ...rotationState, stage: "activation_failed", activation_error: String(error?.message || "") };
+        await writePrivateJson(resultPath, rotationState);
+        throw error;
+      }
       console.log(
         generatedFromSecret
           ? "[warn] The automatically generated 2FA setup code was rejected; enter a current code manually."
@@ -917,20 +996,55 @@ async function setupChatgptTotp(client, { chatgptBase, email, rl, deviceId, resu
       );
     }
     generatedFromSecret = false;
-    code = await askSetupTotpOtp(rl);
+    try {
+      code = await askSetupTotpOtp(rl);
+    } catch (error) {
+      rotationState = { ...rotationState, stage: "activation_failed", activation_error: String(error?.message || "") };
+      await writePrivateJson(resultPath, rotationState);
+      throw error;
+    }
   }
   try {
-    const { data: confirmedInfo } = await client.getJson("GET", infoUrl, {
-      headers: chatgptMfaHeaders({ chatgptBase, accessToken, deviceId }, "/backend-api/accounts/mfa_info"),
-      referer: `${chatgptBase}/`,
-    });
-    if (!hasEnabledTotp(confirmedInfo)) {
+    const { data: confirmedInfo } = await getChatgptMfaInfo(client, infoUrl, mfaContext, { raw: true });
+    const confirmed = hasEnabledTotp(confirmedInfo);
+    rotationState = {
+      ...rotationState,
+      stage: confirmed ? "confirmed" : "confirmation_failed",
+      confirmation_succeeded: confirmed,
+      confirmed_at: confirmed ? new Date().toISOString() : undefined,
+    };
+    await writePrivateJson(resultPath, rotationState);
+    if (!confirmed) {
       console.log("[warn] 2FA activation succeeded, but the follow-up status response did not confirm it.");
     }
   } catch (error) {
+    rotationState = {
+      ...rotationState,
+      stage: "confirmation_failed",
+      confirmation_error: String(error?.message || ""),
+    };
+    await writePrivateJson(resultPath, rotationState);
     console.log(`[warn] 2FA activation succeeded, but the follow-up status check failed: ${error.message}`);
   }
-  console.log("[ok] 2FA setup activated");
+  console.log(replaceExisting ? "[ok] 2FA replacement activated" : "[ok] 2FA setup activated");
+}
+
+async function getChatgptMfaInfo(client, infoUrl, context, options = {}) {
+  const result = await client.getJson("GET", infoUrl, {
+    headers: chatgptMfaHeaders(context, "/backend-api/accounts/mfa_info"),
+    referer: `${context.chatgptBase}/`,
+  });
+  return options.raw ? result : result.data;
+}
+
+async function disableChatgptTotp(client, chatgptBase, context, factorId) {
+  const result = await client.request("POST", `${chatgptBase}/backend-api/accounts/mfa/user/disable_in_house`, {
+    headers: chatgptMfaHeaders(context, "/backend-api/accounts/mfa/user/disable_in_house"),
+    origin: chatgptBase,
+    referer: `${chatgptBase}/`,
+    json: { factor_id: factorId },
+  });
+  assertOk(result, "POST /backend-api/accounts/mfa/user/disable_in_house");
 }
 
 function chatgptMfaHeaders({ chatgptBase, accessToken, deviceId }, targetPath) {
@@ -971,10 +1085,25 @@ function buildTotpUri(email, secret) {
 
 function hasEnabledTotp(info) {
   return Boolean(
-    info?.mfa_enabled_v2
-    && Array.isArray(info?.factors?.totp)
-    && info.factors.totp.some((factor) => factor?.factor_type === "totp" || factor?.id),
+    (info?.mfa_enabled_v2 === true || info?.mfa_enabled === true)
+    && (
+      (Array.isArray(info?.factors?.totp)
+        && info.factors.totp.some((factor) => factor?.factor_type === "totp" || factor?.id))
+      || typeof info?.native_default_factor_id === "string"
+    ),
   );
+}
+
+function getNativeTotpFactorId(info) {
+  const nativeId = typeof info?.native_default_factor_id === "string"
+    ? info.native_default_factor_id.trim()
+    : "";
+  const factors = Array.isArray(info?.factors?.totp) ? info.factors.totp : [];
+  const factorIds = factors
+    .map((factor) => typeof factor?.id === "string" ? factor.id.trim() : "")
+    .filter(Boolean);
+  if (nativeId && (!factorIds.length || factorIds.includes(nativeId))) return nativeId;
+  return factorIds[0] || "";
 }
 
 async function askSetupTotpOtp(rl) {
@@ -1700,6 +1829,7 @@ async function buildSub2apiOauthExport({
 
   const claims = decodeJwtPayload(tokenSet.id_token);
   const authClaims = claims["https://api.openai.com/auth"] || {};
+  const planType = planTypeFromClaims(claims) || planTypeFromJwt(tokenSet.access_token);
   const email = claims.email || "";
   const chatgptAccountId = claims.sid || "";
   const chatgptUserId = authClaims.user_id || claims.sub || "";
@@ -1713,6 +1843,7 @@ async function buildSub2apiOauthExport({
       email,
       id_token: tokenSet.id_token,
       refresh_token: tokenSet.refresh_token,
+      ...(planType ? { plan_type: planType } : {}),
     },
     extra: {
       account_id: chatgptAccountId,
@@ -1720,6 +1851,7 @@ async function buildSub2apiOauthExport({
       chatgpt_user_id: chatgptUserId,
       client_id: clientId,
       email,
+      ...(planType ? { plan_type: planType } : {}),
       openai_long_context_billing_enabled: false,
       openai_oauth_responses_websockets_v2_enabled: false,
       openai_oauth_responses_websockets_v2_mode: "off",
@@ -1817,6 +1949,7 @@ async function refreshSub2apiOauthExport({ authBase, sourcePath, targetPath, fal
     try {
       const claims = decodeJwtPayload(credentials.id_token);
       const authClaims = claims["https://api.openai.com/auth"] || {};
+      const planType = planTypeFromClaims(claims) || planTypeFromJwt(credentials.access_token);
       const accountId = claims.sid || credentials.chatgpt_account_id || "";
       const userId = authClaims.user_id || claims.sub || account?.extra?.chatgpt_user_id || "";
       const email = claims.email || credentials.email || account?.extra?.email || "";
@@ -1829,7 +1962,9 @@ async function refreshSub2apiOauthExport({ authBase, sourcePath, targetPath, fal
         chatgpt_user_id: userId,
         client_id: clientId,
         email,
+        ...(planType ? { plan_type: planType } : {}),
       };
+      if (planType) credentials.plan_type = planType;
       if (email) account.name = buildAccountName(email);
     } catch {
       // Keep the existing account metadata if the provider omits or changes the ID token format.
@@ -1996,6 +2131,31 @@ function decodeJwtPayload(jwt) {
   return JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
 }
 
+function planTypeFromClaims(claims) {
+  const authClaims = claims?.["https://api.openai.com/auth"];
+  return normalizePlanType(
+    authClaims?.chatgpt_plan_type
+      || authClaims?.plan_type
+      || claims?.["https://api.openai.com/auth.chatgpt_plan_type"]
+      || claims?.chatgpt_plan_type
+      || claims?.plan_type,
+  );
+}
+
+function planTypeFromJwt(jwt) {
+  if (!jwt) return "";
+  try {
+    return planTypeFromClaims(decodeJwtPayload(jwt));
+  } catch {
+    return "";
+  }
+}
+
+function normalizePlanType(value) {
+  const text = String(value || "").trim();
+  return text.length > 0 && text.length <= 128 ? text : "";
+}
+
 function buildAccountName(email) {
   return email ? `oauth---${email}` : `oauth---${new Date().toISOString()}`;
 }
@@ -2152,6 +2312,15 @@ async function writePrivateJson(filePath, data) {
   await fs.chmod(filePath, 0o600);
 }
 
+async function readTotpRotationResult(filePath) {
+  try {
+    const data = JSON.parse(await fs.readFile(filePath, "utf8"));
+    return data && data.version === 1 ? data : null;
+  } catch {
+    return null;
+  }
+}
+
 async function writeJsonAtomic(filePath, data, options = {}) {
   await fs.mkdir(path.dirname(filePath), { recursive: true });
   const tempPath = `${filePath}.${process.pid}.${crypto.randomUUID()}.tmp`;
@@ -2220,6 +2389,7 @@ function parseArgs(argv) {
     else if (item === "--debug-auth") args.debugAuth = true;
     else if (item === "--web-only") args.webOnly = true;
     else if (item === "--setup-totp") args.setupTotp = true;
+    else if (item === "--replace-totp") args.replaceTotp = true;
     else if (item === "--add-password") args.addPassword = true;
     else if (item.startsWith("--password-add-result=")) args.passwordAddResult = item.slice("--password-add-result=".length);
     else if (item === "--password-add-result") args.passwordAddResult = argv[++i];
@@ -2362,6 +2532,7 @@ Options:
   --phone <phone>                 Phone number in E.164 format. If omitted, prompt when needed.
   --web-only                      Only complete ChatGPT web login, skip Codex OAuth.
   --setup-totp                    Sign in and set up TOTP 2FA; skip Codex OAuth.
+  --replace-totp                  Disable the current TOTP factor, enroll a new one, and activate it.
   --totp-result <file>            Private 2FA setup result. Default: ${DEFAULT_TOTP_RESULT}
   --add-password                  Sign in and add a password to a passwordless account.
   --password-add-result <file>    Private add-password result. Default: ${DEFAULT_PASSWORD_ADD_RESULT}

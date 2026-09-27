@@ -99,11 +99,26 @@ try {
     proxyUrl: "",
   });
 
-  const unsupportedStore = createCredentialStore({ platform: "linux" });
+  const unsupportedStore = createCredentialStore({ platform: "linux", linuxKey: "" });
   await assert.rejects(
     unsupportedStore.save(email, credentials),
-    (error) => error.status === 501 && error.message.includes("Windows DPAPI"),
+    (error) => error.status === 501 && error.message.includes("TOSUB2_CREDENTIAL_KEY"),
   );
+
+  const linuxRoot = path.join(tempRoot, "linux");
+  const linuxStore = createCredentialStore({ platform: "linux", linuxRoot, linuxKey: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" });
+  await linuxStore.save(email, credentials);
+  assert.deepEqual(await linuxStore.load(email), credentials);
+  const linuxFiles = await fs.readdir(linuxRoot);
+  assert.equal(linuxFiles.length, 1);
+  const linuxEncrypted = await fs.readFile(path.join(linuxRoot, linuxFiles[0]), "utf8");
+  assert.equal(linuxEncrypted.includes(credentials.password), false);
+  assert.equal(linuxEncrypted.includes(credentials.proxyUrl), false);
+  const linuxNoKeyStore = createCredentialStore({ platform: "linux", linuxRoot, linuxKey: "" });
+  await linuxNoKeyStore.delete(email);
+  assert.deepEqual(await linuxStore.load(email), { password: "", totpSecret: "", proxyUrl: "" });
+  await linuxStore.delete(email);
+  assert.deepEqual(await linuxStore.load(email), { password: "", totpSecret: "", proxyUrl: "" });
 } finally {
   await fs.rm(tempRoot, { recursive: true, force: true });
 }

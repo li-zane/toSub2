@@ -7,6 +7,7 @@ import { spawn } from "node:child_process";
 const KEYCHAIN_SERVICE = "com.local.chatgpt-onboarding.credentials";
 const MAC_CREDENTIAL_ROOT = path.join(os.homedir(), "Library", "Application Support", "toSub2", "credentials");
 const WINDOWS_ENTROPY = "toSub2.credentials.v1";
+const LINUX_CREDENTIAL_ROOT = path.join(os.homedir(), ".local", "share", "toSub2", "credentials");
 
 const WINDOWS_PROTECT_SCRIPT = String.raw`
 $ErrorActionPreference = "Stop"
@@ -44,6 +45,10 @@ export function createCredentialStore(options = {}) {
   const platform = options.platform || process.platform;
   const windowsRoot = path.resolve(options.windowsRoot || defaultWindowsCredentialRoot());
   const macRoot = path.resolve(options.macRoot || process.env.TOSUB2_MAC_CREDENTIAL_ROOT || MAC_CREDENTIAL_ROOT);
+  const linuxRoot = path.resolve(options.linuxRoot || process.env.TOSUB2_LINUX_CREDENTIAL_ROOT || LINUX_CREDENTIAL_ROOT);
+  const linuxKey = normalizeLinuxCredentialKey(
+    Object.hasOwn(options, "linuxKey") ? options.linuxKey : process.env.TOSUB2_CREDENTIAL_KEY,
+  );
   const securityRunner = options.securityRunner || runSecurity;
   const powerShellRunner = options.powerShellRunner || runPowerShell;
 
@@ -74,6 +79,11 @@ export function createCredentialStore(options = {}) {
         await fs.writeFile(filePath, `${result.stdout.trim()}\n`, { mode: 0o600 });
         return;
       }
+      if (platform === "linux") {
+        if (!linuxKey) throw credentialError(501, "Linux 持久保存登录凭据需要配置 64 位十六进制或 32 字节 Base64 的 TOSUB2_CREDENTIAL_KEY");
+        await saveLinuxCredential(linuxRoot, email, payload, linuxKey);
+        return;
+      }
       throw credentialError(501, "持久保存登录凭据和代理配置目前支持 macOS Keychain（钥匙串）和 Windows DPAPI（数据保护接口）");
     },
 
@@ -95,6 +105,10 @@ export function createCredentialStore(options = {}) {
         } catch {
           return emptyCredentials();
         }
+      }
+      if (platform === "linux") {
+        if (!linuxKey) return emptyCredentials();
+        return loadLinuxCredential(linuxRoot, email, linuxKey);
       }
       return emptyCredentials();
     },
@@ -122,6 +136,14 @@ export function createCredentialStore(options = {}) {
             throw credentialError(500, "无法删除 Windows DPAPI（数据保护接口）凭据文件");
           }
         }
+        return;
+      }
+      if (platform === "linux") {
+        try {
+          await fs.unlink(linuxCredentialPath(linuxRoot, email));
+        } catch (error) {
+          if (error?.code !== "ENOENT") throw credentialError(500, "无法删除 Linux 凭据文件");
+        }
       }
     },
   };
@@ -140,6 +162,60 @@ function windowsCredentialPath(root, email) {
 function macCredentialPath(root, email) {
   const id = crypto.createHash("sha256").update(credentialAccount(email)).digest("hex");
   return path.join(root, `${id}.enc`);
+}
+
+function linuxCredentialPath(root, email) {
+  const id = crypto.createHash("sha256").update(credentialAccount(email)).digest("hex");
+  return path.join(root, `${id}.enc`);
+}
+
+function normalizeLinuxCredentialKey(value) {
+  if (Buffer.isBuffer(value) && value.length === 32) return Buffer.from(value);
+  const text = String(value || "").trim();
+  if (!text) return null;
+  if (/^[A-Fa-f0-9]{64}$/.test(text)) return Buffer.from(text, "hex");
+  try {
+    const decoded = Buffer.from(text, "base64");
+    if (decoded.length === 32 && decoded.toString("base64").replace(/=+$/, "") === text.replace(/=+$/, "")) {
+      return decoded;
+    }
+  } catch {}
+  return null;
+}
+
+async function saveLinuxCredential(root, email, payload, key) {
+  const encrypted = encryptCredentialPayload(key, payload);
+  await fs.mkdir(root, { recursive: true, mode: 0o700 });
+  try {
+    await fs.chmod(root, 0o700);
+  } catch {}
+  const filePath = linuxCredentialPath(root, email);
+  const tempPath = `${filePath}.${process.pid}.${crypto.randomUUID()}.tmp`;
+  try {
+    await fs.writeFile(tempPath, `${JSON.stringify({ version: 1, ...encrypted })}\n`, { mode: 0o600 });
+    await fs.rename(tempPath, filePath);
+    try {
+      await fs.chmod(filePath, 0o600);
+    } catch {}
+  } catch (error) {
+    await fs.rm(tempPath, { force: true }).catch(() => {});
+    throw credentialError(500, `无法写入 Linux 凭据文件：${error.message}`);
+  }
+}
+
+async function loadLinuxCredential(root, email, key) {
+  let encrypted;
+  try {
+    encrypted = JSON.parse(await fs.readFile(linuxCredentialPath(root, email), "utf8"));
+  } catch {
+    return emptyCredentials();
+  }
+  try {
+    if (encrypted?.version !== 1) return emptyCredentials();
+    return parseCredentialPayload(decryptCredentialPayload(key, encrypted));
+  } catch {
+    return emptyCredentials();
+  }
 }
 
 async function saveMacCredential(root, email, payload, securityRunner) {

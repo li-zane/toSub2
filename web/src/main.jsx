@@ -10,6 +10,8 @@ import {
   CircleAlert,
   Copy,
   Download,
+  Eye,
+  EyeOff,
   ExternalLink,
   FileText,
   Filter,
@@ -108,6 +110,7 @@ function App() {
   });
   const [uploadNotice, setUploadNotice] = useState("");
   const [accountProxyUrl, setAccountProxyUrl] = useState(() => readLocalTextSetting(ACCOUNT_PROXY_STORAGE_KEY));
+  const [credentialJob, setCredentialJob] = useState(null);
 
   useEffect(() => writeLocalJson(SMS_PROVIDER_SETTINGS_KEY, smsSettings), [smsSettings]);
   useEffect(() => writeLocalJson(MAIL_REQUEST_SETTINGS_KEY, mailRequestSettings), [mailRequestSettings]);
@@ -152,6 +155,7 @@ function App() {
           : await apiFetch(token, `/api/jobs?page=${page}`);
         if (!stopped) {
           setJobs(data.jobs);
+          setCredentialJob((current) => data.jobs.find((job) => job.id === current?.id) || current);
           setJobSelectionIndex(data.selection || data.jobs);
           setPagination(data.pagination || { page, pageSize: 20, total: data.jobs.length, totalPages: 1 });
           setStats(data.stats || { active: 0, queued: 0, completed: 0 });
@@ -205,6 +209,9 @@ function App() {
     () => jobSelectionIndex.filter((job) => selectedJobIds.has(job.id)),
     [jobSelectionIndex, selectedJobIds],
   );
+  const activeCredentialJob = credentialJob
+    ? jobs.find((job) => job.id === credentialJob.id) || credentialJob
+    : null;
   const downloadableSelectedCount = selectedJobs.filter((job) => job.canDownload).length;
   const allPageSelected = pageJobIds.length > 0 && pageJobIds.every((id) => selectedJobIds.has(id));
   const canDownloadSelected = selectedJobs.length > 0 && selectedJobs.length === selectedJobIds.size
@@ -949,6 +956,7 @@ function App() {
                   />
                 </th>
                 <th>账号</th>
+                <th>Plan type</th>
                 <th>状态</th>
                 <th>当前操作</th>
                 <th>开始时间</th>
@@ -977,10 +985,12 @@ function App() {
                     passwordAddAvailable={Boolean(features.passwordAdd)}
                     forceReloginAvailable={Boolean(features.forceRelogin)}
                     accountProxyUrl={accountProxyUrl}
+                    credentialsAvailable={Boolean(features.credentialDetails)}
+                    onOpenCredentials={() => setCredentialJob(job)}
                   />
                   {expandedJobId === job.id && (
                     <tr className="log-row">
-                      <td colSpan="7"><JobLogs token={token} jobId={job.id} /></td>
+                      <td colSpan="8"><JobLogs token={token} jobId={job.id} /></td>
                     </tr>
                   )}
                 </React.Fragment>
@@ -1000,6 +1010,17 @@ function App() {
           </nav>
         )}
       </section>
+      {activeCredentialJob && (
+          <CredentialDialog
+          key={activeCredentialJob.id}
+          token={token}
+          job={activeCredentialJob}
+          accountProxyUrl={accountProxyUrl}
+          totpReplaceAvailable={Boolean(features.totpReplace)}
+          onClose={() => setCredentialJob(null)}
+          onError={setError}
+        />
+      )}
       {smsSettingsOpen && (
         <div className="modal-backdrop" role="presentation" onMouseDown={(event) => {
           if (event.target === event.currentTarget) setSmsSettingsOpen(false);
@@ -1469,7 +1490,7 @@ function App() {
 function EmptyState({ filtered = false }) {
   return (
     <tr>
-      <td colSpan="7">
+      <td colSpan="8">
         <div className="empty-state">
           <div><Mail size={24} /></div>
           <h3>{filtered ? "没有匹配账号" : "暂无授权任务"}</h3>
@@ -1480,7 +1501,7 @@ function EmptyState({ filtered = false }) {
   );
 }
 
-function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggleSelected, selectionSupported, smsProviderAvailable, smsProvider, onUpload, sub2apiUploadAvailable, totpSetupAvailable, passwordAddAvailable, forceReloginAvailable, accountProxyUrl }) {
+function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggleSelected, selectionSupported, smsProviderAvailable, smsProvider, onUpload, sub2apiUploadAvailable, totpSetupAvailable, passwordAddAvailable, forceReloginAvailable, accountProxyUrl, credentialsAvailable, onOpenCredentials }) {
   const [value, setValue] = useState("");
   const [submitting, setSubmitting] = useState(false);
 
@@ -1647,6 +1668,9 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
           <LoginMethodBadge job={job} />
         </div>
       </td>
+      <td className={`plan-cell ${job.planType ? "" : "unknown"}`}>
+        {job.planType || "未知"}
+      </td>
       <td><StatusBadge status={job.status} /></td>
       <td className="step-cell">
         <div className="prompt-line">{job.prompt}</div>
@@ -1742,6 +1766,11 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
       </td>
       <td>
         <div className="row-actions">
+          {credentialsAvailable && (
+            <button type="button" className="icon-button" onClick={onOpenCredentials} disabled={submitting} title="查看或修改账号凭据">
+              <KeyRound size={17} />
+            </button>
+          )}
           {job.canDownload && (
             <button type="button" className="download-button" onClick={download}>
               <Download size={16} />下载
@@ -1820,6 +1849,194 @@ function JobLogs({ token, jobId }) {
     <div className="log-panel">
       <div className="log-title"><FileText size={15} />协议日志</div>
       <pre>{logs}</pre>
+    </div>
+  );
+}
+
+function CredentialDialog({ token, job, accountProxyUrl, totpReplaceAvailable, onClose, onError }) {
+  const [details, setDetails] = useState(null);
+  const [password, setPassword] = useState("");
+  const [totpSecret, setTotpSecret] = useState("");
+  const [passwordDirty, setPasswordDirty] = useState(false);
+  const [totpDirty, setTotpDirty] = useState(false);
+  const [showPassword, setShowPassword] = useState(false);
+  const [showTotp, setShowTotp] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [replacing, setReplacing] = useState(false);
+  const [dialogError, setDialogError] = useState("");
+  const [notice, setNotice] = useState("");
+
+  useEffect(() => {
+    let stopped = false;
+    setLoading(true);
+    setDialogError("");
+    setNotice("");
+    apiFetch(token, `/api/jobs/${job.id}/credentials`)
+      .then((data) => {
+        if (stopped) return;
+        const next = data.credentials || {};
+        setDetails(next);
+        setPassword(next.password || "");
+        setTotpSecret(next.totpSecret || "");
+        setPasswordDirty(false);
+        setTotpDirty(false);
+      })
+      .catch((error) => {
+        if (!stopped) setDialogError(error.message);
+      })
+      .finally(() => {
+        if (!stopped) setLoading(false);
+      });
+    return () => {
+      stopped = true;
+    };
+  }, [job.id, token]);
+
+  async function save(event) {
+    event.preventDefault();
+    const body = {};
+    if (passwordDirty) body.password = password;
+    if (totpDirty) {
+      const normalized = totpSecret.toUpperCase().replace(/[\s=]/g, "");
+      if (!/^[A-Z2-7]{16,128}$/.test(normalized)) {
+        setDialogError("2FA 密钥必须是 16 到 128 位 Base32 字符");
+        return;
+      }
+      body.totpSecret = normalized;
+    }
+    if (!Object.keys(body).length) {
+      setNotice("没有需要保存的修改");
+      return;
+    }
+    setSaving(true);
+    setDialogError("");
+    setNotice("");
+    try {
+      const data = await apiFetch(token, `/api/jobs/${job.id}/credentials`, {
+        method: "PUT",
+        body: JSON.stringify(body),
+      });
+      const next = data.credentials || {};
+      setDetails(next);
+      setPassword(next.password || "");
+      setTotpSecret(next.totpSecret || "");
+      setPasswordDirty(false);
+      setTotpDirty(false);
+      setNotice(next.persisted === false
+        ? "已更新当前进程凭据，但系统未提供持久凭据存储"
+        : "凭据已更新并保存");
+      onError("");
+    } catch (error) {
+      setDialogError(error.message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function replaceTotp() {
+    const confirmed = window.confirm(
+      "确定轮换该账号的 2FA 吗？服务会先停用旧 2FA，再创建并激活新密钥；如果远端创建失败，账号可能暂时没有 2FA，需要在本窗口重试。",
+    );
+    if (!confirmed) return;
+    setReplacing(true);
+    setDialogError("");
+    setNotice("");
+    try {
+      const body = {};
+      const proxyUrl = accountProxyUrl.trim();
+      if (proxyUrl) body.proxyUrl = proxyUrl;
+      await apiFetch(token, `/api/jobs/${job.id}/replace-2fa`, {
+        method: "POST",
+        body: JSON.stringify(body),
+      });
+      setNotice("2FA 轮换已排队，请等待任务完成后重新读取凭据");
+      onError("");
+    } catch (error) {
+      setDialogError(error.message);
+    } finally {
+      setReplacing(false);
+    }
+  }
+
+  return (
+    <div className="modal-backdrop" role="presentation" onMouseDown={(event) => {
+      if (event.target === event.currentTarget && !saving && !replacing) onClose();
+    }}>
+      <form className="batch-dialog credential-dialog" onSubmit={save} role="dialog" aria-modal="true" aria-labelledby="credential-dialog-title">
+        <div className="dialog-header">
+          <div>
+            <h2 id="credential-dialog-title">账号凭据</h2>
+            <span>{job.email}</span>
+          </div>
+          <button type="button" className="icon-button" onClick={onClose} disabled={saving || replacing} title="关闭">
+            <X size={18} />
+          </button>
+        </div>
+
+        {loading ? (
+          <div className="credential-loading"><LoaderCircle className="spin" size={18} />正在读取凭据</div>
+        ) : (
+          <>
+            <label className="credential-field">
+              <span>密码</span>
+              <div className="secret-input-row">
+                <KeyRound size={15} aria-hidden="true" />
+                <input
+                  type={showPassword ? "text" : "password"}
+                  value={password}
+                  onChange={(event) => { setPassword(event.target.value); setPasswordDirty(true); }}
+                  placeholder={details?.hasPassword ? "凭据已保存" : "未保存密码"}
+                  autoComplete="off"
+                  spellCheck="false"
+                />
+                <button type="button" className="secret-toggle" onClick={() => setShowPassword((value) => !value)} title={showPassword ? "隐藏密码" : "显示密码"}>
+                  {showPassword ? <EyeOff size={16} /> : <Eye size={16} />}
+                </button>
+              </div>
+            </label>
+            <label className="credential-field">
+              <span>2FA 密钥</span>
+              <div className="secret-input-row">
+                <ShieldCheck size={15} aria-hidden="true" />
+                <input
+                  type={showTotp ? "text" : "password"}
+                  value={totpSecret}
+                  onChange={(event) => { setTotpSecret(event.target.value); setTotpDirty(true); }}
+                  placeholder={details?.hasTotpKey ? "密钥已保存" : "未保存 2FA 密钥"}
+                  autoComplete="off"
+                  spellCheck="false"
+                  inputMode="text"
+                />
+                <button type="button" className="secret-toggle" onClick={() => setShowTotp((value) => !value)} title={showTotp ? "隐藏 2FA 密钥" : "显示 2FA 密钥"}>
+                  {showTotp ? <EyeOff size={16} /> : <Eye size={16} />}
+                </button>
+              </div>
+            </label>
+            <div className="credential-meta">
+              <span>当前状态：{job.status}</span>
+              {details?.persisted === false && <span className="credential-warning">系统未提供持久凭据存储</span>}
+            </div>
+            {job.totpRotationIncomplete && (
+              <div className="credential-warning credential-warning-block">上次 2FA 轮换未完成：远端旧密钥状态可能已变化，请重试完成轮换后再继续登录。</div>
+            )}
+            {dialogError && <div className="dialog-error" role="alert"><CircleAlert size={15} />{dialogError}</div>}
+            {notice && <div className="credential-notice" role="status"><Check size={15} />{notice}</div>}
+            <div className="dialog-actions credential-dialog-actions">
+              {totpReplaceAvailable && job.canReplaceTotp && (
+                <button type="button" className="danger-button" onClick={replaceTotp} disabled={saving || replacing}>
+                  {replacing ? <LoaderCircle className="spin" size={16} /> : <RotateCcw size={16} />}轮换 2FA
+                </button>
+              )}
+              <span className="dialog-actions-spacer" />
+              <button type="button" className="cancel-button" onClick={onClose} disabled={saving || replacing}>关闭</button>
+              <button type="submit" className="primary-button" disabled={loading || saving || replacing || (!passwordDirty && !totpDirty)}>
+                {saving ? <LoaderCircle className="spin" size={16} /> : <Check size={16} />}保存凭据
+              </button>
+            </div>
+          </>
+        )}
+      </form>
     </div>
   );
 }
@@ -2013,6 +2230,7 @@ function operationLabel(type) {
     automatic_relogin: "号池自动重登并授权",
     resume: "继续中断流程",
     setup_2fa: "设置 2FA",
+    replace_2fa: "更换 2FA",
     add_password: "添加密码",
     account_update: "更新账号资料",
     proxy_update: "更新代理 IP",

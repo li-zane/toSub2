@@ -57,6 +57,28 @@ try {
     return;
   }
 
+  if (args.replaceTotp) {
+    const secret = "MZXW6YTBON2GK3TB";
+    await fs.mkdir(path.dirname(args.totpResult), { recursive: true });
+    await fs.writeFile(args.totpResult, `${JSON.stringify({
+      version: 1,
+      already_enabled: false,
+      operation: "replace_totp",
+      activation_mode: "automatic",
+      activation_succeeded: true,
+      confirmation_succeeded: true,
+      remote_disabled: false,
+      stage: "confirmed",
+      email: args.email,
+      secret,
+      otpauth_uri: `otpauth://totp/OpenAI%3A${encodeURIComponent(args.email)}?secret=${secret}&issuer=OpenAI`,
+    }, null, 2)}\n`, { mode: 0o600 });
+    console.log("[2fa-setup-ready] 2FA replacement key created; activating it automatically.");
+    console.log("[2fa] Generated a current 6-digit activation code from the new 2FA key.");
+    console.log("[ok] 2FA replacement activated");
+    return;
+  }
+
   if (args.addPassword) {
     const newPassword = process.env.CHATGPT_NEW_PASSWORD || "";
     if (!newPassword) throw new Error("missing CHATGPT_NEW_PASSWORD");
@@ -261,6 +283,13 @@ try {
 
 async function writeCompleted(outputPath, email, tokenPrefix = "test") {
   await fs.mkdir(path.dirname(outputPath), { recursive: true });
+  const idToken = email === "credential-smoke@example.com"
+    ? `header.${Buffer.from(JSON.stringify({
+        email,
+        sid: `test-account-${email}`,
+        "https://api.openai.com/auth": { chatgpt_plan_type: "plus" },
+      })).toString("base64url")}.signature`
+    : `${tokenPrefix}-id-${email}`;
   const account = {
     name: `oauth---${email}`,
     platform: "openai",
@@ -269,7 +298,7 @@ async function writeCompleted(outputPath, email, tokenPrefix = "test") {
       access_token: `${tokenPrefix}-access-${email}`,
       chatgpt_account_id: `test-account-${email}`,
       email,
-      id_token: `${tokenPrefix}-id-${email}`,
+      id_token: idToken,
       refresh_token: `${tokenPrefix}-refresh-${email}`,
     },
     extra: { email },
@@ -297,6 +326,7 @@ function parseArgs(argv) {
     else if (argv[index] === "--checkpoint") parsed.checkpoint = argv[++index];
     else if (argv[index] === "--resume-checkpoint") parsed.resumeCheckpoint = argv[++index];
     else if (argv[index] === "--setup-totp") parsed.setupTotp = true;
+    else if (argv[index] === "--replace-totp") parsed.replaceTotp = true;
     else if (argv[index] === "--totp-result") parsed.totpResult = argv[++index];
     else if (argv[index] === "--add-password") parsed.addPassword = true;
     else if (argv[index] === "--password-add-result") parsed.passwordAddResult = argv[++index];

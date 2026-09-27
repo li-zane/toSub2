@@ -60,6 +60,8 @@ try {
   const firstExport = JSON.parse(await fs.readFile(outputPath, "utf8"));
   assert.equal(firstExport.type, "sub2api-data");
   assert.equal(firstExport.accounts?.[0]?.credentials?.email, "add-phone-page@example.com");
+  assert.equal(firstExport.accounts?.[0]?.credentials?.plan_type, "plus");
+  assert.equal(firstExport.accounts?.[0]?.extra?.plan_type, "plus");
 
   const passwordAddResultPath = path.join(tempRoot, "password-add-result.json");
   const newPassword = "Added_Test_4826!";
@@ -164,6 +166,7 @@ try {
   const refreshedExport = JSON.parse(await fs.readFile(outputPath, "utf8"));
   assert.equal(refreshedExport.type, "sub2api-data");
   assert.equal(refreshedExport.accounts?.[0]?.credentials?.refresh_token, "mock-refresh-token");
+  assert.equal(refreshedExport.accounts?.[0]?.credentials?.plan_type, "plus");
 
   const riskOutputPath = path.join(tempRoot, "risk-sub2api.json");
   const riskLogin = await runNode([

@@ -7,6 +7,10 @@ const base = `http://127.0.0.1:${port}`;
 const factorId = "0123456789abcdef0123456789abcdef";
 const password = "local-test-password";
 const totpSecret = "JBSWY3DPEHPK3PXP";
+const replacementOldFactorId = "replace-old-factor";
+const replacementNewFactorId = "replace-new-factor";
+const replacementOldSecret = "GEZDGNBVGY3TQOJQ";
+const replacementNewSecret = "MZXW6YTBON2GK3TB";
 const organizationWorkspaceId = "workspace-organization";
 const personalWorkspaceId = "workspace-personal";
 let chatgptWorkspaceSelected = false;
@@ -15,6 +19,11 @@ let workspaceSelectionCount = 0;
 let selectedEmail = "mfa-test@example.com";
 let totpEnabled = false;
 let passwordVerifySentinelCount = 0;
+let replacementTotpEnabled = true;
+let replacementCurrentFactorId = replacementOldFactorId;
+let replacementRequestLog = [];
+let replacementSessionEmail = "";
+let replacementEnrollFailureSent = false;
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || "/", base);
@@ -41,12 +50,21 @@ const server = http.createServer(async (req, res) => {
       chatgptWorkspaceSelected,
       workspaceSelectionCount,
       passwordVerifySentinelCount,
+      replacementTotpEnabled,
+      replacementRequestLog,
     });
   }
   if (req.method === "POST" && url.pathname === "/api/auth/signin/openai") {
     chatgptWorkspaceSelected = false;
     chatgptLoginComplete = false;
     selectedEmail = url.searchParams.get("login_hint") || selectedEmail;
+    if (isReplacementEmail() && selectedEmail !== replacementSessionEmail) {
+      replacementTotpEnabled = true;
+      replacementCurrentFactorId = replacementOldFactorId;
+      replacementRequestLog = [];
+      replacementSessionEmail = selectedEmail;
+      replacementEnrollFailureSent = false;
+    }
     const passwordMode = selectedEmail !== "email-mfa@example.com";
     return sendJson(res, 200, { url: `${base}/api/accounts/authorize?mode=${passwordMode ? "password" : "email"}` });
   }
@@ -84,6 +102,10 @@ const server = http.createServer(async (req, res) => {
     return sendJson(res, 200, mfaPayload());
   }
   if (req.method === "GET" && url.pathname === "/backend-api/accounts/mfa_info") {
+    if (isReplacementEmail()) {
+      recordReplacementRequest(req, "mfa_info");
+      return sendJson(res, 200, replacementMfaInfo());
+    }
     if (selectedEmail === "setup-totp@example.com" && totpEnabled) {
       return sendJson(res, 503, { error: { message: "simulated confirmation failure" } });
     }
@@ -94,6 +116,22 @@ const server = http.createServer(async (req, res) => {
     });
   }
   if (req.method === "POST" && url.pathname === "/backend-api/accounts/mfa/enroll") {
+    if (isReplacementEmail()) {
+      const payload = parseJson(body);
+      recordReplacementRequest(req, "enroll", payload);
+      if (selectedEmail === "replace-totp-enroll-failure@example.com" && !replacementEnrollFailureSent) {
+        replacementEnrollFailureSent = true;
+        return sendJson(res, 503, { error: { message: "simulated replacement enrollment failure" } });
+      }
+      if (replacementTotpEnabled || payload.factor_type !== "totp") {
+        return sendJson(res, 409, { error: { message: "replacement factor is still enabled" } });
+      }
+      return sendJson(res, 200, {
+        secret: replacementNewSecret,
+        session_id: "replace-enroll-session",
+        factor: { id: replacementNewFactorId, factor_type: "totp", is_recovery: false },
+      });
+    }
     if (selectedEmail !== "setup-totp@example.com" || totpEnabled) return sendJson(res, 409, { error: { message: "already enabled" } });
     return sendJson(res, 200, {
       secret: "NB2W45DFOIZAQWER",
@@ -103,12 +141,36 @@ const server = http.createServer(async (req, res) => {
   }
   if (req.method === "POST" && url.pathname === "/backend-api/accounts/mfa/user/activate_enrollment") {
     const payload = parseJson(body);
+    if (isReplacementEmail()) {
+      recordReplacementRequest(req, "activate", payload);
+      const acceptedCodes = [-1, 0, 1].map((offset) => generateTotp(replacementNewSecret, Date.now() + offset * 30_000));
+      if (!acceptedCodes.includes(payload.code) || payload.factor_type !== "totp" || payload.session_id !== "replace-enroll-session") {
+        return sendJson(res, 400, { error: { message: "invalid replacement setup code" } });
+      }
+      replacementTotpEnabled = true;
+      replacementCurrentFactorId = replacementNewFactorId;
+      return sendJson(res, 200, { success: true });
+    }
     const acceptedCodes = [-1, 0, 1].map((offset) => generateTotp("NB2W45DFOIZAQWER", Date.now() + offset * 30_000));
     if (!acceptedCodes.includes(payload.code) || payload.factor_type !== "totp" || payload.session_id !== "mock-enroll-session") {
       return sendJson(res, 400, { error: { message: "invalid setup code" } });
     }
     totpEnabled = true;
     return sendJson(res, 200, { success: true });
+  }
+  if (req.method === "POST" && url.pathname === "/backend-api/accounts/mfa/user/disable_in_house") {
+    const payload = parseJson(body);
+    if (isReplacementEmail()) {
+      recordReplacementRequest(req, "disable", payload);
+      if (payload.factor_id !== replacementOldFactorId) {
+        return sendJson(res, 400, { error: { message: "unexpected replacement factor" } });
+      }
+      replacementTotpEnabled = false;
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+    return sendJson(res, 404, { error: { message: "not found" } });
   }
   if (req.method === "POST" && url.pathname === "/api/accounts/mfa/issue_challenge") {
     const payload = parseJson(body);
@@ -119,7 +181,8 @@ const server = http.createServer(async (req, res) => {
   }
   if (req.method === "POST" && url.pathname === "/api/accounts/mfa/verify") {
     const payload = parseJson(body);
-    const acceptedCodes = [-1, 0, 1].map((offset) => generateTotp(totpSecret, Date.now() + offset * 30_000));
+    const loginSecret = isReplacementEmail() ? replacementOldSecret : totpSecret;
+    const acceptedCodes = [-1, 0, 1].map((offset) => generateTotp(loginSecret, Date.now() + offset * 30_000));
     if (!hasPasswordVerifySentinel(req) || payload.type !== "totp" || payload.id !== factorId || !acceptedCodes.includes(payload.code)) {
       return sendJson(res, 400, { error: { message: "invalid totp" } });
     }
@@ -208,6 +271,38 @@ function mfaPayload() {
     page: { type: "mfa_challenge" },
     "oai-client-auth-session": mfaSession(),
   };
+}
+
+function isReplacementEmail() {
+  return selectedEmail === "replace-totp@example.com"
+    || selectedEmail === "replace-totp-enroll-failure@example.com";
+}
+
+function replacementMfaInfo() {
+  return {
+    mfa_enabled: replacementTotpEnabled,
+    mfa_enabled_v2: replacementTotpEnabled,
+    native_default_factor_id: replacementTotpEnabled ? replacementCurrentFactorId : null,
+    factors: {
+      totp: replacementTotpEnabled
+        ? [{ id: replacementCurrentFactorId, factor_type: "totp", metadata: {} }]
+        : [],
+      push_auth: null,
+      passkeys: [],
+      sms: [],
+    },
+  };
+}
+
+function recordReplacementRequest(req, operation, payload = {}) {
+  replacementRequestLog.push({
+    email: selectedEmail,
+    method: req.method,
+    operation,
+    factor_id: payload.factor_id || null,
+    factor_type: payload.factor_type || null,
+    session_id: payload.session_id || null,
+  });
 }
 
 function mfaSession() {

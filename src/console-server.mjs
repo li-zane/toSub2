@@ -214,6 +214,8 @@ async function handleApi(req, res, requestUrl) {
         sub2apiMonitor: true,
         tlsFingerprint: true,
         totpSetup: true,
+        credentialDetails: true,
+        totpReplace: true,
         passwordAdd: true,
         forceRelogin: true,
       },
@@ -531,7 +533,7 @@ async function handleApi(req, res, requestUrl) {
     return;
   }
 
-  const match = /^\/api\/jobs\/([a-f0-9-]+)(?:\/(input|cancel|retry|regenerate|relogin|setup-2fa|add-password|logs|download|sms-number|luban-number))?$/.exec(requestUrl.pathname);
+  const match = /^\/api\/jobs\/([a-f0-9-]+)(?:\/(input|cancel|retry|regenerate|relogin|setup-2fa|replace-2fa|add-password|credentials|logs|download|sms-number|luban-number))?$/.exec(requestUrl.pathname);
   if (!match) {
     sendJson(res, 404, { error: "Not found" });
     return;
@@ -546,6 +548,11 @@ async function handleApi(req, res, requestUrl) {
   const action = match[2];
   if (req.method === "GET" && action === "logs") {
     sendJson(res, 200, { id: job.id, logs: job.logs });
+    return;
+  }
+  if (req.method === "GET" && action === "credentials") {
+    await reloadMissingJobCredentials(job);
+    sendJson(res, 200, { credentials: publicCredentialDetails(job) });
     return;
   }
   if (req.method === "GET" && action === "download") {
@@ -589,6 +596,21 @@ async function handleApi(req, res, requestUrl) {
     const body = await readJson(req);
     await withEmailJobLock(job.email, () => startTotpSetup(job, body));
     sendJson(res, 200, { job: publicJob(job) });
+    return;
+  }
+  if (req.method === "POST" && action === "replace-2fa") {
+    const body = await readJson(req);
+    await withEmailJobLock(job.email, () => startTotpSetup(job, { ...body, replaceExisting: true }));
+    sendJson(res, 200, { job: publicJob(job) });
+    return;
+  }
+  if (req.method === "PUT" && action === "credentials") {
+    const body = await readJson(req);
+    let persisted = false;
+    await withEmailJobLock(job.email, async () => {
+      persisted = await updateStoredCredentialFields(job, body);
+    });
+    sendJson(res, 200, { credentials: publicCredentialDetails(job, persisted), job: publicJob(job) });
     return;
   }
   if (req.method === "POST" && action === "add-password") {
@@ -674,6 +696,7 @@ async function startJob(email, credentials = {}, proxyUrl = null) {
     child: null,
     parserTail: "",
     resultSaved: false,
+    planType: null,
     loginMode,
     password,
     totpSecret,
@@ -703,6 +726,10 @@ async function startJob(email, credentials = {}, proxyUrl = null) {
     totpSetupSecret: null,
     totpSetupUri: null,
     totpSetupError: null,
+    totpSetupReplaceExisting: false,
+    totpRotationRemoteDisabled: false,
+    totpRotationStage: null,
+    totpRotationIncomplete: false,
     totpSetupResumesAuthorization: false,
     passwordAddError: null,
     passwordAddedAt: null,
@@ -782,7 +809,7 @@ async function prepareAndLaunchJob(job, mode, queueRunId) {
     launchJob(job, { mode });
   } catch (error) {
     if (mode === "totp_setup") {
-      restoreTotpSetupFailure(job, `准备 2FA 设置失败：${error.message}`);
+      await restoreTotpSetupFailure(job, `准备 2FA 设置失败：${error.message}`);
     } else if (mode === "password_add") {
       restorePasswordAddFailure(job, `准备添加密码失败：${error.message}`);
     } else {
@@ -827,7 +854,7 @@ function launchJob(job, options = {}) {
           PROTOCOL_SCRIPT,
           "--email",
           job.email,
-          "--setup-totp",
+          job.totpSetupReplaceExisting ? "--replace-totp" : "--setup-totp",
           "--totp-result",
           job.totpResultPath,
           ...(job.totpSetupResumesAuthorization ? ["--resume-checkpoint", job.checkpointPath] : []),
@@ -884,7 +911,7 @@ function launchJob(job, options = {}) {
   child.on("error", (error) => {
     void withEmailJobLock(job.email, async () => {
       if (job.runId !== runId) return;
-      if (mode === "totp_setup") restoreTotpSetupFailure(job, `无法启动 2FA 设置进程：${error.message}`);
+      if (mode === "totp_setup") await restoreTotpSetupFailure(job, `无法启动 2FA 设置进程：${error.message}`);
       else if (mode === "password_add") restorePasswordAddFailure(job, `无法启动添加密码进程：${error.message}`);
       else failJob(job, `无法启动登录进程：${error.message}`);
     });
@@ -892,7 +919,7 @@ function launchJob(job, options = {}) {
   child.on("close", (code, signal) => {
     void withEmailJobLock(job.email, () => handleChildClose(job, { code, signal, mode, runId }))
       .catch((error) => {
-        handleChildCloseFailure(job, mode, runId, error);
+        void handleChildCloseFailure(job, mode, runId, error);
       });
   });
 }
@@ -917,6 +944,7 @@ async function handleChildClose(job, { code, signal, mode, runId }) {
     return;
   }
   if (code === 0 && job.resultSaved && (await fileExists(job.outputPath))) {
+    job.planType = await readPlanTypeFromOutput(job.outputPath);
     if (mode === "full") completeAuthorizationAutomationAttempt(job);
     job.loginCheckpointAvailable = false;
     job.status = "completed";
@@ -943,9 +971,17 @@ function handleChildCloseFailure(job, mode, runId, error) {
   if (job.runId !== runId && !(["totp_setup", "password_add"].includes(mode) && job.runId === null)) return;
   const message = `收尾处理失败：${error.message}`;
   if (mode === "totp_setup") {
+    const replacingTotp = Boolean(job.totpSetupReplaceExisting);
+    if (replacingTotp) job.totpRotationIncomplete = true;
     job.status = "completed";
-    job.prompt = "原授权文件仍然可用，2FA 密钥尚未完成安全保存";
-    job.totpSetupError = `${message}；已保留 2FA 结果文件，请重试保存`;
+    job.prompt = replacingTotp && job.totpRotationRemoteDisabled
+      ? "原 2FA 状态可能已关闭，新 2FA 尚未激活；可以重试更换流程"
+      : "原授权文件仍然可用，2FA 密钥尚未完成安全保存";
+    job.totpSetupError = replacingTotp && job.totpRotationRemoteDisabled
+      ? `${message}；远端 2FA 状态可能已关闭，结果文件已保留`
+      : `${message}；已保留 2FA 结果文件，请重试保存`;
+    job.totpRotationStage = replacingTotp ? (job.totpRotationStage || "failed") : null;
+    job.totpSetupReplaceExisting = false;
     job.runMode = null;
     job.runId = null;
   } else if (mode === "password_add") {
@@ -1115,16 +1151,24 @@ async function reloadMissingJobCredentials(job) {
 }
 
 async function startTotpSetup(job, options = {}) {
-  if (!canSetupTotp(job)) {
-    throw httpError(409, "只能为已完成授权，或已保存邮箱登录检查点且尚未设置 2FA 的账号设置 2FA");
+  const replaceExisting = Boolean(options.replaceExisting);
+  await reloadMissingJobCredentials(job);
+  if (replaceExisting) {
+    if (!canReplaceTotp(job)) {
+      throw httpError(409, "只能为已完成授权且已知启用 2FA 的账号更换 2FA");
+    }
+  } else {
+    if (!canSetupTotp(job)) {
+      throw httpError(409, "只能为已完成授权，或已保存邮箱登录检查点且尚未设置 2FA 的账号设置 2FA");
+    }
+    if (job.totpSecret || job.hasTotpCredential) {
+      throw httpError(409, "该账号已经保存了 2FA 密钥，无需重复设置");
+    }
+    if (job.totpKnownEnabled) {
+      throw httpError(409, "该账号已经启用 2FA，但本地没有它的原始密钥，无法重复创建");
+    }
   }
-  if (job.totpSecret || job.hasTotpCredential) {
-    throw httpError(409, "该账号已经保存了 2FA 密钥，无需重复设置");
-  }
-  if (job.totpKnownEnabled) {
-    throw httpError(409, "该账号已经启用 2FA，但本地没有它的原始密钥，无法重复创建");
-  }
-  const resumeAuthorization = !job.resultSaved;
+  const resumeAuthorization = replaceExisting ? false : !job.resultSaved;
   if (resumeAuthorization && !(await fileExists(job.checkpointPath))) {
     job.loginCheckpointAvailable = false;
     throw httpError(409, "邮箱登录检查点已丢失，请先重新登录");
@@ -1141,10 +1185,16 @@ async function startTotpSetup(job, options = {}) {
   job.child = null;
   job.currentPhone = null;
   job.phoneError = null;
-  await removePrivateFile(job.totpResultPath);
+  const resumeDisabledRotation = replaceExisting
+    && await hasIncompleteRemoteTotpRotation(job.totpResultPath, job.totpRotationRemoteDisabled);
+  if (!resumeDisabledRotation) await removePrivateFile(job.totpResultPath);
   job.totpSetupSecret = null;
   job.totpSetupUri = null;
   job.totpSetupError = null;
+  job.totpSetupReplaceExisting = replaceExisting;
+  job.totpRotationRemoteDisabled = resumeDisabledRotation;
+  job.totpRotationStage = resumeDisabledRotation ? "disabled" : (replaceExisting ? "starting" : null);
+  job.totpRotationIncomplete = replaceExisting;
   job.totpSetupAttempt = (job.totpSetupAttempt || 0) + 1;
   job.totpSetupResumesAuthorization = resumeAuthorization;
   job.proxyRiskRetryCount = 0;
@@ -1155,9 +1205,27 @@ async function startTotpSetup(job, options = {}) {
   job.proxyAttemptParserTail = "";
   job.lastError = null;
   job.parserTail = "";
-  recordJobOperation(job, "setup_2fa");
-  appendJobLog(job, `\n[2fa] 开始第 ${job.totpSetupAttempt} 次 2FA 设置，原授权文件保持不变。\n`);
-  enqueueJob(job, "totp_setup", "正在重新验证账号并准备设置 2FA");
+  recordJobOperation(job, replaceExisting ? "replace_2fa" : "setup_2fa");
+  appendJobLog(
+    job,
+    replaceExisting
+      ? `\n[2fa] 开始第 ${job.totpSetupAttempt} 次 2FA 更换；原授权文件保持不变，失败时可能需要重新启用 2FA。\n`
+      : `\n[2fa] 开始第 ${job.totpSetupAttempt} 次 2FA 设置，原授权文件保持不变。\n`,
+  );
+  enqueueJob(job, "totp_setup", replaceExisting ? "正在重新验证账号并更换 2FA" : "正在重新验证账号并准备设置 2FA");
+}
+
+async function hasIncompleteRemoteTotpRotation(resultPath, metadataFlag = false) {
+  if (metadataFlag) return fileExists(resultPath);
+  try {
+    const result = JSON.parse(await fs.readFile(resultPath, "utf8"));
+    return result?.version === 1
+      && result?.operation === "replace_totp"
+      && result?.activation_succeeded !== true
+      && (result?.remote_disabled === true || result?.stage === "disabling");
+  } catch {
+    return false;
+  }
 }
 
 async function startPasswordAdd(job, options = {}) {
@@ -1293,6 +1361,10 @@ function restorePasswordAddFailure(job, message) {
 async function loadTotpSetupResult(job) {
   const data = JSON.parse(await fs.readFile(job.totpResultPath, "utf8"));
   if (data?.version !== 1) throw new Error("2FA 设置结果文件格式不正确");
+  job.totpSetupReplaceExisting = data?.operation === "replace_totp";
+  job.totpRotationRemoteDisabled = Boolean(data?.remote_disabled);
+  job.totpRotationStage = typeof data?.stage === "string" ? data.stage : null;
+  job.totpRotationIncomplete = data?.operation === "replace_totp" && data?.activation_succeeded !== true;
   if (data.already_enabled) {
     job.totpKnownEnabled = true;
     job.totpSetupSecret = null;
@@ -1322,6 +1394,7 @@ async function finishTotpSetup(job, code, signal) {
   }
 
   const activationSucceeded = result?.activation_succeeded === true;
+  const replacingTotp = Boolean(job.totpSetupReplaceExisting || result?.operation === "replace_totp");
   let removeResult = false;
   if (code === 0 && result?.already_enabled) {
     job.totpKnownEnabled = true;
@@ -1333,6 +1406,9 @@ async function finishTotpSetup(job, code, signal) {
     job.totpSecret = secret;
     job.hasTotpCredential = true;
     job.totpKnownEnabled = true;
+    job.totpRotationRemoteDisabled = false;
+    job.totpRotationStage = result?.confirmation_succeeded === false ? "confirmation_failed" : "confirmed";
+    job.totpRotationIncomplete = false;
     const persisted = await saveStoredLoginCredentials(job.email, job);
     job.prompt = activationSucceeded && code !== 0
       ? "2FA 已激活并保存，但最终状态确认未完成"
@@ -1345,16 +1421,29 @@ async function finishTotpSetup(job, code, signal) {
       ? "激活接口已返回成功，但后续确认请求失败；密钥已保留"
       : null;
     appendJobLog(job, persisted
-      ? "[2fa] 2FA 设置成功，密钥已写入系统凭据存储，未写入协议日志。\n"
-      : "[2fa] 2FA 设置成功，但当前系统不支持持久凭据存储；密钥已保留在私有结果文件中。\n");
+      ? (replacingTotp
+        ? "[2fa] 2FA 更换成功，新密钥已写入系统凭据存储，未写入协议日志。\n"
+        : "[2fa] 2FA 设置成功，密钥已写入系统凭据存储，未写入协议日志。\n")
+      : (replacingTotp
+        ? "[2fa] 2FA 更换成功，但当前系统不支持持久凭据存储；新密钥已保留在私有结果文件中。\n"
+        : "[2fa] 2FA 设置成功，但当前系统不支持持久凭据存储；密钥已保留在私有结果文件中。\n"));
     removeResult = persisted;
   } else {
-    job.prompt = resumeAuthorization
-      ? "本次 2FA 设置未完成，原登录检查点仍可继续"
-      : "授权文件仍然可用，本次 2FA 设置未完成";
-    job.totpSetupError ||= signal
-      ? `2FA 设置进程被 ${signal} 终止`
-      : `2FA 设置进程退出，代码 ${code ?? "未知"}`;
+    const remoteDisabled = Boolean(job.totpRotationRemoteDisabled || result?.remote_disabled);
+    job.totpRotationRemoteDisabled = replacingTotp && remoteDisabled;
+    job.totpRotationStage = result?.stage || (replacingTotp ? "failed" : null);
+    job.totpRotationIncomplete = replacingTotp;
+    job.totpKnownEnabled = replacingTotp ? !remoteDisabled : job.totpKnownEnabled;
+    job.prompt = replacingTotp && remoteDisabled
+      ? "原 2FA 状态可能已关闭，新 2FA 尚未激活；可以重试更换流程"
+      : resumeAuthorization
+        ? "本次 2FA 设置未完成，原登录检查点仍可继续"
+        : "授权文件仍然可用，本次 2FA 设置未完成";
+    job.totpSetupError ||= replacingTotp && remoteDisabled
+      ? "远端 2FA 状态可能已关闭，结果文件已保留；请重试以完成新密钥激活"
+      : signal
+        ? `2FA 设置进程被 ${signal} 终止`
+        : `2FA 设置进程退出，代码 ${code ?? "未知"}`;
   }
 
   job.status = resumeAuthorization ? "resume_available" : "completed";
@@ -1365,8 +1454,9 @@ async function finishTotpSetup(job, code, signal) {
   job.runId = null;
   job.totpSetupSecret = null;
   job.totpSetupUri = null;
+  job.totpSetupReplaceExisting = false;
   job.totpSetupResumesAuthorization = false;
-  if (removeResult || !result?.secret || result?.activation_succeeded === false) {
+  if (removeResult || (!replacingTotp && (!result?.secret || result?.activation_succeeded === false))) {
     await removePrivateFile(job.totpResultPath);
   }
   touch(job);
@@ -1384,19 +1474,30 @@ async function removePrivateFile(filePath) {
 
 function restoreTotpSetupFailure(job, message) {
   const resumeAuthorization = Boolean(job.totpSetupResumesAuthorization);
+  const replacingTotp = Boolean(job.totpSetupReplaceExisting);
+  // Keep the remote-disabled flag conservative. The protocol persists the
+  // disable state before enrollment, and re-checks mfa_info when a retry
+  // resumes from the durable result file.
+  if (replacingTotp) job.totpRotationIncomplete = true;
   job.status = resumeAuthorization ? "resume_available" : "completed";
-  job.prompt = resumeAuthorization
+  job.prompt = replacingTotp && job.totpRotationRemoteDisabled
+    ? "原 2FA 已关闭，新 2FA 尚未激活；可以重试更换流程"
+    : resumeAuthorization
     ? "本次 2FA 设置未完成，原登录检查点仍可继续"
     : "授权文件仍然可用，本次 2FA 设置未完成";
-  job.totpSetupError = message;
+  job.totpSetupError = replacingTotp && job.totpRotationRemoteDisabled
+    ? `${message}；远端 2FA 状态可能已关闭，结果文件已保留`
+    : message;
+  job.totpRotationStage = replacingTotp ? (job.totpRotationStage || "failed") : null;
   job.totpSetupSecret = null;
   job.totpSetupUri = null;
+  job.totpSetupReplaceExisting = false;
   job.totpSetupResumesAuthorization = false;
   job.lastError = resumeAuthorization ? "点击继续流程可恢复 Codex 授权" : null;
   job.runMode = null;
   job.child?.kill("SIGTERM");
   job.child = null;
-  void removePrivateFile(job.totpResultPath).catch(() => {});
+  if (!replacingTotp) void removePrivateFile(job.totpResultPath).catch(() => {});
   touch(job);
   void saveJobMetadata(job).catch(() => {});
 }
@@ -2233,7 +2334,7 @@ async function cancelJob(job) {
     job.child?.kill("SIGTERM");
     job.child = null;
     await finishTotpSetup(job, 1, "SIGTERM");
-    if (!job.totpKnownEnabled) {
+    if (!job.totpKnownEnabled && !job.totpRotationRemoteDisabled) {
       job.prompt = job.resultSaved
         ? "授权文件仍然可用，2FA 设置已取消"
         : "2FA 设置已取消，原登录检查点仍可继续";
@@ -2971,6 +3072,7 @@ function publicJob(job) {
     lastOperationAt: job.lastOperationAt || job.createdAt,
     lastOperationType: job.lastOperationType || "initial_authorization",
     completedAt: job.completedAt,
+    planType: job.planType || null,
     lastError: job.lastError,
     canDownload: Boolean(job.resultSaved),
     loginMode: job.loginMode || (job.mailApiUrl ? "email_otp" : "manual"),
@@ -2983,6 +3085,10 @@ function publicJob(job) {
     totpSetupSecret: job.status === "totp_setup_otp" ? job.totpSetupSecret : null,
     totpSetupUri: job.status === "totp_setup_otp" ? job.totpSetupUri : null,
     totpSetupError: job.totpSetupError || null,
+    totpSetupReplaceExisting: Boolean(job.totpSetupReplaceExisting),
+    totpRotationRemoteDisabled: Boolean(job.totpRotationRemoteDisabled),
+    totpRotationStage: job.totpRotationStage || null,
+    totpRotationIncomplete: Boolean(job.totpRotationIncomplete),
     passwordAddError: job.passwordAddError || null,
     passwordAddedAt: job.passwordAddedAt || null,
     smsProviderId: job.smsProviderId,
@@ -2996,6 +3102,7 @@ function publicJob(job) {
     canRegenerate: job.status === "completed" && job.resultSaved,
     canForceRelogin: canForceRelogin(job),
     canSetupTotp: canSetupTotp(job),
+    canReplaceTotp: canReplaceTotp(job),
     canAddPassword: canAddPassword(job),
     restartRequired: job.restartRequired,
     proxyConfigured: Boolean(job.proxyUrl),
@@ -3011,16 +3118,75 @@ function publicJob(job) {
   };
 }
 
+function publicCredentialDetails(job, persisted = null) {
+  return {
+    email: job.email,
+    password: job.password || "",
+    totpSecret: job.totpSecret || "",
+    hasPassword: Boolean(job.password || job.hasPasswordCredential),
+    hasTotpKey: Boolean(job.totpSecret || job.hasTotpCredential),
+    persisted,
+  };
+}
+
+function normalizePlanType(value) {
+  const text = String(value || "").trim();
+  return text.length > 0 && text.length <= 128 ? text : "";
+}
+
+function extractPlanTypeFromAccount(account) {
+  const direct = normalizePlanType(
+    account?.plan_type
+      || account?.planType
+      || account?.credentials?.plan_type
+      || account?.credentials?.planType
+      || account?.extra?.plan_type
+      || account?.extra?.planType,
+  );
+  if (direct) return direct;
+  return extractPlanTypeFromJwt(account?.credentials?.id_token);
+}
+
+function extractPlanTypeFromJwt(jwt) {
+  if (!jwt) return "";
+  try {
+    const [, payload] = String(jwt).split(".");
+    if (!payload) return "";
+    const claims = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
+    const authClaims = claims?.["https://api.openai.com/auth"];
+    return normalizePlanType(
+      authClaims?.chatgpt_plan_type
+        || authClaims?.plan_type
+        || claims?.["https://api.openai.com/auth.chatgpt_plan_type"]
+        || claims?.chatgpt_plan_type
+        || claims?.plan_type,
+    );
+  } catch {
+    return "";
+  }
+}
+
+async function readPlanTypeFromOutput(outputPath) {
+  try {
+    const data = JSON.parse(await fs.readFile(outputPath, "utf8"));
+    return extractPlanTypeFromAccount(data?.accounts?.[0]) || null;
+  } catch {
+    return null;
+  }
+}
+
 function publicSelectionJob(job) {
   return {
     id: job.id,
     email: job.email,
     status: job.status,
+    planType: job.planType || null,
     canDownload: Boolean(job.resultSaved),
     canRetry: ["failed", "canceled", "reauth_required", "resume_available"].includes(job.status),
     canRegenerate: job.status === "completed" && job.resultSaved,
     canForceRelogin: canForceRelogin(job),
     canSetupTotp: canSetupTotp(job),
+    canReplaceTotp: canReplaceTotp(job),
     canAddPassword: canAddPassword(job),
   };
 }
@@ -3316,6 +3482,7 @@ async function syncCompletedOutputs(force = false) {
           child: null,
           parserTail: "",
           resultSaved: true,
+          planType: extractPlanTypeFromAccount(account) || normalizePlanType(metadata.plan_type),
           loginMode: metadata.login_mode === "password" || storedCredentials.password ? "password" : (mailApiUrl ? "email_otp" : metadata.login_mode || "manual"),
           password: storedCredentials.password,
           totpSecret: storedCredentials.totpSecret,
@@ -3409,6 +3576,7 @@ async function syncCompletedOutputs(force = false) {
           child: null,
           parserTail: "",
           resultSaved: false,
+          planType: normalizePlanType(metadata.plan_type),
           loginMode: metadata.login_mode === "password" || storedCredentials.password ? "password" : (mailApiUrl ? "email_otp" : metadata.login_mode || "manual"),
           password: storedCredentials.password,
           totpSecret: storedCredentials.totpSecret,
@@ -3499,6 +3667,7 @@ async function syncCompletedOutputs(force = false) {
           child: null,
           parserTail: "",
           resultSaved: false,
+          planType: normalizePlanType(metadata.plan_type),
           loginMode: metadata.login_mode === "password" || storedCredentials.password ? "password" : (mailApiUrl ? "email_otp" : metadata.login_mode || "manual"),
           password: storedCredentials.password,
           totpSecret: storedCredentials.totpSecret,
@@ -3767,7 +3936,14 @@ function restoredTotpSetupState(metadata = {}, credentials = {}) {
     totpSetupSecret: null,
     totpSetupUri: null,
     totpSetupError: null,
-    totpKnownEnabled: Boolean(metadata.totp_known_enabled || credentials.totpSecret),
+    totpSetupReplaceExisting: Boolean(metadata.totp_setup_replace_existing),
+    totpRotationRemoteDisabled: Boolean(metadata.totp_rotation_remote_disabled),
+    totpRotationStage: typeof metadata.totp_rotation_stage === "string" ? metadata.totp_rotation_stage : null,
+    totpRotationIncomplete: Boolean(metadata.totp_rotation_incomplete || metadata.totp_rotation_remote_disabled),
+    totpKnownEnabled: Boolean(
+      metadata.totp_known_enabled
+      || (credentials.totpSecret && !metadata.totp_rotation_remote_disabled),
+    ),
     totpSetupAttempt: 0,
     totpResultLoading: false,
   };
@@ -4278,6 +4454,55 @@ async function updateJobCredentials(job, credentials, options = {}) {
   }
 }
 
+function canReplaceTotp(job) {
+  if (isActive(job.status)) return false;
+  if ((job.totpRotationIncomplete || job.totpRotationRemoteDisabled) && job.resultSaved) return true;
+  if (!(job.status === "completed" && job.resultSaved)) return false;
+  return Boolean(job.totpKnownEnabled || job.totpSecret || job.hasTotpCredential);
+}
+
+async function updateStoredCredentialFields(job, body = {}) {
+  if (isActive(job.status)) throw httpError(409, "任务正在运行，请等待完成后再修改凭据");
+  const hasPassword = Object.hasOwn(body, "password");
+  const hasTotpSecret = Object.hasOwn(body, "totpSecret");
+  if (!hasPassword && !hasTotpSecret) throw httpError(400, "至少需要提供 password 或 totpSecret");
+
+  await reloadMissingJobCredentials(job);
+  if (!hasPassword && job.hasPasswordCredential && !job.password) {
+    throw httpError(409, "现有密码无法从系统凭据存储读取，请同时提交密码后再修改其他字段");
+  }
+  if (!hasTotpSecret && job.hasTotpCredential && !job.totpSecret) {
+    throw httpError(409, "现有 2FA 密钥无法从系统凭据存储读取，请同时提交 2FA 密钥后再修改其他字段");
+  }
+  const password = hasPassword ? String(body.password ?? "") : job.password || "";
+  const totpSecret = hasTotpSecret ? normalizeTotpSecret(body.totpSecret) : job.totpSecret || "";
+  if (password.length > 128) throw httpError(400, "密码长度不能超过 128 个字符");
+  if (hasTotpSecret && !/^[A-Z2-7]{16,128}$/.test(totpSecret)) {
+    throw httpError(400, "2FA 密钥必须是 16 到 128 位 Base32 字符");
+  }
+
+  const persisted = await saveStoredLoginCredentials(job.email, {
+    password: hasPassword ? password : job.password,
+    totpSecret: hasTotpSecret ? totpSecret : job.totpSecret,
+    proxyUrl: job.proxyUrl,
+  });
+  if (hasPassword) {
+    job.password = password;
+    job.hasPasswordCredential = Boolean(password);
+    job.loginMode = password ? "password" : (job.mailApiUrl ? "email_otp" : "manual");
+  }
+  if (hasTotpSecret) {
+    job.totpSecret = totpSecret;
+    job.hasTotpCredential = Boolean(totpSecret);
+    if (totpSecret) job.totpKnownEnabled = true;
+  }
+  recordJobOperation(job, "credential_update");
+  appendJobLog(job, "[account] 登录凭据已更新，敏感字段未写入日志。\n");
+  touch(job);
+  await saveJobMetadata(job);
+  return persisted;
+}
+
 async function updateJobProxy(job, proxyUrl) {
   if (job.proxyUrl === proxyUrl) return;
   job.proxyUrl = proxyUrl;
@@ -4325,6 +4550,7 @@ async function saveJobMetadata(job) {
         prompt: job.prompt || null,
         last_error: job.lastError || null,
         result_saved: Boolean(job.resultSaved),
+        plan_type: job.planType || null,
         completed_at: job.completedAt || null,
         attempt: Number(job.attempt || 1),
         security_check_required: Boolean(job.securityCheckRequired),
@@ -4339,7 +4565,13 @@ async function saveJobMetadata(job) {
         has_stored_credentials: Boolean(job.password || job.totpSecret),
         has_password: Boolean(job.password || job.hasPasswordCredential),
         has_totp_key: Boolean(job.totpSecret || job.hasTotpCredential),
-        totp_known_enabled: Boolean(job.totpKnownEnabled || job.totpSecret || job.hasTotpCredential),
+        totp_known_enabled: Boolean(
+          !job.totpRotationRemoteDisabled && (job.totpKnownEnabled || job.totpSecret || job.hasTotpCredential),
+        ),
+        totp_setup_replace_existing: Boolean(job.totpSetupReplaceExisting),
+        totp_rotation_remote_disabled: Boolean(job.totpRotationRemoteDisabled),
+        totp_rotation_stage: job.totpRotationStage || null,
+        totp_rotation_incomplete: Boolean(job.totpRotationIncomplete),
         password_add_error: job.passwordAddError || null,
         password_added_at: job.passwordAddedAt || null,
         login_checkpoint_available: Boolean(job.loginCheckpointAvailable),

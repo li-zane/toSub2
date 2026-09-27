@@ -262,7 +262,7 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .stop-all-button:hover:not(:disabled) { color: #fff; background: var(--danger); border-color: var(--danger); }
 
 .table-frame { overflow-x: auto; background: var(--surface); border: 1px solid var(--line); border-radius: 7px; }
-table { width: 100%; min-width: 1740px; border-collapse: collapse; table-layout: fixed; }
+table { width: 100%; min-width: 1800px; border-collapse: collapse; table-layout: fixed; }
 th {
   height: 42px;
   padding: 0 16px;
@@ -276,12 +276,13 @@ th {
   letter-spacing: 0;
 }
 th:nth-child(1) { width: 4%; }
-th:nth-child(2) { width: 17%; }
+th:nth-child(2) { width: 15%; }
 th:nth-child(3) { width: 9%; }
-th:nth-child(4) { width: 23%; }
+th:nth-child(4) { width: 9%; }
 th:nth-child(5) { width: 8%; }
-th:nth-child(6) { width: 11%; }
-th:nth-child(7) { width: 28%; }
+th:nth-child(6) { width: 21%; }
+th:nth-child(7) { width: 8%; }
+th:nth-child(8) { width: 26%; }
 .actions-heading { text-align: right; }
 .select-heading, .select-cell { text-align: center; }
 .select-heading input, .select-cell input { width: 15px; height: 15px; margin: 0; accent-color: var(--green); cursor: pointer; }
@@ -325,6 +326,14 @@ tbody tr:last-child td { border-bottom: 0; }
 .account-cell .mail-mode.error { color: var(--danger); background: var(--danger-soft); }
 .account-cell .mail-mode.password-mode { color: var(--blue); background: var(--blue-soft); }
 .account-cell .mail-mode.unknown-mode { color: var(--amber); background: var(--amber-soft); }
+
+.plan-cell {
+  color: var(--ink);
+  font-size: 12px;
+  font-weight: 650;
+  overflow-wrap: anywhere;
+}
+.plan-cell.unknown { color: #8a9490; font-weight: 500; }
 
 .status-badge {
   min-height: 25px;
@@ -617,6 +626,33 @@ tbody tr:last-child td { border-bottom: 0; }
 .sms-settings-dialog { width: min(620px, 100%); }
 .mail-request-settings-dialog { width: min(620px, 100%); }
 .sub2api-settings-dialog { width: min(620px, 100%); }
+.credential-dialog { width: min(560px, 100%); }
+.credential-field { display: grid; gap: 7px; margin-top: 18px; color: #53605b; font-size: 12px; font-weight: 700; }
+.secret-input-row {
+  min-height: 42px;
+  padding: 0 10px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #7c8682;
+  background: #fbfcfb;
+  border: 1px solid #cdd5d1;
+  border-radius: 5px;
+}
+.secret-input-row:focus-within { border-color: var(--green); box-shadow: 0 0 0 3px rgba(18, 113, 91, .1); }
+.secret-input-row input { width: 100%; min-width: 0; border: 0; outline: 0; color: var(--ink); background: transparent; font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; letter-spacing: .02em; }
+.secret-toggle { width: 28px; height: 28px; padding: 0; display: inline-flex; align-items: center; justify-content: center; color: var(--muted); background: transparent; border: 0; border-radius: 4px; cursor: pointer; }
+.secret-toggle:hover { color: var(--green-strong); background: var(--green-soft); }
+.credential-loading { min-height: 140px; display: flex; align-items: center; justify-content: center; gap: 8px; color: var(--muted); font-size: 13px; }
+.credential-meta { margin-top: 12px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; color: var(--muted); font-size: 11px; }
+.credential-warning { color: #9b5a16; }
+.credential-warning-block { margin-top: 12px; padding: 9px 10px; background: #fff7e8; border: 1px solid #f0d6a5; border-radius: 5px; line-height: 1.5; }
+.credential-notice { margin-top: 10px; display: flex; align-items: flex-start; gap: 6px; color: var(--green-strong); font-size: 12px; line-height: 1.45; }
+.credential-notice svg { flex: 0 0 auto; margin-top: 1px; }
+.credential-dialog-actions { align-items: center; }
+.danger-button { min-height: 38px; padding: 0 12px; display: inline-flex; align-items: center; gap: 6px; color: #a33c31; background: #fff4f1; border: 1px solid #e7bdb6; border-radius: 5px; font-size: 12px; font-weight: 700; cursor: pointer; }
+.danger-button:hover:not(:disabled) { color: #fff; background: var(--danger); border-color: var(--danger); }
+.danger-button:disabled { cursor: not-allowed; opacity: .55; }
 .sub2api-config-grid { margin-top: 18px; }
 .mail-request-config-grid { margin-top: 18px; }
 .provider-tabs {

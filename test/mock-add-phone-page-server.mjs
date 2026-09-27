@@ -9,6 +9,7 @@ const idTokenPayload = Buffer.from(JSON.stringify({
   email: "add-phone-page@example.com",
   sid: "mock-account-id",
   sub: "mock-user-id",
+  "https://api.openai.com/auth": { chatgpt_plan_type: "plus" },
 })).toString("base64url");
 
 let lastLoginHint = "";

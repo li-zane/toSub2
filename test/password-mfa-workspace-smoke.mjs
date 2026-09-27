@@ -19,6 +19,8 @@ const skipCheckpointPath = path.join(tempRoot, "skip-login-checkpoint.json");
 const directOutputPath = path.join(tempRoot, "direct-sub2api-import-oauth.json");
 const directCheckpointPath = path.join(tempRoot, "direct-login-checkpoint.json");
 const totpResultPath = path.join(tempRoot, "totp-setup-result.json");
+const replaceTotpResultPath = path.join(tempRoot, "totp-replace-result.json");
+const replaceFailureResultPath = path.join(tempRoot, "totp-replace-failure-result.json");
 const mockServer = spawn(process.execPath, [
   path.join(projectRoot, "test", "mock-password-mfa-server.mjs"),
   String(port),
@@ -164,6 +166,87 @@ try {
   assert.equal(setupResult.secret, "NB2W45DFOIZAQWER");
   assert.equal(setupResult.activation_mode, "automatic");
   assert.equal(setupResult.activation_succeeded, true);
+
+  const replaceTotp = await runNode([
+    path.join(projectRoot, "src", "protocol-login.mjs"),
+    "--email", "replace-totp@example.com",
+    "--replace-totp",
+    "--totp-result", replaceTotpResultPath,
+    "--chatgpt-base", baseUrl,
+    "--auth-base", baseUrl,
+    "--verbose",
+  ], {
+    CHATGPT_LOGIN_PASSWORD: "local-test-password",
+    CHATGPT_TOTP_SECRET: "GEZDGNBVGY3TQOJQ",
+  });
+  assert.equal(replaceTotp.code, 0, processFailure(replaceTotp));
+  assert.match(replaceTotp.output, /\[ok\] 2FA replacement activated/);
+  const replaceState = await fetch(`${baseUrl}/__test/state`).then((response) => response.json());
+  assert.equal(replaceState.replacementTotpEnabled, true);
+  assert.deepEqual(
+    replaceState.replacementRequestLog.map((entry) => entry.operation),
+    ["mfa_info", "disable", "mfa_info", "enroll", "activate", "mfa_info"],
+  );
+  assert.equal(replaceState.replacementRequestLog[1].factor_id, "replace-old-factor");
+  assert.equal(replaceState.replacementRequestLog[3].factor_type, "totp");
+  assert.equal(replaceState.replacementRequestLog[4].session_id, "replace-enroll-session");
+  const replaceResult = JSON.parse(await fs.readFile(replaceTotpResultPath, "utf8"));
+  assert.equal(replaceResult.operation, "replace_totp");
+  assert.equal(replaceResult.previous_factor_id, "replace-old-factor");
+  assert.equal(replaceResult.remote_disabled, false);
+  assert.equal(replaceResult.activation_succeeded, true);
+  assert.equal(replaceResult.confirmation_succeeded, true);
+  assert.equal(replaceResult.secret, "MZXW6YTBON2GK3TB");
+  assert.equal(replaceState.replacementRequestLog.at(-1).operation, "mfa_info");
+
+  const replaceFailure = await runNode([
+    path.join(projectRoot, "src", "protocol-login.mjs"),
+    "--email", "replace-totp-enroll-failure@example.com",
+    "--replace-totp",
+    "--totp-result", replaceFailureResultPath,
+    "--chatgpt-base", baseUrl,
+    "--auth-base", baseUrl,
+    "--verbose",
+  ], {
+    CHATGPT_LOGIN_PASSWORD: "local-test-password",
+    CHATGPT_TOTP_SECRET: "GEZDGNBVGY3TQOJQ",
+  });
+  assert.equal(replaceFailure.code, 1, processFailure(replaceFailure));
+  assert.match(replaceFailure.output, /simulated replacement enrollment failure/);
+  const replaceFailureState = await fetch(`${baseUrl}/__test/state`).then((response) => response.json());
+  assert.equal(replaceFailureState.replacementTotpEnabled, false);
+  assert.deepEqual(
+    replaceFailureState.replacementRequestLog.map((entry) => entry.operation),
+    ["mfa_info", "disable", "mfa_info", "enroll"],
+  );
+  const replaceFailureResult = JSON.parse(await fs.readFile(replaceFailureResultPath, "utf8"));
+  assert.equal(replaceFailureResult.operation, "replace_totp");
+  assert.equal(replaceFailureResult.remote_disabled, true);
+  assert.equal(replaceFailureResult.stage, "enroll_failed");
+
+  const replaceRetry = await runNode([
+    path.join(projectRoot, "src", "protocol-login.mjs"),
+    "--email", "replace-totp-enroll-failure@example.com",
+    "--replace-totp",
+    "--totp-result", replaceFailureResultPath,
+    "--chatgpt-base", baseUrl,
+    "--auth-base", baseUrl,
+    "--verbose",
+  ], {
+    CHATGPT_LOGIN_PASSWORD: "local-test-password",
+    CHATGPT_TOTP_SECRET: "GEZDGNBVGY3TQOJQ",
+  });
+  assert.equal(replaceRetry.code, 0, processFailure(replaceRetry));
+  assert.match(replaceRetry.output, /Resuming replacement after the previous factor was disabled/);
+  const replaceRetryState = await fetch(`${baseUrl}/__test/state`).then((response) => response.json());
+  assert.equal(replaceRetryState.replacementTotpEnabled, true);
+  assert.deepEqual(
+    replaceRetryState.replacementRequestLog.map((entry) => entry.operation),
+    ["mfa_info", "disable", "mfa_info", "enroll", "mfa_info", "enroll", "activate", "mfa_info"],
+  );
+  const replaceRetryResult = JSON.parse(await fs.readFile(replaceFailureResultPath, "utf8"));
+  assert.equal(replaceRetryResult.activation_succeeded, true);
+  assert.equal(replaceRetryResult.confirmation_succeeded, true);
   console.log("password/email OTP + 2FA workspace smoke tests passed");
 } catch (error) {
   error.message = `${error.message}\nMock server output:\n${serverLogs}`;
