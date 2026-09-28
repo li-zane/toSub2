@@ -506,6 +506,11 @@ function App() {
     setError("");
     setUploadNotice("正在轮换 2FA 0/" + count);
     try {
+      const preflightJobs = await queryPipelineJobs(ids, emailById);
+      const preflightFailure = preflightJobs.find((job) => !job.canReplaceTotp || !job.canDownload);
+      if (preflightFailure) {
+        throw new Error(`${preflightFailure.email} 当前不满足轮换 2FA 或上传条件，请刷新后重试`);
+      }
       const rotationResults = await Promise.allSettled(ids.map((id) => apiFetch(token, `/api/jobs/${id}/replace-2fa`, {
         method: "POST",
         body: JSON.stringify({ proxyUrl: accountProxyUrl.trim() }),
