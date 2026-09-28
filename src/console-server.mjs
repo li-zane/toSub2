@@ -11,6 +11,11 @@ import react from "@vitejs/plugin-react";
 import { createServer as createViteServer } from "vite";
 import { createCredentialStore } from "./credential-store.mjs";
 import {
+  listAccountSessions,
+  revokeAccountSession,
+  revokeAllAccountSessions,
+} from "./account-sessions.mjs";
+import {
   fetchMailboxOtpCandidates,
   filterMailboxOtpCandidatesByRequestTime,
   validateMailApiUrl,
@@ -218,6 +223,7 @@ async function handleApi(req, res, requestUrl) {
         totpReplace: true,
         passwordAdd: true,
         forceRelogin: true,
+        accountSessions: true,
       },
     });
     return;
@@ -533,7 +539,7 @@ async function handleApi(req, res, requestUrl) {
     return;
   }
 
-  const match = /^\/api\/jobs\/([a-f0-9-]+)(?:\/(input|cancel|retry|regenerate|relogin|setup-2fa|replace-2fa|add-password|credentials|logs|download|sms-number|luban-number))?$/.exec(requestUrl.pathname);
+  const match = /^\/api\/jobs\/([a-f0-9-]+)(?:\/(input|cancel|retry|regenerate|relogin|setup-2fa|replace-2fa|add-password|credentials|logs|download|sms-number|luban-number|sessions(?:\/(?:logout|logout-all))?))?$/.exec(requestUrl.pathname);
   if (!match) {
     sendJson(res, 404, { error: "Not found" });
     return;
@@ -553,6 +559,14 @@ async function handleApi(req, res, requestUrl) {
   if (req.method === "GET" && action === "credentials") {
     await reloadMissingJobCredentials(job);
     sendJson(res, 200, { credentials: await publicCredentialDetails(job) });
+    return;
+  }
+  if (req.method === "GET" && action === "sessions") {
+    try {
+      sendJson(res, 200, { sessions: await listAccountSessions(job) });
+    } catch (error) {
+      throw sessionApiError(error);
+    }
     return;
   }
   if (req.method === "GET" && action === "download") {
@@ -596,6 +610,27 @@ async function handleApi(req, res, requestUrl) {
     const body = await readJson(req);
     await withEmailJobLock(job.email, () => startTotpSetup(job, body));
     sendJson(res, 200, { job: publicJob(job) });
+    return;
+  }
+  if (req.method === "POST" && action === "sessions/logout") {
+    const body = await readJson(req);
+    let result;
+    try {
+      result = await withEmailJobLock(job.email, () => revokeAccountSession(job, body));
+    } catch (error) {
+      throw sessionApiError(error);
+    }
+    sendJson(res, 200, result);
+    return;
+  }
+  if (req.method === "POST" && action === "sessions/logout-all") {
+    let result;
+    try {
+      result = await withEmailJobLock(job.email, () => revokeAllAccountSessions(job));
+    } catch (error) {
+      throw sessionApiError(error);
+    }
+    sendJson(res, 200, result);
     return;
   }
   if (req.method === "POST" && action === "replace-2fa") {
@@ -4845,6 +4880,27 @@ function httpError(status, message) {
   const error = new Error(message);
   error.status = status;
   return error;
+}
+
+function sessionApiError(error) {
+  if (error?.status) return error;
+  const message = String(error?.message || "SESSION_PROVIDER_ERROR: 会话服务请求失败")
+    .replace(/[\r\n]+/g, " ")
+    .slice(0, 320);
+  const status = /SESSION_(?:CREDENTIALS_UNAVAILABLE|TOKEN_EXPIRED)/.test(message)
+    ? 409
+    : /SESSION_(?:TARGET_INVALID|CURRENT_DEVICE)/.test(message)
+      ? 400
+      : /SESSION_TARGET_NOT_FOUND/.test(message)
+        ? 404
+        : /SESSION_TOKEN_REFRESH_FAILED/.test(message)
+          ? 502
+          : /SESSION_PROVIDER_ERROR: HTTP 401/.test(message)
+            ? 401
+            : /SESSION_PROVIDER_ERROR: HTTP 403/.test(message)
+              ? 403
+              : 502;
+  return httpError(status, message.replace(/^SESSION_[A-Z_]+:\s*/, ""));
 }
 
 process.on("SIGINT", () => void shutdown().catch(reportShutdownFailure));

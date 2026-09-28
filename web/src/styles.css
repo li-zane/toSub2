@@ -644,6 +644,34 @@ tbody tr:last-child td { border-bottom: 0; }
 .sub2api-settings-dialog { width: min(620px, 100%); }
 .plan-type-mapping-dialog { width: min(780px, 100%); }
 .credential-dialog { width: min(560px, 100%); }
+.session-dialog { width: min(700px, 100%); }
+.session-list { margin-top: 18px; display: grid; gap: 10px; }
+.session-item {
+  min-width: 0;
+  padding: 13px 12px;
+  display: flex;
+  align-items: flex-start;
+  gap: 11px;
+  background: #fbfcfb;
+  border: 1px solid #dbe4df;
+  border-radius: 6px;
+}
+.session-item-icon { width: 34px; height: 34px; flex: 0 0 auto; display: grid; place-items: center; color: var(--green-strong); background: var(--green-soft); border-radius: 6px; }
+.session-item-main { min-width: 0; flex: 1; }
+.session-item-heading { min-width: 0; display: flex; align-items: center; flex-wrap: wrap; gap: 7px; }
+.session-item-heading strong { min-width: 0; color: var(--ink); font-size: 13px; overflow-wrap: anywhere; }
+.session-badge { display: inline-flex; align-items: center; min-height: 20px; padding: 0 7px; border-radius: 999px; font-size: 10px; font-weight: 700; white-space: nowrap; }
+.session-badge.current { color: #42514b; background: #e7eeeb; }
+.session-badge.trusted { color: #88611a; background: #fff3d5; }
+.session-item-meta { margin-top: 6px; display: flex; flex-wrap: wrap; gap: 4px 11px; color: var(--muted); font-size: 11px; line-height: 1.45; }
+.session-item-meta span + span::before, .session-item-meta time + span::before { content: "·"; margin-right: 11px; color: #b3bdb8; }
+.session-apps { margin-top: 7px; color: #53605b; font-size: 11px; overflow-wrap: anywhere; }
+.session-logout-button { flex: 0 0 auto; margin-top: 2px; }
+.session-empty { min-height: 170px; margin-top: 18px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; color: var(--muted); text-align: center; }
+.session-empty svg { color: var(--green); }
+.session-empty strong { color: var(--ink); font-size: 13px; }
+.session-empty span { font-size: 11px; }
+.session-dialog-actions { margin-top: 20px; }
 .credential-field { display: grid; gap: 7px; margin-top: 18px; color: #53605b; font-size: 12px; font-weight: 700; }
 .secret-input-row {
   min-height: 42px;

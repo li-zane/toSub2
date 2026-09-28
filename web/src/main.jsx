@@ -22,6 +22,8 @@ import {
   LogIn,
   Mail,
   MailCheck,
+  LogOut,
+  MonitorSmartphone,
   Plus,
   RefreshCw,
   RotateCcw,
@@ -127,6 +129,7 @@ function App() {
   const [planTypeMappingDraft, setPlanTypeMappingDraft] = useState(() => planTypeMappingRows(readPlanTypeMapping()));
   const [planTypeMappingError, setPlanTypeMappingError] = useState("");
   const [credentialJob, setCredentialJob] = useState(null);
+  const [sessionJob, setSessionJob] = useState(null);
 
   useEffect(() => writeLocalJson(SMS_PROVIDER_SETTINGS_KEY, smsSettings), [smsSettings]);
   useEffect(() => writeLocalJson(MAIL_REQUEST_SETTINGS_KEY, mailRequestSettings), [mailRequestSettings]);
@@ -173,6 +176,7 @@ function App() {
         if (!stopped) {
           setJobs(data.jobs);
           setCredentialJob((current) => data.jobs.find((job) => job.id === current?.id) || current);
+          setSessionJob((current) => data.jobs.find((job) => job.id === current?.id) || current);
           setJobSelectionIndex(data.selection || data.jobs);
           setPagination(data.pagination || { page, pageSize: 20, total: data.jobs.length, totalPages: 1 });
           setStats(data.stats || { active: 0, queued: 0, completed: 0 });
@@ -228,6 +232,9 @@ function App() {
   );
   const activeCredentialJob = credentialJob
     ? jobs.find((job) => job.id === credentialJob.id) || credentialJob
+    : null;
+  const activeSessionJob = sessionJob
+    ? jobs.find((job) => job.id === sessionJob.id) || sessionJob
     : null;
   const downloadableSelectedCount = selectedJobs.filter((job) => job.canDownload).length;
   const allPageSelected = pageJobIds.length > 0 && pageJobIds.every((id) => selectedJobIds.has(id));
@@ -1042,6 +1049,8 @@ function App() {
                     planTypeMapping={planTypeMapping}
                     credentialsAvailable={Boolean(features.credentialDetails)}
                     onOpenCredentials={() => setCredentialJob(job)}
+                    sessionsAvailable={Boolean(features.accountSessions)}
+                    onOpenSessions={() => setSessionJob(job)}
                   />
                   {expandedJobId === job.id && (
                     <tr className="log-row">
@@ -1073,6 +1082,15 @@ function App() {
           accountProxyUrl={accountProxyUrl}
           totpReplaceAvailable={Boolean(features.totpReplace)}
           onClose={() => setCredentialJob(null)}
+          onError={setError}
+        />
+      )}
+      {activeSessionJob && (
+        <SessionDialog
+          key={activeSessionJob.id}
+          token={token}
+          job={activeSessionJob}
+          onClose={() => setSessionJob(null)}
           onError={setError}
         />
       )}
@@ -1620,7 +1638,7 @@ function EmptyState({ filtered = false }) {
   );
 }
 
-function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggleSelected, selectionSupported, smsProviderAvailable, smsProvider, onUpload, sub2apiUploadAvailable, totpSetupAvailable, passwordAddAvailable, forceReloginAvailable, accountProxyUrl, planTypeMapping, credentialsAvailable, onOpenCredentials }) {
+function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggleSelected, selectionSupported, smsProviderAvailable, smsProvider, onUpload, sub2apiUploadAvailable, totpSetupAvailable, passwordAddAvailable, forceReloginAvailable, accountProxyUrl, planTypeMapping, credentialsAvailable, onOpenCredentials, sessionsAvailable, onOpenSessions }) {
   const [value, setValue] = useState("");
   const [submitting, setSubmitting] = useState(false);
 
@@ -1888,6 +1906,11 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
           {credentialsAvailable && (
             <button type="button" className="icon-button" onClick={onOpenCredentials} disabled={submitting} title="查看或修改账号凭据">
               <KeyRound size={17} />
+            </button>
+          )}
+          {sessionsAvailable && job.canDownload && (
+            <button type="button" className="icon-button" onClick={onOpenSessions} disabled={submitting} title="查看已登录设备和会话">
+              <MonitorSmartphone size={17} />
             </button>
           )}
           {job.canDownload && (
@@ -2312,6 +2335,173 @@ function CredentialDialog({ token, job, accountProxyUrl, totpReplaceAvailable, o
       </form>
     </div>
   );
+}
+
+function SessionDialog({ token, job, onClose, onError }) {
+  const [devices, setDevices] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+  const [action, setAction] = useState("");
+  const [dialogError, setDialogError] = useState("");
+  const [notice, setNotice] = useState("");
+
+  async function loadSessions({ initial = false } = {}) {
+    if (initial) setLoading(true);
+    else setRefreshing(true);
+    setDialogError("");
+    try {
+      const data = await apiFetch(token, `/api/jobs/${job.id}/sessions`);
+      setDevices(data.sessions?.devices || []);
+      onError("");
+    } catch (error) {
+      setDialogError(error.message);
+    } finally {
+      if (initial) setLoading(false);
+      else setRefreshing(false);
+    }
+  }
+
+  useEffect(() => {
+    let stopped = false;
+    setLoading(true);
+    setDialogError("");
+    apiFetch(token, `/api/jobs/${job.id}/sessions`)
+      .then((data) => {
+        if (!stopped) setDevices(data.sessions?.devices || []);
+      })
+      .catch((error) => {
+        if (!stopped) setDialogError(error.message);
+      })
+      .finally(() => {
+        if (!stopped) setLoading(false);
+      });
+    return () => {
+      stopped = true;
+    };
+  }, [job.id, token]);
+
+  async function logoutDevice(device) {
+    if (device.isCurrentDevice) {
+      setDialogError("当前设备不能在这里单独登出，请使用一键登出");
+      return;
+    }
+    const label = device.description || device.displayName || "该设备";
+    if (!window.confirm(`确定登出 ${label} 吗？`)) return;
+    setAction(device.id);
+    setDialogError("");
+    setNotice("");
+    try {
+      await apiFetch(token, `/api/jobs/${job.id}/sessions/logout`, {
+        method: "POST",
+        body: JSON.stringify(device.sessionId
+          ? { sessionId: device.sessionId }
+          : { deviceIdHash: device.deviceIdHash }),
+      });
+      setDevices((current) => current.filter((item) => item.id !== device.id));
+      setNotice("设备已登出");
+      onError("");
+    } catch (error) {
+      setDialogError(error.message);
+    } finally {
+      setAction("");
+    }
+  }
+
+  async function logoutAll() {
+    if (!window.confirm("确定登出该账号的所有设备和会话吗？当前会话也会失效，需要重新登录。")) return;
+    setAction("all");
+    setDialogError("");
+    setNotice("");
+    try {
+      await apiFetch(token, `/api/jobs/${job.id}/sessions/logout-all`, { method: "POST" });
+      setDevices([]);
+      setNotice("已提交全部设备登出请求，服务端可能需要几分钟完成传播");
+      onError("");
+    } catch (error) {
+      setDialogError(error.message);
+    } finally {
+      setAction("");
+    }
+  }
+
+  return (
+    <div className="modal-backdrop" role="presentation" onMouseDown={(event) => {
+      if (event.target === event.currentTarget && !action) onClose();
+    }}>
+      <section className="batch-dialog session-dialog" role="dialog" aria-modal="true" aria-labelledby="session-dialog-title">
+        <div className="dialog-header">
+          <div>
+            <h2 id="session-dialog-title">已登录设备与会话</h2>
+            <span>{job.email}</span>
+          </div>
+          <div className="dialog-header-actions">
+            <button type="button" className="icon-button" onClick={() => loadSessions()} disabled={loading || refreshing || Boolean(action)} title="刷新设备列表" aria-label="刷新设备列表">
+              <RefreshCw className={refreshing ? "spin" : ""} size={17} />
+            </button>
+            <button type="button" className="icon-button" onClick={onClose} disabled={Boolean(action)} title="关闭">
+              <X size={18} />
+            </button>
+          </div>
+        </div>
+
+        {loading ? (
+          <div className="credential-loading"><LoaderCircle className="spin" size={18} />正在读取设备和会话</div>
+        ) : devices.length ? (
+          <div className="session-list" aria-live="polite">
+            {devices.map((device) => (
+              <article className="session-item" key={device.id}>
+                <div className="session-item-icon" aria-hidden="true"><MonitorSmartphone size={19} /></div>
+                <div className="session-item-main">
+                  <div className="session-item-heading">
+                    <strong>{device.description || device.displayName}</strong>
+                    {device.isCurrentDevice && <span className="session-badge current">当前会话</span>}
+                    {!device.isCurrentDevice && device.isTrustedDevice && <span className="session-badge trusted">可信设备</span>}
+                  </div>
+                  <div className="session-item-meta">
+                    {device.description && device.displayName !== device.description && <span>{device.displayName}</span>}
+                    {formatSessionLocation(device) && <span>{formatSessionLocation(device)}</span>}
+                    {device.lastSignedInTimestamp && <time dateTime={new Date(device.lastSignedInTimestamp * 1000).toISOString()}>最近登录 {formatDateTime(new Date(device.lastSignedInTimestamp * 1000).toISOString())}</time>}
+                  </div>
+                  {device.appSessions?.length > 0 && (
+                    <div className="session-apps">应用：{device.appSessions.join("、")}</div>
+                  )}
+                </div>
+                <button
+                  type="button"
+                  className="icon-button danger session-logout-button"
+                  onClick={() => logoutDevice(device)}
+                  disabled={Boolean(action) || device.isCurrentDevice || (!device.sessionId && !device.deviceIdHash)}
+                  title={device.isCurrentDevice ? "当前会话请使用一键登出" : "登出该设备"}
+                  aria-label={`登出 ${device.displayName || "设备"}`}
+                >
+                  {action === device.id ? <LoaderCircle className="spin" size={16} /> : <LogOut size={16} />}
+                </button>
+              </article>
+            ))}
+          </div>
+        ) : (
+          <div className="session-empty"><MonitorSmartphone size={24} /><strong>没有可显示的设备或会话</strong><span>账号可能刚刚完成登出，刷新后会重新读取状态。</span></div>
+        )}
+
+        {dialogError && <div className="dialog-error" role="alert"><CircleAlert size={15} />{dialogError}</div>}
+        {notice && <div className="credential-notice" role="status"><Check size={15} />{notice}</div>}
+        <div className="dialog-actions session-dialog-actions">
+          <button type="button" className="danger-button" onClick={logoutAll} disabled={loading || Boolean(action)}>
+            {action === "all" ? <LoaderCircle className="spin" size={16} /> : <LogOut size={16} />}一键登出所有设备
+          </button>
+          <span className="dialog-actions-spacer" />
+          <button type="button" className="cancel-button" onClick={onClose} disabled={Boolean(action)}>关闭</button>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function formatSessionLocation(device) {
+  const parts = [device.lastSignedInCity, device.lastSignedInRegionCode, device.lastSignedInCountry]
+    .map((value) => String(value || "").trim())
+    .filter(Boolean);
+  return [...new Set(parts)].join(" · ");
 }
 
 function StatusBadge({ status }) {
