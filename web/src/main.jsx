@@ -143,7 +143,7 @@ function App() {
   useEffect(() => writeLocalJson(MAIL_REQUEST_SETTINGS_KEY, mailRequestSettings), [mailRequestSettings]);
   useEffect(() => {
     const browserSettings = { ...sub2apiSettings };
-    if (browserSettings.hasStoredAdminApiKey) browserSettings.adminApiKey = "";
+    browserSettings.adminApiKey = "";
     writeLocalJson(SUB2API_UPLOAD_SETTINGS_KEY, browserSettings);
   }, [sub2apiSettings]);
   useEffect(() => writeLocalTextSetting(ACCOUNT_PROXY_STORAGE_KEY, accountProxyUrl.trim()), [accountProxyUrl]);
