@@ -70,10 +70,12 @@ try {
   const credentialsResponse = await fetch(`${baseUrl}/api/jobs/${jobId}/credentials`, { headers });
   assert.equal(credentialsResponse.status, 200);
   const credentials = await credentialsResponse.json();
-  assert.deepEqual(Object.keys(credentials.credentials).sort(), ["email", "hasPassword", "hasSub2apiJson", "hasTotpKey", "password", "persisted", "sub2apiJson", "totpSecret"].sort());
+  assert.deepEqual(Object.keys(credentials.credentials).sort(), ["email", "hasPassword", "hasSub2apiJson", "hasTotpKey", "password", "passwordAvailable", "persisted", "sub2apiJson", "totpSecret", "totpSecretAvailable"].sort());
   assert.equal(credentials.credentials.email, "credential-smoke@example.com");
   assert.equal(credentials.credentials.password, password);
   assert.equal(credentials.credentials.totpSecret, firstTotp);
+  assert.equal(credentials.credentials.passwordAvailable, true);
+  assert.equal(credentials.credentials.totpSecretAvailable, true);
   assert.equal(credentials.credentials.hasSub2apiJson, true);
   assert.match(credentials.credentials.sub2apiJson, /"type": "sub2api-data"/);
   assert.match(credentials.credentials.sub2apiJson, /credential-smoke@example\.com/);

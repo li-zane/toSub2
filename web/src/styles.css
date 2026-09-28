@@ -618,6 +618,7 @@ tbody tr:last-child td { border-bottom: 0; }
   border-bottom: 1px solid #edf0ef;
 }
 .dialog-header > div { display: flex; align-items: baseline; gap: 9px; }
+.dialog-header .dialog-header-actions { display: flex; align-items: center; gap: 4px; }
 .dialog-header h2 { margin: 0; font-size: 18px; letter-spacing: 0; }
 .dialog-header span { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
 .batch-label { margin: 20px 0 7px; color: #53605b; font-size: 12px; font-weight: 700; }
@@ -666,6 +667,22 @@ tbody tr:last-child td { border-bottom: 0; }
 .credential-notice { margin-top: 10px; display: flex; align-items: flex-start; gap: 6px; color: var(--green-strong); font-size: 12px; line-height: 1.45; }
 .credential-notice svg { flex: 0 0 auto; margin-top: 1px; }
 .credential-dialog-actions { align-items: center; }
+.totp-code-panel {
+  margin-top: 12px;
+  padding: 12px;
+  background: #f2faf6;
+  border: 1px solid #cde4d8;
+  border-radius: 5px;
+}
+.totp-code-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.totp-code-heading > div { display: grid; gap: 4px; }
+.totp-code-heading strong { color: var(--ink); font-size: 12px; }
+.totp-code-heading span { color: var(--muted); font-size: 11px; font-weight: 500; }
+.totp-code-value { margin-top: 10px; display: flex; align-items: baseline; justify-content: space-between; gap: 12px; min-width: 0; }
+.totp-code-value code { min-width: 0; color: var(--green-strong); font: 700 28px/1.15 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; letter-spacing: .16em; overflow-wrap: anywhere; }
+.totp-code-countdown { flex: 0 0 auto; color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.totp-code-progress { height: 4px; margin-top: 10px; overflow: hidden; background: #dcebe3; border-radius: 2px; }
+.totp-code-progress span { display: block; height: 100%; background: var(--green); transition: width .25s linear; }
 .danger-button { min-height: 38px; padding: 0 12px; display: inline-flex; align-items: center; gap: 6px; color: #a33c31; background: #fff4f1; border: 1px solid #e7bdb6; border-radius: 5px; font-size: 12px; font-weight: 700; cursor: pointer; }
 .danger-button:hover:not(:disabled) { color: #fff; background: var(--danger); border-color: var(--danger); }
 .danger-button:disabled { cursor: not-allowed; opacity: .55; }

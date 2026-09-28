@@ -1981,7 +1981,11 @@ function CredentialDialog({ token, job, accountProxyUrl, totpReplaceAvailable, o
   const [totpDirty, setTotpDirty] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
   const [showTotp, setShowTotp] = useState(false);
+  const [totpCode, setTotpCode] = useState("");
+  const [totpSeconds, setTotpSeconds] = useState(0);
+  const [totpCodeError, setTotpCodeError] = useState("");
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
   const [saving, setSaving] = useState(false);
   const [replacing, setReplacing] = useState(false);
   const [dialogError, setDialogError] = useState("");
@@ -2013,6 +2017,60 @@ function CredentialDialog({ token, job, accountProxyUrl, totpReplaceAvailable, o
       stopped = true;
     };
   }, [job.id, token]);
+
+  useEffect(() => {
+    let stopped = false;
+    async function refreshTotpCode() {
+      const normalized = normalizeTotpForDisplay(totpSecret);
+      const seconds = 30 - (Math.floor(Date.now() / 1000) % 30);
+      if (!stopped) setTotpSeconds(seconds);
+      if (!normalized) {
+        if (!stopped) {
+          setTotpCode("");
+          setTotpCodeError("");
+        }
+        return;
+      }
+      try {
+        const code = await generateTotpCode(normalized);
+        if (!stopped) {
+          setTotpCode(code);
+          setTotpCodeError("");
+        }
+      } catch (error) {
+        if (!stopped) {
+          setTotpCode("");
+          setTotpCodeError(error.message || "2FA 密钥无法生成动态验证码");
+        }
+      }
+    }
+    void refreshTotpCode();
+    const timer = window.setInterval(refreshTotpCode, 1_000);
+    return () => {
+      stopped = true;
+      window.clearInterval(timer);
+    };
+  }, [totpSecret]);
+
+  async function refreshCredentials() {
+    setRefreshing(true);
+    setDialogError("");
+    try {
+      const data = await apiFetch(token, `/api/jobs/${job.id}/credentials`);
+      const next = data.credentials || {};
+      setDetails(next);
+      setPassword(next.password || "");
+      setTotpSecret(next.totpSecret || "");
+      setSub2apiJson(next.sub2apiJson || "");
+      setPasswordDirty(false);
+      setTotpDirty(false);
+      onError("");
+    } catch (error) {
+      setDialogError(error.message);
+    } finally {
+      setRefreshing(false);
+    }
+  }
 
   async function save(event) {
     event.preventDefault();
@@ -2092,6 +2150,17 @@ function CredentialDialog({ token, job, accountProxyUrl, totpReplaceAvailable, o
     }
   }
 
+  async function copyTotpCode() {
+    if (!totpCode) return;
+    try {
+      await navigator.clipboard.writeText(totpCode);
+      setNotice("动态验证码已复制");
+      onError("");
+    } catch {
+      setDialogError("无法自动复制动态验证码，请手动选择验证码");
+    }
+  }
+
   return (
     <div className="modal-backdrop" role="presentation" onMouseDown={(event) => {
       if (event.target === event.currentTarget && !saving && !replacing) onClose();
@@ -2102,24 +2171,37 @@ function CredentialDialog({ token, job, accountProxyUrl, totpReplaceAvailable, o
             <h2 id="credential-dialog-title">账号凭据</h2>
             <span>{job.email}</span>
           </div>
-          <button type="button" className="icon-button" onClick={onClose} disabled={saving || replacing} title="关闭">
-            <X size={18} />
-          </button>
+          <div className="dialog-header-actions">
+            <button
+              type="button"
+              className="icon-button"
+              onClick={refreshCredentials}
+              disabled={loading || refreshing || saving || replacing || passwordDirty || totpDirty}
+              title={passwordDirty || totpDirty ? "请先保存当前修改" : "重新读取凭据"}
+              aria-label="重新读取凭据"
+            >
+              <RefreshCw className={refreshing ? "spin" : ""} size={17} />
+            </button>
+            <button type="button" className="icon-button" onClick={onClose} disabled={saving || replacing} title="关闭">
+              <X size={18} />
+            </button>
+          </div>
         </div>
 
         {loading ? (
           <div className="credential-loading"><LoaderCircle className="spin" size={18} />正在读取凭据</div>
         ) : (
           <>
-            <label className="credential-field">
+            <div className="credential-field">
               <span>密码</span>
               <div className="secret-input-row">
                 <KeyRound size={15} aria-hidden="true" />
                 <input
+                  aria-label="密码"
                   type={showPassword ? "text" : "password"}
                   value={password}
                   onChange={(event) => { setPassword(event.target.value); setPasswordDirty(true); }}
-                  placeholder={details?.hasPassword ? "凭据已保存" : "未保存密码"}
+                  placeholder={details?.passwordAvailable ? "凭据已保存" : details?.hasPassword ? "原文不可恢复，请重新录入" : "未保存密码"}
                   autoComplete="off"
                   spellCheck="false"
                 />
@@ -2127,16 +2209,22 @@ function CredentialDialog({ token, job, accountProxyUrl, totpReplaceAvailable, o
                   {showPassword ? <EyeOff size={16} /> : <Eye size={16} />}
                 </button>
               </div>
-            </label>
-            <label className="credential-field">
+            </div>
+            {details?.hasPassword && !details?.passwordAvailable && (
+              <div className="credential-warning credential-warning-block">
+                该账号只保留了密码存在标记，旧版本没有保存密码原文。请重新录入并保存，之后即可查看。
+              </div>
+            )}
+            <div className="credential-field">
               <span>2FA 密钥</span>
               <div className="secret-input-row">
                 <ShieldCheck size={15} aria-hidden="true" />
                 <input
+                  aria-label="2FA 密钥"
                   type={showTotp ? "text" : "password"}
                   value={totpSecret}
                   onChange={(event) => { setTotpSecret(event.target.value); setTotpDirty(true); }}
-                  placeholder={details?.hasTotpKey ? "密钥已保存" : "未保存 2FA 密钥"}
+                  placeholder={details?.totpSecretAvailable ? "密钥已保存" : details?.hasTotpKey ? "原文不可恢复，请重新录入" : "未保存 2FA 密钥"}
                   autoComplete="off"
                   spellCheck="false"
                   inputMode="text"
@@ -2145,7 +2233,43 @@ function CredentialDialog({ token, job, accountProxyUrl, totpReplaceAvailable, o
                   {showTotp ? <EyeOff size={16} /> : <Eye size={16} />}
                 </button>
               </div>
-            </label>
+            </div>
+            {details?.hasTotpKey && !details?.totpSecretAvailable && (
+              <div className="credential-warning credential-warning-block">
+                该账号只保留了 2FA 存在标记，旧版本没有保存密钥原文。请重新录入并保存，之后即可生成动态验证码。
+              </div>
+            )}
+            <section className="totp-code-panel" aria-labelledby="totp-code-title">
+              <div className="totp-code-heading">
+                <div>
+                  <strong id="totp-code-title">当前动态验证码</strong>
+                  <span>每 30 秒自动更新</span>
+                </div>
+                <button
+                  type="button"
+                  className="icon-button"
+                  onClick={copyTotpCode}
+                  disabled={!totpCode}
+                  title="复制动态验证码"
+                  aria-label="复制动态验证码"
+                >
+                  <Copy size={16} />
+                </button>
+              </div>
+              {totpCode ? (
+                <div className="totp-code-value" aria-live="polite">
+                  <code>{totpCode}</code>
+                  <span className="totp-code-countdown">{totpSeconds} 秒后更新</span>
+                </div>
+              ) : totpCodeError ? (
+                <div className="credential-warning credential-warning-block">{totpCodeError}</div>
+              ) : (
+                <div className="credential-json-empty">保存可读取的 2FA 密钥后，这里会显示动态验证码</div>
+              )}
+              <div className="totp-code-progress" aria-hidden="true">
+                <span style={{ width: `${Math.min(100, Math.max(0, (totpSeconds / 30) * 100))}%` }} />
+              </div>
+            </section>
             <section className="credential-json-section" aria-labelledby="sub2api-json-title">
               <div className="credential-json-heading">
                 <div>
@@ -2432,6 +2556,58 @@ function readLocalSetting(key) {
   } catch {
     return "";
   }
+}
+
+function normalizeTotpForDisplay(secret) {
+  let value = String(secret || "").trim();
+  if (/^otpauth:\/\//i.test(value)) {
+    try {
+      value = new URL(value).searchParams.get("secret") || "";
+    } catch {
+      return "";
+    }
+  }
+  const normalized = value.toUpperCase().replace(/[\s-]/g, "").replace(/=+$/g, "");
+  return /^[A-Z2-7]{16,128}$/.test(normalized) ? normalized : "";
+}
+
+function decodeTotpBase32(secret) {
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+  const output = [];
+  let buffer = 0;
+  let bits = 0;
+  for (const character of secret) {
+    const value = alphabet.indexOf(character);
+    if (value < 0) throw new Error("2FA 密钥不是有效的 Base32 格式");
+    buffer = (buffer << 5) | value;
+    bits += 5;
+    if (bits >= 8) {
+      bits -= 8;
+      output.push((buffer >> bits) & 0xff);
+    }
+  }
+  return new Uint8Array(output);
+}
+
+async function generateTotpCode(secret, timestamp = Date.now()) {
+  const normalized = normalizeTotpForDisplay(secret);
+  if (!normalized) throw new Error("2FA 密钥不是有效的 Base32 格式");
+  const subtle = globalThis.crypto?.subtle;
+  if (!subtle) throw new Error("当前浏览器不支持生成动态验证码");
+  const keyBytes = decodeTotpBase32(normalized);
+  const counter = Math.floor(Number(timestamp) / 1000 / 30);
+  const counterBytes = new ArrayBuffer(8);
+  const counterView = new DataView(counterBytes);
+  counterView.setUint32(0, Math.floor(counter / 0x100000000));
+  counterView.setUint32(4, counter >>> 0);
+  const key = await subtle.importKey("raw", keyBytes, { name: "HMAC", hash: "SHA-1" }, false, ["sign"]);
+  const digest = new Uint8Array(await subtle.sign("HMAC", key, counterBytes));
+  const offset = digest[digest.length - 1] & 0x0f;
+  const binary = ((digest[offset] & 0x7f) << 24)
+    | ((digest[offset + 1] & 0xff) << 16)
+    | ((digest[offset + 2] & 0xff) << 8)
+    | (digest[offset + 3] & 0xff);
+  return String(binary % 1_000_000).padStart(6, "0");
 }
 
 function normalizePlanTypeMapping(value) {

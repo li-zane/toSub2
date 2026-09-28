@@ -3130,6 +3130,8 @@ async function publicCredentialDetails(job, persisted = null) {
     totpSecret: job.totpSecret || "",
     hasPassword: Boolean(job.password || job.hasPasswordCredential),
     hasTotpKey: Boolean(job.totpSecret || job.hasTotpCredential),
+    passwordAvailable: Boolean(job.password),
+    totpSecretAvailable: Boolean(job.totpSecret),
     sub2apiJson,
     hasSub2apiJson: Boolean(sub2apiJson),
     persisted,
