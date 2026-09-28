@@ -627,7 +627,7 @@ try {
     headers,
     body: JSON.stringify({
       ids: [profileJob.id, "missing-job-is-filtered-by-selection-limit"],
-      config: { baseUrl: sub2apiUrl, adminApiKey: "test-admin-key", groupIds: ["7", "8"], proxyId: "3", concurrency: "10", loadFactor: "100", priority: "1", modelWhitelist: "gpt-5\ngpt-5-mini", codexFingerprintMode: "full" },
+      config: { baseUrl: sub2apiUrl, adminApiKey: "test-admin-key", groupIds: ["7", "8"], proxyId: "3", concurrency: "10", loadFactor: "100", priority: "1", modelWhitelist: "gpt-5\ngpt-5-mini", codexFingerprintMode: "full", wsMode: "http_bridge" },
     }),
   });
   assert.equal(uploadResponse.status, 404);
@@ -637,7 +637,7 @@ try {
     headers,
     body: JSON.stringify({
       ids: [profileJob.id],
-      config: { baseUrl: sub2apiUrl, adminApiKey: "test-admin-key", groupIds: ["7", "8"], proxyId: "3", concurrency: "10", loadFactor: "100", priority: "1", modelWhitelist: "gpt-5\ngpt-5-mini", codexFingerprintMode: "full" },
+      config: { baseUrl: sub2apiUrl, adminApiKey: "test-admin-key", groupIds: ["7", "8"], proxyId: "3", concurrency: "10", loadFactor: "100", priority: "1", modelWhitelist: "gpt-5\ngpt-5-mini", codexFingerprintMode: "full", wsMode: "http_bridge" },
     }),
   });
   const validUploadText = await validUploadResponse.text();
@@ -653,6 +653,8 @@ try {
   assert.equal(uploadedAccounts[0].status, "active");
   assert.equal(uploadedAccounts[0].schedulable, true);
   assert.equal(uploadedAccounts[0].extra.codex_fingerprint_mode, "full");
+  assert.equal(uploadedAccounts[0].extra.openai_oauth_responses_websockets_v2_mode, "http_bridge");
+  assert.equal(uploadedAccounts[0].extra.openai_oauth_responses_websockets_v2_enabled, true);
   assert.deepEqual(uploadedAccounts[0].credentials.model_mapping, { "gpt-5": "gpt-5", "gpt-5-mini": "gpt-5-mini" });
   assert.equal(uploadedAccounts[0].credentials.email, "account-profile@example.com");
 
@@ -666,6 +668,20 @@ try {
   });
   assert.equal(legacyUploadResponse.status, 200, await legacyUploadResponse.text());
   assert.equal(uploadedAccounts[0].extra.codex_fingerprint_mode, "session", "旧配置未填写时应使用 Sub2API 的推荐默认值");
+  assert.equal(uploadedAccounts[0].extra.openai_oauth_responses_websockets_v2_mode, "off", "旧配置未填写时 WS mode 应保持关闭");
+  assert.equal(uploadedAccounts[0].extra.openai_oauth_responses_websockets_v2_enabled, false);
+
+  const legacyWsModeUploadResponse = await fetch(`${baseUrl}/api/sub2api/upload`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      ids: [profileJob.id],
+      config: { baseUrl: sub2apiUrl, adminApiKey: "test-admin-key", openaiWsMode: " HTTP_BRIDGE " },
+    }),
+  });
+  assert.equal(legacyWsModeUploadResponse.status, 200, await legacyWsModeUploadResponse.text());
+  assert.equal(uploadedAccounts[0].extra.openai_oauth_responses_websockets_v2_mode, "http_bridge", "旧 WS mode 别名应归一化");
+  assert.equal(uploadedAccounts[0].extra.openai_oauth_responses_websockets_v2_enabled, true);
 
   const disabledFingerprintUploadResponse = await fetch(`${baseUrl}/api/sub2api/upload`, {
     method: "POST",
@@ -677,6 +693,16 @@ try {
   });
   assert.equal(disabledFingerprintUploadResponse.status, 200, await disabledFingerprintUploadResponse.text());
   assert.equal(uploadedAccounts[0].extra.codex_fingerprint_mode, "off", "关闭模式必须显式写入，不能退回默认值");
+
+  const invalidWsModeUploadResponse = await fetch(`${baseUrl}/api/sub2api/upload`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      ids: [profileJob.id],
+      config: { baseUrl: sub2apiUrl, adminApiKey: "test-admin-key", wsMode: "invalid" },
+    }),
+  });
+  assert.equal(invalidWsModeUploadResponse.status, 400, await invalidWsModeUploadResponse.text());
 
   const invalidFingerprintUploadResponse = await fetch(`${baseUrl}/api/sub2api/upload`, {
     method: "POST",
@@ -837,6 +863,7 @@ try {
     adminApiKey: "test-admin-key",
     groupIds: ["7"],
     codexFingerprintMode: "device",
+    wsMode: "passthrough",
   };
   const monitorSaveResponse = await fetch(`${baseUrl}/api/sub2api/monitor`, {
     method: "POST",
@@ -897,6 +924,8 @@ try {
   assert.deepEqual(updatedRemoteAccounts.get(91).extra, {
     existing_setting: "preserved",
     codex_fingerprint_mode: "device",
+    openai_oauth_responses_websockets_v2_mode: "passthrough",
+    openai_oauth_responses_websockets_v2_enabled: true,
   });
 
   const bannedCreateResponse = await fetch(`${baseUrl}/api/jobs`, {

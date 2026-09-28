@@ -457,10 +457,7 @@ async function handleApi(req, res, requestUrl) {
     const accounts = payload.accounts.map((account) => {
       const { proxy_key: _proxyKey, ...accountData } = account;
       const credentials = { ...(account.credentials || {}) };
-      const extra = {
-        ...(account.extra && typeof account.extra === "object" ? account.extra : {}),
-        codex_fingerprint_mode: config.codexFingerprintMode,
-      };
+      const extra = buildSub2ApiAccountExtra(account.extra, config);
       if (config.modelWhitelist.length) {
         credentials.model_mapping = Object.fromEntries(config.modelWhitelist.map((model) => [model, model]));
       }
@@ -2538,7 +2535,28 @@ function normalizeSub2ApiConfig(value) {
   if (!["off", "device", "session", "full"].includes(codexFingerprintMode)) {
     throw httpError(400, "Codex 指纹收敛模式无效");
   }
-  return { baseUrl, adminApiKey, groupIds, proxyId, concurrency, loadFactor, priority, modelWhitelist, codexFingerprintMode };
+  const wsMode = normalizeSub2ApiWsMode(
+    config.wsMode ?? config.openaiWsMode ?? config.openaiOAuthResponsesWebsocketsV2Mode,
+  );
+  return { baseUrl, adminApiKey, groupIds, proxyId, concurrency, loadFactor, priority, modelWhitelist, codexFingerprintMode, wsMode };
+}
+
+const SUB2API_WS_MODES = new Set(["off", "ctx_pool", "passthrough", "http_bridge"]);
+
+function normalizeSub2ApiWsMode(value) {
+  const mode = String(value ?? "").trim().toLowerCase() || "off";
+  if (!SUB2API_WS_MODES.has(mode)) throw httpError(400, "Sub2API WS mode 无效");
+  return mode;
+}
+
+function buildSub2ApiAccountExtra(value, config) {
+  const extra = value && typeof value === "object" ? { ...value } : {};
+  extra.codex_fingerprint_mode = config.codexFingerprintMode;
+  extra.openai_oauth_responses_websockets_v2_mode = config.wsMode;
+  extra.openai_oauth_responses_websockets_v2_enabled = config.wsMode !== "off";
+  delete extra.responses_websockets_v2_enabled;
+  delete extra.openai_ws_enabled;
+  return extra;
 }
 
 function readDurationEnv(name, fallback, minimum) {
@@ -2662,6 +2680,7 @@ async function persistSub2ApiMonitorConfiguration() {
       priority: sub2ApiMonitorConfig.priority,
       modelWhitelist: sub2ApiMonitorConfig.modelWhitelist,
       codexFingerprintMode: sub2ApiMonitorConfig.codexFingerprintMode,
+      wsMode: sub2ApiMonitorConfig.wsMode,
     },
     state: {
       lastCheckAt: sub2ApiMonitorState.lastCheckAt,
@@ -2982,10 +3001,7 @@ async function performSub2ApiAutoRepairSuccess(job) {
         ...(remoteAccount.credentials && typeof remoteAccount.credentials === "object" ? remoteAccount.credentials : {}),
         ...localAccount.credentials,
       };
-      const extra = {
-        ...(remoteAccount.extra && typeof remoteAccount.extra === "object" ? remoteAccount.extra : {}),
-        codex_fingerprint_mode: operation.config.codexFingerprintMode,
-      };
+      const extra = buildSub2ApiAccountExtra(remoteAccount.extra, operation.config);
       await requestSub2Api(operation.config, `/api/v1/admin/accounts/${accountId}`, {
         method: "PUT",
         body: JSON.stringify({ credentials, extra }),

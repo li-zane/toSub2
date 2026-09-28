@@ -56,6 +56,14 @@ const DEFAULT_PLAN_TYPE_MAPPING = {
   self_serve_business_prolite: "Business Premium",
   self_serve_pro: "Pro",
 };
+const SUB2API_WS_MODE_OPTIONS = [
+  { value: "off", label: "关闭（off）" },
+  { value: "ctx_pool", label: "上下文池（ctx_pool）" },
+  { value: "passthrough", label: "透传（passthrough）" },
+  { value: "http_bridge", label: "HTTP 桥接（http_bridge）" },
+];
+const SUB2API_WS_MODES = new Set(SUB2API_WS_MODE_OPTIONS.map((option) => option.value));
+const SUB2API_WS_MODE_LABELS = Object.fromEntries(SUB2API_WS_MODE_OPTIONS.map((option) => [option.value, option.label]));
 const SMS_PROVIDER_EXTERNAL_LINKS = {
   luban: {
     href: "https://lubansms.com/",
@@ -859,7 +867,7 @@ function App() {
           <span className={`provider-ready ${sub2apiSettings.adminApiKey ? "" : "incomplete"}`}>
             {sub2apiSettings.adminApiKey ? <Check size={14} /> : <CircleAlert size={14} />}
             {sub2apiSettings.adminApiKey
-              ? `${sub2apiSettings.groupIds.length ? `已配置 · ${sub2apiSettings.groupIds.length} 个号池` : "已配置 · 默认号池"}${sub2apiSettings.proxyId ? " · 已指定代理" : ""}`
+              ? `${sub2apiSettings.groupIds.length ? `已配置 · ${sub2apiSettings.groupIds.length} 个号池` : "已配置 · 默认号池"}${sub2apiSettings.proxyId ? " · 已指定代理" : ""} · WS ${SUB2API_WS_MODE_LABELS[sub2apiSettings.wsMode] || sub2apiSettings.wsMode}`
               : "未完成配置"}
           </span>
           {features.sub2apiMonitor && (
@@ -1405,6 +1413,15 @@ function App() {
                   <option value="full">完全收敛</option>
                 </select>
               </label>
+              <label className="settings-field wide-settings-field">
+                <span>WS mode</span>
+                <select
+                  value={sub2apiSettingsDraft.wsMode}
+                  onChange={(event) => setSub2apiSettingsDraft((current) => ({ ...current, wsMode: event.target.value }))}
+                >
+                  {SUB2API_WS_MODE_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+                </select>
+              </label>
               <label className="settings-field">
                 <span>并发数</span>
                 <input
@@ -1453,7 +1470,7 @@ function App() {
                 />
               </label>
             </div>
-            <div className="dialog-hint">分组为空时，上传使用 Sub2API 默认号池，监控检查全部 OpenAI 账号；选择分组后只监控这些号池。Codex 指纹收敛会写入每个上传或巡检更新的 OpenAI OAuth 账号。</div>
+            <div className="dialog-hint">分组为空时，上传使用 Sub2API 默认号池，监控检查全部 OpenAI 账号；选择分组后只监控这些号池。Codex 指纹收敛和 WS mode 会写入每个上传或巡检更新的 OpenAI OAuth 账号。要让账号级 WS mode 生效，请确认 Sub2API 的 gateway.openai_ws.mode_router_v2_enabled 已开启。</div>
             {features.sub2apiMonitor && sub2apiMonitorStatus.configured && (
               <div className={`sub2api-monitor-status ${sub2apiMonitorStatus.lastError ? "error" : ""}`}>
                 <ShieldCheck size={15} />
@@ -2930,6 +2947,8 @@ function normalizeSub2ApiSettings(value) {
     : String(stored.groupId || "").trim()
       ? [stored.groupId]
       : [];
+  const rawWsMode = stored.wsMode ?? stored.openaiWsMode ?? stored.openaiOAuthResponsesWebsocketsV2Mode;
+  const wsMode = String(rawWsMode ?? "off").trim().toLowerCase();
   return {
     baseUrl: String(stored.baseUrl || ""),
     adminApiKey: String(stored.adminApiKey || ""),
@@ -2942,6 +2961,9 @@ function normalizeSub2ApiSettings(value) {
     codexFingerprintMode: ["off", "device", "session", "full"].includes(stored.codexFingerprintMode)
       ? stored.codexFingerprintMode
       : "session",
+    wsMode: SUB2API_WS_MODES.has(wsMode)
+      ? wsMode
+      : "off",
     monitorEnabled: stored.monitorEnabled === true,
   };
 }
