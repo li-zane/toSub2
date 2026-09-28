@@ -38,6 +38,7 @@ const JOB_META_FILENAME = "job-meta.json";
 const LOGIN_CHECKPOINT_FILENAME = "login-checkpoint.json";
 const TOTP_SETUP_RESULT_FILENAME = "totp-setup-result.json";
 const PASSWORD_ADD_RESULT_FILENAME = "password-add-result.json";
+const SUB2API_SETTINGS_FILENAME = "sub2api-settings.json";
 const SUB2API_MONITOR_FILENAME = "sub2api-monitor.json";
 const SUB2API_WS_MODES = new Set(["off", "ctx_pool", "passthrough", "http_bridge"]);
 const SUB2API_MONITOR_INTERVAL_MS = readDurationEnv("SUB2API_MONITOR_INTERVAL_MS", 5 * 60_000, 1_000);
@@ -69,6 +70,7 @@ const OUTPUT_ROOT = path.resolve(
   process.env.ONBOARDING_OUTPUT_ROOT || path.join(WORKSPACE_ROOT, "tmp", "chatgpt-onboarding-console"),
 );
 const SUB2API_MONITOR_PATH = path.join(OUTPUT_ROOT, SUB2API_MONITOR_FILENAME);
+const SUB2API_SETTINGS_PATH = path.join(OUTPUT_ROOT, SUB2API_SETTINGS_FILENAME);
 const credentialStore = createCredentialStore();
 const consoleToken = crypto.randomBytes(24).toString("base64url");
 const jobs = new Map();
@@ -79,6 +81,7 @@ let lastOutputSyncAt = 0;
 let shuttingDown = false;
 let queueSchedulingPaused = false;
 let shutdownPromise = null;
+let sub2ApiSettingsConfig = null;
 let sub2ApiMonitorConfig = null;
 let sub2ApiMonitorTimer = null;
 let sub2ApiMonitorPromise = null;
@@ -122,6 +125,7 @@ if (!Number.isInteger(requestedPort) || requestedPort < 1 || requestedPort > 655
 }
 
 await fs.mkdir(OUTPUT_ROOT, { recursive: true });
+await loadSub2ApiSettingsConfiguration();
 await loadSub2ApiMonitorConfiguration();
 await syncCompletedOutputs(true);
 scheduleQueuedJobs();
@@ -491,6 +495,20 @@ async function handleApi(req, res, requestUrl) {
     return;
   }
 
+  if (req.method === "GET" && requestUrl.pathname === "/api/sub2api/settings") {
+    sendJson(res, 200, publicSub2ApiSettingsState());
+    return;
+  }
+
+  if (req.method === "POST" && requestUrl.pathname === "/api/sub2api/settings") {
+    const body = await readJson(req);
+    const config = normalizeSub2ApiConfig(body.config, { inheritStoredFields: true });
+    sub2ApiSettingsConfig = config;
+    await persistSub2ApiSettingsConfiguration();
+    sendJson(res, 200, publicSub2ApiSettingsState());
+    return;
+  }
+
   if (req.method === "GET" && requestUrl.pathname === "/api/sub2api/monitor") {
     sendJson(res, 200, publicSub2ApiMonitorState());
     return;
@@ -498,12 +516,10 @@ async function handleApi(req, res, requestUrl) {
 
   if (req.method === "POST" && requestUrl.pathname === "/api/sub2api/monitor") {
     const body = await readJson(req);
-    if (body.enabled) {
-      const config = normalizeSub2ApiConfig(body.config);
-      sub2ApiMonitorConfig = { ...config, enabled: true };
-    } else {
-      sub2ApiMonitorConfig = null;
-    }
+    const config = normalizeSub2ApiConfig(body.config, { inheritStoredFields: true });
+    sub2ApiSettingsConfig = config;
+    await persistSub2ApiSettingsConfiguration();
+    sub2ApiMonitorConfig = { ...config, enabled: body.enabled === true };
     sub2ApiMonitorState.lastError = null;
     await persistSub2ApiMonitorConfiguration();
     scheduleSub2ApiMonitor();
@@ -2497,10 +2513,12 @@ async function buildSub2ApiUploadPayload(downloadable) {
   };
 }
 
-function normalizeSub2ApiConfig(value) {
+function normalizeSub2ApiConfig(value, options = {}) {
   const config = value && typeof value === "object" ? value : {};
-  const baseUrl = String(config.baseUrl || "").trim().replace(/\/+$/, "");
-  const adminApiKey = String(config.adminApiKey || "").trim();
+  const fallback = sub2ApiSettingsConfig || sub2ApiMonitorConfig || {};
+  const stored = options.inheritStoredFields ? fallback : {};
+  const baseUrl = String(config.baseUrl || fallback.baseUrl || "").trim().replace(/\/+$/, "");
+  const adminApiKey = String(config.adminApiKey || fallback.adminApiKey || "").trim();
   if (!baseUrl) throw httpError(400, "请填写 Sub2API 后端地址");
   let parsed;
   try {
@@ -2516,28 +2534,51 @@ function normalizeSub2ApiConfig(value) {
   }
   const rawGroupIds = Array.isArray(config.groupIds)
     ? config.groupIds
-    : String(config.groupId || "").trim() ? [config.groupId] : [];
+    : Object.hasOwn(config, "groupId")
+      ? (String(config.groupId || "").trim() ? [config.groupId] : [])
+      : Array.isArray(stored.groupIds) ? stored.groupIds : [];
   const groupIds = [...new Set(rawGroupIds.map((value) => String(value).trim()).filter(Boolean))].map((value) => {
     if (!/^\d+$/.test(value) || Number(value) <= 0 || Number(value) > Number.MAX_SAFE_INTEGER) {
       throw httpError(400, "目标号池 ID 无效");
     }
     return Number(value);
   });
-  const proxyText = String(config.proxyId || "").trim();
+  const proxyText = String(Object.hasOwn(config, "proxyId") ? config.proxyId : (stored.proxyId || "")).trim();
   if (proxyText && (!/^\d+$/.test(proxyText) || Number(proxyText) <= 0 || Number(proxyText) > Number.MAX_SAFE_INTEGER)) {
     throw httpError(400, "代理 ID 无效");
   }
   const proxyId = proxyText ? Number(proxyText) : 0;
-  const concurrency = parseOptionalSub2ApiInteger(config.concurrency, "并发数", 0, 10000);
-  const loadFactor = parseOptionalSub2ApiInteger(config.loadFactor, "负载因子", 0, 10000);
-  const priority = parseOptionalSub2ApiInteger(config.priority, "优先级", 0, 10000);
-  const modelWhitelist = parseSub2ApiModelWhitelist(config.modelWhitelist);
-  const codexFingerprintMode = String(config.codexFingerprintMode || "session").trim().toLowerCase();
+  const concurrency = parseOptionalSub2ApiInteger(
+    Object.hasOwn(config, "concurrency") ? config.concurrency : stored.concurrency,
+    "并发数",
+    0,
+    10000,
+  );
+  const loadFactor = parseOptionalSub2ApiInteger(
+    Object.hasOwn(config, "loadFactor") ? config.loadFactor : stored.loadFactor,
+    "负载因子",
+    0,
+    10000,
+  );
+  const priority = parseOptionalSub2ApiInteger(
+    Object.hasOwn(config, "priority") ? config.priority : stored.priority,
+    "优先级",
+    0,
+    10000,
+  );
+  const modelWhitelist = parseSub2ApiModelWhitelist(
+    Object.hasOwn(config, "modelWhitelist") ? config.modelWhitelist : stored.modelWhitelist,
+  );
+  const codexFingerprintMode = String(config.codexFingerprintMode || stored.codexFingerprintMode || "session").trim().toLowerCase();
   if (!["off", "device", "session", "full"].includes(codexFingerprintMode)) {
     throw httpError(400, "Codex 指纹收敛模式无效");
   }
   const wsMode = normalizeSub2ApiWsMode(
-    config.wsMode ?? config.openaiWsMode ?? config.openaiOAuthResponsesWebsocketsV2Mode,
+    config.wsMode
+      ?? config.openaiWsMode
+      ?? config.openaiOAuthResponsesWebsocketsV2Mode
+      ?? stored.wsMode
+      ?? "off",
   );
   return { baseUrl, adminApiKey, groupIds, proxyId, concurrency, loadFactor, priority, modelWhitelist, codexFingerprintMode, wsMode };
 }
@@ -2643,11 +2684,70 @@ function sub2ApiResponseMessage(payload, text) {
     : extractResponseMessage(text);
 }
 
+function serializeSub2ApiConfig(config) {
+  return {
+    baseUrl: config.baseUrl,
+    adminApiKey: config.adminApiKey,
+    groupIds: config.groupIds,
+    proxyId: config.proxyId,
+    concurrency: config.concurrency,
+    loadFactor: config.loadFactor,
+    priority: config.priority,
+    modelWhitelist: config.modelWhitelist,
+    codexFingerprintMode: config.codexFingerprintMode,
+    wsMode: config.wsMode,
+  };
+}
+
+function publicSub2ApiConfig(config) {
+  if (!config) return null;
+  const { adminApiKey: _adminApiKey, ...publicConfig } = serializeSub2ApiConfig(config);
+  return publicConfig;
+}
+
+function publicSub2ApiSettingsState() {
+  const config = sub2ApiSettingsConfig || sub2ApiMonitorConfig;
+  return {
+    configured: Boolean(config?.baseUrl && config?.adminApiKey),
+    hasAdminApiKey: Boolean(config?.adminApiKey),
+    monitorEnabled: Boolean(sub2ApiMonitorConfig?.enabled),
+    config: publicSub2ApiConfig(config),
+  };
+}
+
+async function loadSub2ApiSettingsConfiguration() {
+  try {
+    const saved = JSON.parse(await fs.readFile(SUB2API_SETTINGS_PATH, "utf8"));
+    sub2ApiSettingsConfig = normalizeSub2ApiConfig(saved.config);
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      console.warn(`[warn] Sub2API 设置配置无法读取：${String(error?.message || error).slice(0, 180)}`);
+    }
+    sub2ApiSettingsConfig = null;
+  }
+}
+
+async function persistSub2ApiSettingsConfiguration() {
+  if (!sub2ApiSettingsConfig) return;
+  const payload = {
+    version: 1,
+    config: serializeSub2ApiConfig(sub2ApiSettingsConfig),
+    updatedAt: new Date().toISOString(),
+  };
+  const tempPath = `${SUB2API_SETTINGS_PATH}.${process.pid}.${crypto.randomUUID()}.tmp`;
+  await fs.writeFile(tempPath, `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 });
+  await fs.rename(tempPath, SUB2API_SETTINGS_PATH);
+}
+
 async function loadSub2ApiMonitorConfiguration() {
   try {
     const saved = JSON.parse(await fs.readFile(SUB2API_MONITOR_PATH, "utf8"));
     const config = normalizeSub2ApiConfig(saved.config);
     sub2ApiMonitorConfig = { ...config, enabled: saved.enabled === true };
+    if (!sub2ApiSettingsConfig) {
+      sub2ApiSettingsConfig = config;
+      await persistSub2ApiSettingsConfiguration();
+    }
     sub2ApiMonitorState.lastCheckAt = saved.state?.lastCheckAt || null;
     sub2ApiMonitorState.lastError = saved.state?.lastError || null;
     sub2ApiMonitorState.lastResult = saved.state?.lastResult && typeof saved.state.lastResult === "object"
@@ -2657,30 +2757,18 @@ async function loadSub2ApiMonitorConfiguration() {
     if (error?.code !== "ENOENT") {
       console.warn(`[warn] Sub2API 号池监控配置无法读取：${String(error?.message || error).slice(0, 180)}`);
     }
-    sub2ApiMonitorConfig = null;
+    sub2ApiMonitorConfig = sub2ApiSettingsConfig
+      ? { ...sub2ApiSettingsConfig, enabled: false }
+      : null;
   }
 }
 
 async function persistSub2ApiMonitorConfiguration() {
-  if (!sub2ApiMonitorConfig) {
-    await fs.rm(SUB2API_MONITOR_PATH, { force: true });
-    return;
-  }
+  if (!sub2ApiMonitorConfig) return;
   const payload = {
     version: 1,
     enabled: Boolean(sub2ApiMonitorConfig.enabled),
-    config: {
-      baseUrl: sub2ApiMonitorConfig.baseUrl,
-      adminApiKey: sub2ApiMonitorConfig.adminApiKey,
-      groupIds: sub2ApiMonitorConfig.groupIds,
-      proxyId: sub2ApiMonitorConfig.proxyId,
-      concurrency: sub2ApiMonitorConfig.concurrency,
-      loadFactor: sub2ApiMonitorConfig.loadFactor,
-      priority: sub2ApiMonitorConfig.priority,
-      modelWhitelist: sub2ApiMonitorConfig.modelWhitelist,
-      codexFingerprintMode: sub2ApiMonitorConfig.codexFingerprintMode,
-      wsMode: sub2ApiMonitorConfig.wsMode,
-    },
+    config: serializeSub2ApiConfig(sub2ApiMonitorConfig),
     state: {
       lastCheckAt: sub2ApiMonitorState.lastCheckAt,
       lastError: sub2ApiMonitorState.lastError,
@@ -2694,11 +2782,14 @@ async function persistSub2ApiMonitorConfiguration() {
 }
 
 function publicSub2ApiMonitorState() {
+  const config = sub2ApiMonitorConfig || sub2ApiSettingsConfig;
   return {
-    configured: Boolean(sub2ApiMonitorConfig?.baseUrl && sub2ApiMonitorConfig?.adminApiKey),
+    configured: Boolean(config?.baseUrl && config?.adminApiKey),
+    hasAdminApiKey: Boolean(config?.adminApiKey),
     enabled: Boolean(sub2ApiMonitorConfig?.enabled),
-    baseUrl: sub2ApiMonitorConfig?.baseUrl || null,
-    groupIds: sub2ApiMonitorConfig?.groupIds || [],
+    baseUrl: config?.baseUrl || null,
+    groupIds: config?.groupIds || [],
+    config: publicSub2ApiConfig(config),
     intervalMinutes: Math.max(1, Math.round(SUB2API_MONITOR_INTERVAL_MS / 60_000)),
     cooldownMinutes: Math.max(1, Math.round(SUB2API_AUTO_REPAIR_COOLDOWN_MS / 60_000)),
     running: sub2ApiMonitorState.running,

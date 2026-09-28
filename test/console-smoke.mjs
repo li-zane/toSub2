@@ -622,6 +622,60 @@ try {
     proxies: [{ id: 3, name: "测试代理", protocol: "http", host: "proxy.example", port: 8080, ipAddress: "203.0.113.10", status: "active" }],
   });
 
+  const settingsConfig = {
+    baseUrl: sub2apiUrl,
+    adminApiKey: "test-admin-key",
+    groupIds: ["8"],
+    proxyId: "3",
+    codexFingerprintMode: "device",
+    wsMode: "passthrough",
+  };
+  const settingsSaveResponse = await fetch(`${baseUrl}/api/sub2api/settings`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ config: settingsConfig }),
+  });
+  const settingsSaveText = await settingsSaveResponse.text();
+  assert.equal(settingsSaveResponse.status, 200, settingsSaveText);
+  const savedSettings = JSON.parse(settingsSaveText);
+  assert.equal(savedSettings.config.baseUrl, sub2apiUrl);
+  assert.equal(savedSettings.config.wsMode, "passthrough");
+  assert.equal(savedSettings.hasAdminApiKey, true);
+  assert.equal(Object.hasOwn(savedSettings.config, "adminApiKey"), false);
+  const persistedSettings = JSON.parse(await fs.readFile(path.join(outputRoot, "sub2api-settings.json"), "utf8"));
+  assert.equal(persistedSettings.config.adminApiKey, "test-admin-key");
+  assert.equal(persistedSettings.config.wsMode, "passthrough");
+
+  const settingsReadResponse = await fetch(`${baseUrl}/api/sub2api/settings`, { headers });
+  const settingsRead = await settingsReadResponse.json();
+  assert.equal(settingsReadResponse.status, 200);
+  assert.equal(settingsRead.config.baseUrl, sub2apiUrl);
+  assert.equal(settingsRead.config.groupIds[0], 8);
+  assert.equal(Object.hasOwn(settingsRead.config, "adminApiKey"), false);
+
+  const fallbackOptionsResponse = await fetch(`${baseUrl}/api/sub2api/options`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ config: { baseUrl: sub2apiUrl } }),
+  });
+  assert.equal(fallbackOptionsResponse.status, 200, await fallbackOptionsResponse.text());
+
+  const disabledMonitorSaveResponse = await fetch(`${baseUrl}/api/sub2api/monitor`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ enabled: false, config: { baseUrl: sub2apiUrl, wsMode: "passthrough" } }),
+  });
+  const disabledMonitorSave = await disabledMonitorSaveResponse.json();
+  assert.equal(disabledMonitorSaveResponse.status, 200);
+  assert.equal(disabledMonitorSave.enabled, false);
+  assert.equal(disabledMonitorSave.configured, true);
+  assert.equal(disabledMonitorSave.hasAdminApiKey, true);
+  assert.equal(disabledMonitorSave.config.wsMode, "passthrough");
+  const persistedMonitorAfterDisable = JSON.parse(await fs.readFile(path.join(outputRoot, "sub2api-monitor.json"), "utf8"));
+  assert.equal(persistedMonitorAfterDisable.enabled, false);
+  assert.deepEqual(persistedMonitorAfterDisable.config.groupIds, [8]);
+  assert.equal(persistedMonitorAfterDisable.config.wsMode, "passthrough");
+
   const uploadResponse = await fetch(`${baseUrl}/api/sub2api/upload`, {
     method: "POST",
     headers,

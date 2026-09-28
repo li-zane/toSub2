@@ -210,6 +210,7 @@ API Key 只会随取号请求临时发送给本地服务，不会写入任务元
 - 可以统一指定代理 IP、并发数、负载因子和优先级。数字参数留空时保留每个账号原来的配置。
 - 可以填写允许使用的模型，每行一个，也支持逗号分隔，例如 `gpt-5`、`gpt-5-mini`。
 - 可以设置账号级 `WS mode`：`off`、`ctx_pool`、`passthrough` 或 `http_bridge`。该设置会写入 OpenAI OAuth 账号的 `extra.openai_oauth_responses_websockets_v2_mode` 及对应启用开关，并在上传和号池自动修复时保持一致。使用非 `off` 模式前，需要在 Sub2API 的 `gateway.openai_ws.mode_router_v2_enabled` 中启用新版路由。
+- Sub2API 后端地址、号池、代理、WS mode 和管理员 API Key 会由本机服务保存到输出目录的 `sub2api-settings.json`（权限 `0600`）；浏览器只保留非敏感的界面缓存。更换浏览器或域名入口后，服务会自动恢复这份配置，管理员 Key 不会通过 API 返回到前端。
 
 上传选项会保存在当前浏览器的 `localStorage`（本地存储）。批量上传时，未完成的任务会自动跳过；服务端返回的创建失败数量会显示在控制台中。
 

@@ -141,7 +141,11 @@ function App() {
 
   useEffect(() => writeLocalJson(SMS_PROVIDER_SETTINGS_KEY, smsSettings), [smsSettings]);
   useEffect(() => writeLocalJson(MAIL_REQUEST_SETTINGS_KEY, mailRequestSettings), [mailRequestSettings]);
-  useEffect(() => writeLocalJson(SUB2API_UPLOAD_SETTINGS_KEY, sub2apiSettings), [sub2apiSettings]);
+  useEffect(() => {
+    const browserSettings = { ...sub2apiSettings };
+    if (browserSettings.hasStoredAdminApiKey) browserSettings.adminApiKey = "";
+    writeLocalJson(SUB2API_UPLOAD_SETTINGS_KEY, browserSettings);
+  }, [sub2apiSettings]);
   useEffect(() => writeLocalTextSetting(ACCOUNT_PROXY_STORAGE_KEY, accountProxyUrl.trim()), [accountProxyUrl]);
   useEffect(() => writeLocalJson(PLAN_TYPE_MAPPING_STORAGE_KEY, planTypeMapping), [planTypeMapping]);
 
@@ -212,7 +216,7 @@ function App() {
         const data = await apiFetch(token, "/api/sub2api/monitor");
         if (!stopped) {
           setSub2apiMonitorStatus(data);
-          setSub2apiSettings((current) => ({ ...current, monitorEnabled: Boolean(data.enabled) }));
+          setSub2apiSettings((current) => mergeServerSub2ApiSettings(current, data));
         }
       } catch {}
     };
@@ -223,6 +227,19 @@ function App() {
       window.clearInterval(timer);
     };
   }, [token, features.sub2apiMonitor]);
+
+  useEffect(() => {
+    if (!token) return undefined;
+    let stopped = false;
+    apiFetch(token, "/api/sub2api/settings")
+      .then((data) => {
+        if (!stopped) setSub2apiSettings((current) => mergeServerSub2ApiSettings(current, data));
+      })
+      .catch(() => {});
+    return () => {
+      stopped = true;
+    };
+  }, [token]);
 
   const pageJobIds = useMemo(() => jobs.map((job) => job.id), [jobs]);
   const smsProviderDefinitions = Array.isArray(features.smsProviders) ? features.smsProviders : [];
@@ -332,7 +349,7 @@ function App() {
       setSub2apiSettingsError("请输入 http:// 或 https:// 开头的 Sub2API 后端地址");
       return;
     }
-    if (!adminApiKey) {
+    if (!adminApiKey && !sub2apiSettingsDraft.hasStoredAdminApiKey) {
       setSub2apiSettingsError("请输入 Sub2API 管理员 API Key");
       return;
     }
@@ -340,15 +357,22 @@ function App() {
       ...readSub2ApiSettings(sub2apiSettingsDraft),
       baseUrl: baseUrl.replace(/\/+$/, ""),
       adminApiKey,
+      hasStoredAdminApiKey: true,
     };
     setSub2apiSettingsSaving(true);
     try {
-      const monitor = await apiFetch(token, "/api/sub2api/monitor", {
+      const savedSettings = await apiFetch(token, "/api/sub2api/settings", {
+        method: "POST",
+        body: JSON.stringify({ config: nextSettings }),
+      });
+      const monitor = features.sub2apiMonitor
+        ? await apiFetch(token, "/api/sub2api/monitor", {
         method: "POST",
         body: JSON.stringify({ enabled: nextSettings.monitorEnabled, config: nextSettings }),
-      });
-      setSub2apiSettings(nextSettings);
-      setSub2apiMonitorStatus(monitor);
+      })
+        : { ...savedSettings, enabled: false };
+      setSub2apiSettings(mergeServerSub2ApiSettings(nextSettings, { ...savedSettings, ...monitor }));
+      setSub2apiMonitorStatus((current) => ({ ...current, ...monitor }));
       setSub2apiSettingsOpen(false);
       setSub2apiSettingsError("");
     } catch (requestError) {
@@ -385,9 +409,9 @@ function App() {
   }
 
   async function uploadSelected(ids) {
-    if (!sub2apiSettings.baseUrl || !sub2apiSettings.adminApiKey) {
+    if (!hasUsableSub2ApiSettings(sub2apiSettings)) {
       openSub2ApiSettings();
-      setUploadNotice("请先配置 Sub2API 后端地址、管理员 API Key 和目标号池");
+      setUploadNotice("请先配置 Sub2API 后端地址和管理员 API Key");
       return;
     }
     if (batchAction) return;
@@ -864,9 +888,9 @@ function App() {
         <div className="provider-toolbar sub2api-toolbar" aria-label="Sub2API 配置与号池监控">
           <div className="provider-heading"><Send size={17} /><strong>Sub2API</strong></div>
           <span className="provider-name">{sub2apiSettings.baseUrl || "未配置后端"}</span>
-          <span className={`provider-ready ${sub2apiSettings.adminApiKey ? "" : "incomplete"}`}>
-            {sub2apiSettings.adminApiKey ? <Check size={14} /> : <CircleAlert size={14} />}
-            {sub2apiSettings.adminApiKey
+          <span className={`provider-ready ${hasUsableSub2ApiSettings(sub2apiSettings) ? "" : "incomplete"}`}>
+            {hasUsableSub2ApiSettings(sub2apiSettings) ? <Check size={14} /> : <CircleAlert size={14} />}
+            {hasUsableSub2ApiSettings(sub2apiSettings)
               ? `${sub2apiSettings.groupIds.length ? `已配置 · ${sub2apiSettings.groupIds.length} 个号池` : "已配置 · 默认号池"}${sub2apiSettings.proxyId ? " · 已指定代理" : ""} · WS ${SUB2API_WS_MODE_LABELS[sub2apiSettings.wsMode] || sub2apiSettings.wsMode}`
               : "未完成配置"}
           </span>
@@ -1049,7 +1073,7 @@ function App() {
                     smsProviderAvailable={smsProviderDefinitions.length > 0}
                     smsProvider={activeSmsProvider}
                     onUpload={() => uploadSelected([job.id])}
-                    sub2apiUploadAvailable={Boolean(features.sub2apiUpload && sub2apiSettings.baseUrl && sub2apiSettings.adminApiKey)}
+                    sub2apiUploadAvailable={Boolean(features.sub2apiUpload && hasUsableSub2ApiSettings(sub2apiSettings))}
                     totpSetupAvailable={Boolean(features.totpSetup)}
                     passwordAddAvailable={Boolean(features.passwordAdd)}
                     forceReloginAvailable={Boolean(features.forceRelogin)}
@@ -1317,7 +1341,7 @@ function App() {
             <div className="dialog-header">
               <div>
                 <h2 id="sub2api-settings-title">Sub2API 配置</h2>
-                <span>管理员 Key 不写入任务文件或日志；启用监控后由本机服务保存</span>
+                <span>配置保存到 x1 服务端设置文件；管理员 Key 不写入任务文件、日志或浏览器存储</span>
               </div>
               <button type="button" className="icon-button" onClick={() => setSub2apiSettingsOpen(false)} title="关闭"><X size={18} /></button>
             </div>
@@ -1351,7 +1375,7 @@ function App() {
                   type="password"
                   value={sub2apiSettingsDraft.adminApiKey}
                   onChange={(event) => setSub2apiSettingsDraft((current) => ({ ...current, adminApiKey: event.target.value }))}
-                  placeholder="输入 sub2api 管理员 API Key"
+                  placeholder={sub2apiSettingsDraft.hasStoredAdminApiKey ? "已保存到 x1，留空保持不变" : "输入 sub2api 管理员 API Key"}
                   autoComplete="off"
                 />
               </label>
@@ -2964,8 +2988,35 @@ function normalizeSub2ApiSettings(value) {
     wsMode: SUB2API_WS_MODES.has(wsMode)
       ? wsMode
       : "off",
+    hasStoredAdminApiKey: stored.hasStoredAdminApiKey === true,
     monitorEnabled: stored.monitorEnabled === true,
   };
+}
+
+function hasUsableSub2ApiSettings(settings) {
+  return Boolean(settings?.baseUrl && (settings.adminApiKey || settings.hasStoredAdminApiKey));
+}
+
+function mergeServerSub2ApiSettings(current, serverState) {
+  const serverConfig = serverState?.config && typeof serverState.config === "object"
+    ? serverState.config
+    : {};
+  const serverHasSettingsState = typeof serverState?.hasAdminApiKey === "boolean"
+    || serverState?.config !== undefined;
+  const hasStoredAdminApiKey = serverHasSettingsState
+    ? serverState?.hasAdminApiKey === true
+    : current.hasStoredAdminApiKey === true;
+  return normalizeSub2ApiSettings({
+    ...current,
+    ...serverConfig,
+    adminApiKey: serverHasSettingsState ? "" : (hasStoredAdminApiKey ? "" : current.adminApiKey),
+    hasStoredAdminApiKey,
+    monitorEnabled: serverState?.monitorEnabled !== undefined
+      ? serverState.monitorEnabled === true
+      : serverState?.enabled !== undefined
+        ? serverState.enabled === true
+        : current.monitorEnabled,
+  });
 }
 
 function readSub2ApiSettings(value) {
