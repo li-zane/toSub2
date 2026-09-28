@@ -70,10 +70,13 @@ try {
   const credentialsResponse = await fetch(`${baseUrl}/api/jobs/${jobId}/credentials`, { headers });
   assert.equal(credentialsResponse.status, 200);
   const credentials = await credentialsResponse.json();
-  assert.deepEqual(Object.keys(credentials.credentials).sort(), ["email", "hasPassword", "hasTotpKey", "password", "persisted", "totpSecret"].sort());
+  assert.deepEqual(Object.keys(credentials.credentials).sort(), ["email", "hasPassword", "hasSub2apiJson", "hasTotpKey", "password", "persisted", "sub2apiJson", "totpSecret"].sort());
   assert.equal(credentials.credentials.email, "credential-smoke@example.com");
   assert.equal(credentials.credentials.password, password);
   assert.equal(credentials.credentials.totpSecret, firstTotp);
+  assert.equal(credentials.credentials.hasSub2apiJson, true);
+  assert.match(credentials.credentials.sub2apiJson, /"type": "sub2api-data"/);
+  assert.match(credentials.credentials.sub2apiJson, /credential-smoke@example\.com/);
 
   const updateResponse = await fetch(`${baseUrl}/api/jobs/${jobId}/credentials`, {
     method: "PUT",
@@ -114,6 +117,7 @@ try {
   const afterReplaceBody = await afterReplace.json();
   assert.equal(afterReplaceBody.credentials.password, password);
   assert.equal(afterReplaceBody.credentials.totpSecret, "MZXW6YTBON2GK3TB");
+  assert.equal(afterReplaceBody.credentials.hasSub2apiJson, true);
   const logsResponse = await fetch(`${baseUrl}/api/jobs/${jobId}/logs`, { headers });
   const jobLogs = await logsResponse.json();
   assert.doesNotMatch(jobLogs.logs, new RegExp(password.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));

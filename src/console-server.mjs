@@ -552,7 +552,7 @@ async function handleApi(req, res, requestUrl) {
   }
   if (req.method === "GET" && action === "credentials") {
     await reloadMissingJobCredentials(job);
-    sendJson(res, 200, { credentials: publicCredentialDetails(job) });
+    sendJson(res, 200, { credentials: await publicCredentialDetails(job) });
     return;
   }
   if (req.method === "GET" && action === "download") {
@@ -610,7 +610,7 @@ async function handleApi(req, res, requestUrl) {
     await withEmailJobLock(job.email, async () => {
       persisted = await updateStoredCredentialFields(job, body);
     });
-    sendJson(res, 200, { credentials: publicCredentialDetails(job, persisted), job: publicJob(job) });
+    sendJson(res, 200, { credentials: await publicCredentialDetails(job, persisted), job: publicJob(job) });
     return;
   }
   if (req.method === "POST" && action === "add-password") {
@@ -3118,13 +3118,20 @@ function publicJob(job) {
   };
 }
 
-function publicCredentialDetails(job, persisted = null) {
+async function publicCredentialDetails(job, persisted = null) {
+  let sub2apiJson = "";
+  try {
+    const raw = await fs.readFile(job.outputPath, "utf8");
+    sub2apiJson = JSON.stringify(JSON.parse(raw), null, 2);
+  } catch {}
   return {
     email: job.email,
     password: job.password || "",
     totpSecret: job.totpSecret || "",
     hasPassword: Boolean(job.password || job.hasPasswordCredential),
     hasTotpKey: Boolean(job.totpSecret || job.hasTotpCredential),
+    sub2apiJson,
+    hasSub2apiJson: Boolean(sub2apiJson),
     persisted,
   };
 }

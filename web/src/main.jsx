@@ -29,6 +29,7 @@ import {
   Settings2,
   ShieldCheck,
   Smartphone,
+  Tags,
   PhoneIncoming,
   Trash2,
   X,
@@ -42,6 +43,17 @@ const SMS_PROVIDER_SETTINGS_KEY = "chatgpt-onboarding.sms-provider-settings-v1";
 const MAIL_REQUEST_SETTINGS_KEY = "chatgpt-onboarding.mail-request-settings-v1";
 const SUB2API_UPLOAD_SETTINGS_KEY = "chatgpt-onboarding.sub2api-upload-settings-v1";
 const ACCOUNT_PROXY_STORAGE_KEY = "chatgpt-onboarding.account-proxy-v1";
+const PLAN_TYPE_MAPPING_STORAGE_KEY = "chatgpt-onboarding.plan-type-mapping-v1";
+const DEFAULT_PLAN_TYPE_MAPPING = {
+  free: "Free",
+  plus: "Plus",
+  pro: "Pro",
+  team: "Team",
+  enterprise: "Enterprise",
+  self_serve_business: "Business",
+  self_serve_business_prolite: "Business Premium",
+  self_serve_pro: "Pro",
+};
 const SMS_PROVIDER_EXTERNAL_LINKS = {
   luban: {
     href: "https://lubansms.com/",
@@ -110,12 +122,17 @@ function App() {
   });
   const [uploadNotice, setUploadNotice] = useState("");
   const [accountProxyUrl, setAccountProxyUrl] = useState(() => readLocalTextSetting(ACCOUNT_PROXY_STORAGE_KEY));
+  const [planTypeMapping, setPlanTypeMapping] = useState(readPlanTypeMapping);
+  const [planTypeMappingOpen, setPlanTypeMappingOpen] = useState(false);
+  const [planTypeMappingDraft, setPlanTypeMappingDraft] = useState(() => planTypeMappingRows(readPlanTypeMapping()));
+  const [planTypeMappingError, setPlanTypeMappingError] = useState("");
   const [credentialJob, setCredentialJob] = useState(null);
 
   useEffect(() => writeLocalJson(SMS_PROVIDER_SETTINGS_KEY, smsSettings), [smsSettings]);
   useEffect(() => writeLocalJson(MAIL_REQUEST_SETTINGS_KEY, mailRequestSettings), [mailRequestSettings]);
   useEffect(() => writeLocalJson(SUB2API_UPLOAD_SETTINGS_KEY, sub2apiSettings), [sub2apiSettings]);
   useEffect(() => writeLocalTextSetting(ACCOUNT_PROXY_STORAGE_KEY, accountProxyUrl.trim()), [accountProxyUrl]);
+  useEffect(() => writeLocalJson(PLAN_TYPE_MAPPING_STORAGE_KEY, planTypeMapping), [planTypeMapping]);
 
   useEffect(() => {
     let stopped = false;
@@ -464,6 +481,39 @@ function App() {
     setExpandedJobId(null);
   }, [page]);
 
+  function openPlanTypeMapping() {
+    setPlanTypeMappingDraft(planTypeMappingRows(planTypeMapping));
+    setPlanTypeMappingError("");
+    setPlanTypeMappingOpen(true);
+  }
+
+  function resetPlanTypeMapping() {
+    setPlanTypeMappingDraft(planTypeMappingRows(DEFAULT_PLAN_TYPE_MAPPING));
+    setPlanTypeMappingError("");
+  }
+
+  function savePlanTypeMapping(event) {
+    event.preventDefault();
+    const next = {};
+    for (const row of planTypeMappingDraft) {
+      const raw = String(row.raw || "").trim();
+      const label = String(row.label || "").trim();
+      if (!raw && !label) continue;
+      if (!raw || !label) {
+        setPlanTypeMappingError("每一行都需要填写原始 PlanType 和显示标签");
+        return;
+      }
+      if (raw.length > 128 || label.length > 128) {
+        setPlanTypeMappingError("PlanType 和显示标签最多 128 个字符");
+        return;
+      }
+      next[raw] = label;
+    }
+    setPlanTypeMapping(next);
+    setPlanTypeMappingOpen(false);
+    setPlanTypeMappingError("");
+  }
+
   async function createJob(event) {
     event.preventDefault();
     if (!email.trim() || busy) return;
@@ -745,6 +795,10 @@ function App() {
               {busy ? <LoaderCircle className="spin" size={17} /> : <Plus size={17} />}
               添加任务
             </button>
+            <button className="secondary-button" type="button" onClick={openPlanTypeMapping} disabled={!token} title="配置 PlanType 映射" aria-label="配置 PlanType 映射">
+              <Tags size={17} />
+              PlanType 映射
+            </button>
             <button className="secondary-button" type="button" onClick={() => { setBatchError(""); setBatchOpen(true); }} disabled={!token}>
               <ListPlus size={17} />
               批量添加
@@ -985,6 +1039,7 @@ function App() {
                     passwordAddAvailable={Boolean(features.passwordAdd)}
                     forceReloginAvailable={Boolean(features.forceRelogin)}
                     accountProxyUrl={accountProxyUrl}
+                    planTypeMapping={planTypeMapping}
                     credentialsAvailable={Boolean(features.credentialDetails)}
                     onOpenCredentials={() => setCredentialJob(job)}
                   />
@@ -1410,6 +1465,70 @@ function App() {
           </form>
         </div>
       )}
+      {planTypeMappingOpen && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={(event) => {
+          if (event.target === event.currentTarget) setPlanTypeMappingOpen(false);
+        }}>
+          <form className="batch-dialog plan-type-mapping-dialog" onSubmit={savePlanTypeMapping} role="dialog" aria-modal="true" aria-labelledby="plan-type-mapping-title">
+            <div className="dialog-header">
+              <div>
+                <h2 id="plan-type-mapping-title">PlanType 映射</h2>
+                <span>把 OAuth 原始参数转换为账号列表中的显示标签</span>
+              </div>
+              <button type="button" className="icon-button" onClick={() => setPlanTypeMappingOpen(false)} title="关闭">
+                <X size={18} />
+              </button>
+            </div>
+            <div className="plan-type-mapping-list">
+              {planTypeMappingDraft.map((row, index) => (
+                <div className="plan-type-mapping-row" key={`${row.raw || "new"}-${index}`}>
+                  <label>
+                    <span>原始 PlanType</span>
+                    <input
+                      value={row.raw}
+                      onChange={(event) => setPlanTypeMappingDraft((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, raw: event.target.value } : item))}
+                      placeholder="self_serve_business_prolite"
+                      spellCheck="false"
+                    />
+                  </label>
+                  <span className="plan-type-mapping-arrow" aria-hidden="true">→</span>
+                  <label>
+                    <span>显示标签</span>
+                    <input
+                      value={row.label}
+                      onChange={(event) => setPlanTypeMappingDraft((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, label: event.target.value } : item))}
+                      placeholder="Business Premium"
+                    />
+                  </label>
+                  <button
+                    type="button"
+                    className="icon-button danger"
+                    onClick={() => setPlanTypeMappingDraft((current) => current.filter((_, itemIndex) => itemIndex !== index))}
+                    title="删除映射"
+                    aria-label="删除映射"
+                  >
+                    <Trash2 size={16} />
+                  </button>
+                </div>
+              ))}
+            </div>
+            <button
+              type="button"
+              className="secondary-button mapping-add-button"
+              onClick={() => setPlanTypeMappingDraft((current) => [...current, { raw: "", label: "" }])}
+            >
+              <Plus size={16} />添加映射
+            </button>
+            {planTypeMappingError && <div className="dialog-error" role="alert"><CircleAlert size={15} />{planTypeMappingError}</div>}
+            <div className="dialog-footer">
+              <button type="button" className="selection-text-button" onClick={resetPlanTypeMapping}>恢复默认</button>
+              <span className="dialog-actions-spacer" />
+              <button type="button" className="cancel-button" onClick={() => setPlanTypeMappingOpen(false)}>取消</button>
+              <button type="submit" className="primary-button"><Check size={16} />保存映射</button>
+            </div>
+          </form>
+        </div>
+      )}
       {batchOpen && (
         <div className="modal-backdrop" role="presentation" onMouseDown={(event) => {
           if (event.target === event.currentTarget && !batchBusy) setBatchOpen(false);
@@ -1501,7 +1620,7 @@ function EmptyState({ filtered = false }) {
   );
 }
 
-function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggleSelected, selectionSupported, smsProviderAvailable, smsProvider, onUpload, sub2apiUploadAvailable, totpSetupAvailable, passwordAddAvailable, forceReloginAvailable, accountProxyUrl, credentialsAvailable, onOpenCredentials }) {
+function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggleSelected, selectionSupported, smsProviderAvailable, smsProvider, onUpload, sub2apiUploadAvailable, totpSetupAvailable, passwordAddAvailable, forceReloginAvailable, accountProxyUrl, planTypeMapping, credentialsAvailable, onOpenCredentials }) {
   const [value, setValue] = useState("");
   const [submitting, setSubmitting] = useState(false);
 
@@ -1668,8 +1787,8 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
           <LoginMethodBadge job={job} />
         </div>
       </td>
-      <td className={`plan-cell ${job.planType ? "" : "unknown"}`}>
-        {job.planType || "未知"}
+      <td className={`plan-cell ${job.planType ? "" : "unknown"}`} title={job.planType || "未知"}>
+        <span className="plan-tag">{formatPlanTypeLabel(job.planType, planTypeMapping)}</span>
       </td>
       <td><StatusBadge status={job.status} /></td>
       <td className="step-cell">
@@ -1857,6 +1976,7 @@ function CredentialDialog({ token, job, accountProxyUrl, totpReplaceAvailable, o
   const [details, setDetails] = useState(null);
   const [password, setPassword] = useState("");
   const [totpSecret, setTotpSecret] = useState("");
+  const [sub2apiJson, setSub2apiJson] = useState("");
   const [passwordDirty, setPasswordDirty] = useState(false);
   const [totpDirty, setTotpDirty] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
@@ -1879,6 +1999,7 @@ function CredentialDialog({ token, job, accountProxyUrl, totpReplaceAvailable, o
         setDetails(next);
         setPassword(next.password || "");
         setTotpSecret(next.totpSecret || "");
+        setSub2apiJson(next.sub2apiJson || "");
         setPasswordDirty(false);
         setTotpDirty(false);
       })
@@ -1921,6 +2042,7 @@ function CredentialDialog({ token, job, accountProxyUrl, totpReplaceAvailable, o
       setDetails(next);
       setPassword(next.password || "");
       setTotpSecret(next.totpSecret || "");
+      setSub2apiJson(next.sub2apiJson || sub2apiJson);
       setPasswordDirty(false);
       setTotpDirty(false);
       setNotice(next.persisted === false
@@ -1956,6 +2078,17 @@ function CredentialDialog({ token, job, accountProxyUrl, totpReplaceAvailable, o
       setDialogError(error.message);
     } finally {
       setReplacing(false);
+    }
+  }
+
+  async function copySub2apiJson() {
+    if (!sub2apiJson) return;
+    try {
+      await navigator.clipboard.writeText(sub2apiJson);
+      setNotice("Sub2API JSON 已复制");
+      onError("");
+    } catch {
+      setDialogError("无法自动复制 Sub2API JSON，请在滚动区域中手动选择");
     }
   }
 
@@ -2013,6 +2146,22 @@ function CredentialDialog({ token, job, accountProxyUrl, totpReplaceAvailable, o
                 </button>
               </div>
             </label>
+            <section className="credential-json-section" aria-labelledby="sub2api-json-title">
+              <div className="credential-json-heading">
+                <div>
+                  <strong id="sub2api-json-title">Sub2API JSON</strong>
+                  <span>完整内容已放在可滚动区域中</span>
+                </div>
+                <button type="button" className="icon-button" onClick={copySub2apiJson} disabled={!sub2apiJson} title="复制 Sub2API JSON" aria-label="复制 Sub2API JSON">
+                  <Copy size={16} />
+                </button>
+              </div>
+              {sub2apiJson ? (
+                <pre className="credential-json-viewer" tabIndex="0">{sub2apiJson}</pre>
+              ) : (
+                <div className="credential-json-empty">当前任务还没有可用的 Sub2API 导入 JSON</div>
+              )}
+            </section>
             <div className="credential-meta">
               <span>当前状态：{job.status}</span>
               {details?.persisted === false && <span className="credential-warning">系统未提供持久凭据存储</span>}
@@ -2283,6 +2432,38 @@ function readLocalSetting(key) {
   } catch {
     return "";
   }
+}
+
+function normalizePlanTypeMapping(value) {
+  const source = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  const result = {};
+  Object.entries(source).slice(0, 100).forEach(([raw, label]) => {
+    const normalizedRaw = String(raw || "").trim();
+    const normalizedLabel = String(label || "").trim();
+    if (normalizedRaw && normalizedLabel && normalizedRaw.length <= 128 && normalizedLabel.length <= 128) {
+      result[normalizedRaw] = normalizedLabel;
+    }
+  });
+  return result;
+}
+
+function readPlanTypeMapping() {
+  try {
+    const stored = JSON.parse(window.localStorage.getItem(PLAN_TYPE_MAPPING_STORAGE_KEY) || "null");
+    const normalized = normalizePlanTypeMapping(stored);
+    if (Object.keys(normalized).length) return { ...DEFAULT_PLAN_TYPE_MAPPING, ...normalized };
+  } catch {}
+  return { ...DEFAULT_PLAN_TYPE_MAPPING };
+}
+
+function planTypeMappingRows(mapping) {
+  return Object.entries(normalizePlanTypeMapping(mapping)).map(([raw, label]) => ({ raw, label }));
+}
+
+function formatPlanTypeLabel(value, mapping = DEFAULT_PLAN_TYPE_MAPPING) {
+  const raw = String(value || "").trim();
+  if (!raw) return "未知";
+  return normalizePlanTypeMapping(mapping)[raw] || raw;
 }
 
 function readLocalTextSetting(key) {
