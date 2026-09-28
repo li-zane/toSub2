@@ -39,6 +39,7 @@ import {
 import "./styles.css";
 
 const POLL_INTERVAL_MS = 900;
+const SUB2API_PIPELINE_TIMEOUT_MS = 15 * 60_000;
 const LUBAN_API_KEY_STORAGE_KEY = "chatgpt-onboarding.luban-api-key";
 const LUBAN_SERVICE_ID_STORAGE_KEY = "chatgpt-onboarding.luban-service-id";
 const SMS_PROVIDER_SETTINGS_KEY = "chatgpt-onboarding.sms-provider-settings-v1";
@@ -271,6 +272,9 @@ function App() {
   const canForceReloginSelected = selectedJobs.length > 0 && selectedJobs.length === selectedJobIds.size
     && forceReloginSelectedCount > 0;
   const canUploadSelected = selectedJobs.length > 0 && downloadableSelectedCount > 0;
+  const canRotateAndUploadSelected = selectedJobs.length > 0
+    && selectedJobs.length === selectedJobIds.size
+    && selectedJobs.every((job) => job.canReplaceTotp && job.canDownload);
   const totpSetupSelectedCount = selectedJobs.filter((job) => job.canSetupTotp).length;
   const canSetupTotpSelected = selectedJobs.length > 0 && selectedJobs.length === selectedJobIds.size
     && totpSetupSelectedCount > 0;
@@ -408,6 +412,20 @@ function App() {
     });
   }
 
+  async function performSub2ApiUpload(ids) {
+    return apiFetch(token, "/api/sub2api/upload", {
+      method: "POST",
+      body: JSON.stringify({ ids, config: sub2apiSettings }),
+    });
+  }
+
+  function formatSub2ApiUploadNotice(data) {
+    const result = data.result || {};
+    const created = result.account_created ?? result.success ?? data.uploaded;
+    const failed = result.account_failed ?? result.failed ?? 0;
+    return `已上传 ${created} 条${failed ? `，失败 ${failed} 条` : ""}${data.skipped ? `，跳过未完成任务 ${data.skipped} 条` : ""}`;
+  }
+
   async function uploadSelected(ids) {
     if (!hasUsableSub2ApiSettings(sub2apiSettings)) {
       openSub2ApiSettings();
@@ -418,18 +436,128 @@ function App() {
     setBatchAction("upload");
     setUploadNotice("");
     try {
-      const data = await apiFetch(token, "/api/sub2api/upload", {
-        method: "POST",
-        body: JSON.stringify({ ids, config: sub2apiSettings }),
-      });
-      const result = data.result || {};
-      const created = result.account_created ?? result.success ?? data.uploaded;
-      const failed = result.account_failed ?? result.failed ?? 0;
-      setUploadNotice(`已上传 ${created} 条${failed ? `，失败 ${failed} 条` : ""}${data.skipped ? `，跳过未完成任务 ${data.skipped} 条` : ""}`);
+      const data = await performSub2ApiUpload(ids);
+      setUploadNotice(formatSub2ApiUploadNotice(data));
       setSelectedJobIds(new Set());
       setError("");
     } catch (requestError) {
       setError(requestError.message);
+    } finally {
+      setBatchAction("");
+    }
+  }
+
+  async function queryPipelineJobs(ids, emailById) {
+    const emails = ids.map((id) => emailById.get(id)).filter(Boolean);
+    if (emails.length !== ids.length) throw new Error("无法读取一键流程中的账号信息");
+    const pages = [];
+    let pageNumber = 1;
+    let totalPages = 1;
+    do {
+      const data = await apiFetch(token, "/api/jobs/query", {
+        method: "POST",
+        body: JSON.stringify({ page: pageNumber, emails }),
+      });
+      pages.push(data);
+      totalPages = Math.max(1, Number(data.pagination?.totalPages) || 1);
+      pageNumber += 1;
+    } while (pageNumber <= totalPages);
+    const jobsById = new Map(pages.flatMap((data) => data.jobs || []).map((job) => [job.id, job]));
+    if (jobsById.size !== ids.length) throw new Error("一键流程中的账号列表已发生变化，请刷新后重试");
+    setJobs((current) => current.map((job) => jobsById.get(job.id) || job));
+    const selectionById = new Map(pages.flatMap((data) => data.selection || []).map((job) => [job.id, job]));
+    setJobSelectionIndex((current) => current.map((job) => selectionById.get(job.id) || job));
+    return ids.map((id) => jobsById.get(id));
+  }
+
+  async function waitForPipelineJobs(ids, emailById, label, predicate, failurePredicate = null) {
+    const deadline = Date.now() + SUB2API_PIPELINE_TIMEOUT_MS;
+    let latest = [];
+    while (Date.now() < deadline) {
+      latest = await queryPipelineJobs(ids, emailById);
+      const completed = latest.filter(predicate).length;
+      setUploadNotice(`${label} ${completed}/${ids.length}`);
+      const failed = latest.find((job) => failurePredicate?.(job) || (
+        ["failed", "canceled", "reauth_required", "resume_available"].includes(job.status) && !predicate(job)
+      ));
+      if (failed) {
+        const detail = extractResponseMessage(failed.totpSetupError || failed.lastError || failed.prompt || "任务失败");
+        throw new Error(`${failed.email}：${detail || "任务未完成"}`);
+      }
+      if (latest.every(predicate)) return latest;
+      await new Promise((resolve) => window.setTimeout(resolve, POLL_INTERVAL_MS));
+    }
+    throw new Error(`${label}超时，请查看任务状态后重试`);
+  }
+
+  async function rotateLogoutReauthorizeUploadSelected() {
+    if (!canRotateAndUploadSelected || batchAction) return;
+    if (!hasUsableSub2ApiSettings(sub2apiSettings)) {
+      openSub2ApiSettings();
+      setUploadNotice("请先配置 Sub2API 后端地址和管理员 API Key");
+      return;
+    }
+    const ids = [...selectedJobIds];
+    const emailById = new Map(selectedJobs.map((job) => [job.id, job.email]));
+    const count = ids.length;
+    if (!window.confirm(`确定对选中的 ${count} 个账号依次轮换 2FA、登出所有设备、重新授权并上传到 Sub2API 吗？当前会话会失效。`)) return;
+
+    setBatchAction("rotate-logout-reauthorize-upload");
+    setError("");
+    setUploadNotice("正在轮换 2FA 0/" + count);
+    try {
+      const rotationResults = await Promise.allSettled(ids.map((id) => apiFetch(token, `/api/jobs/${id}/replace-2fa`, {
+        method: "POST",
+        body: JSON.stringify({ proxyUrl: accountProxyUrl.trim() }),
+      })));
+      const rotationError = rotationResults.find((result) => result.status === "rejected");
+      if (rotationError) throw new Error(`启动 2FA 轮换失败：${rotationError.reason?.message || "请求失败"}`);
+      await waitForPipelineJobs(
+        ids,
+        emailById,
+        "正在轮换 2FA",
+        (job) => job.status === "completed"
+          && job.lastOperationType === "replace_2fa"
+          && job.hasTotpKey
+          && !job.totpRotationIncomplete,
+        (job) => (job.status === "completed" && job.totpRotationIncomplete) || job.status === "totp_setup_otp",
+      );
+
+      let loggedOut = 0;
+      setUploadNotice("正在登出所有设备 0/" + count);
+      const logoutResults = await Promise.allSettled(ids.map(async (id) => {
+        const result = await apiFetch(token, `/api/jobs/${id}/sessions/logout-all`, { method: "POST" });
+        loggedOut += 1;
+        setUploadNotice(`正在登出所有设备 ${loggedOut}/${count}`);
+        return result;
+      }));
+      const logoutError = logoutResults.find((result) => result.status === "rejected");
+      if (logoutError) throw new Error(`登出所有设备失败：${logoutError.reason?.message || "请求失败"}`);
+
+      setUploadNotice("正在重新授权 0/" + count);
+      const reauthorize = await apiFetch(token, "/api/jobs/reauthorize-batch", {
+        method: "POST",
+        body: JSON.stringify({ ids, proxyUrl: accountProxyUrl.trim() }),
+      });
+      if (reauthorize.started !== count) {
+        throw new Error(`重新授权只启动了 ${reauthorize.started || 0}/${count} 个账号`);
+      }
+      await waitForPipelineJobs(
+        ids,
+        emailById,
+        "正在重新授权",
+        (job) => job.status === "completed"
+          && job.lastOperationType === "reauthorize"
+          && job.canDownload,
+      );
+
+      setUploadNotice("正在上传到 Sub2API");
+      const uploaded = await performSub2ApiUpload(ids);
+      setUploadNotice(formatSub2ApiUploadNotice(uploaded));
+      setSelectedJobIds(new Set());
+    } catch (requestError) {
+      setError(`一键流程已停止：${requestError.message}`);
+      setUploadNotice("一键流程未完成，已保留当前选择");
     } finally {
       setBatchAction("");
     }
@@ -793,7 +921,7 @@ function App() {
   }
 
   return (
-    <main className="app-shell">
+    <main className={`app-shell ${batchAction ? "workflow-busy" : ""}`}>
       <header className="topbar">
         <div className="brand-block">
           <div className="brand-mark"><ShieldCheck size={21} strokeWidth={2.2} /></div>
@@ -960,7 +1088,7 @@ function App() {
         )}
         {uploadNotice && (
           <div className="global-success" role="status">
-            <Check size={17} />
+            {batchAction ? <LoaderCircle className="spin" size={17} /> : <Check size={17} />}
             <span>{uploadNotice}</span>
             <button type="button" onClick={() => setUploadNotice("")} title="关闭"><X size={16} /></button>
           </div>
@@ -970,10 +1098,10 @@ function App() {
           <div className="selection-toolbar">
             <div className="selection-summary">
               <span>当前页 {jobs.length} 条，跨页已选 {selectedJobIds.size} 条，可下载 {downloadableSelectedCount} 条</span>
-              <button type="button" className="selection-text-button" onClick={toggleAllOnPage} disabled={allPageSelected || !pageJobIds.length}>
+              <button type="button" className="selection-text-button" onClick={toggleAllOnPage} disabled={allPageSelected || !pageJobIds.length || Boolean(batchAction)}>
                 本页全选
               </button>
-              <button type="button" className="selection-text-button" onClick={() => setSelectedJobIds(new Set())} disabled={!selectedJobIds.size}>
+              <button type="button" className="selection-text-button" onClick={() => setSelectedJobIds(new Set())} disabled={!selectedJobIds.size || Boolean(batchAction)}>
                 清除选择
               </button>
             </div>
@@ -997,6 +1125,18 @@ function App() {
                 <button type="button" className="secondary-button bulk-button" onClick={() => uploadSelected([...selectedJobIds])} disabled={!canUploadSelected || Boolean(batchAction)}>
                   {batchAction === "upload" ? <LoaderCircle className="spin" size={16} /> : <Send size={16} />}
                   上传到 Sub2API
+                </button>
+              )}
+              {features.sub2apiPipeline && (
+                <button
+                  type="button"
+                  className="secondary-button bulk-button pipeline-button"
+                  onClick={rotateLogoutReauthorizeUploadSelected}
+                  disabled={!canRotateAndUploadSelected || Boolean(batchAction)}
+                  title="依次轮换 2FA、登出所有设备、重新授权并上传到 Sub2API"
+                >
+                  {batchAction === "rotate-logout-reauthorize-upload" ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}
+                  一键轮换并上传
                 </button>
               )}
               {features.sourceExport && (
@@ -1044,7 +1184,7 @@ function App() {
                     type="checkbox"
                     checked={allPageSelected}
                     onChange={toggleAllOnPage}
-                    disabled={!features.bulkActions || !pageJobIds.length}
+                    disabled={!features.bulkActions || !pageJobIds.length || Boolean(batchAction)}
                     aria-label="选择当前页全部任务"
                   />
                 </th>
@@ -1069,7 +1209,7 @@ function App() {
                     onError={setError}
                     selected={selectedJobIds.has(job.id)}
                     onToggleSelected={() => toggleJobSelection(job.id)}
-                    selectionSupported={Boolean(features.bulkActions)}
+                    selectionSupported={Boolean(features.bulkActions && !batchAction)}
                     smsProviderAvailable={smsProviderDefinitions.length > 0}
                     smsProvider={activeSmsProvider}
                     onUpload={() => uploadSelected([job.id])}

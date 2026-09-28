@@ -221,6 +221,7 @@ async function handleApi(req, res, requestUrl) {
         sourceExport: true,
         cancelAll: true,
         sub2apiUpload: true,
+        sub2apiPipeline: true,
         sub2apiMonitor: true,
         tlsFingerprint: true,
         totpSetup: true,
