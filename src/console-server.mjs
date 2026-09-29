@@ -11,6 +11,7 @@ import react from "@vitejs/plugin-react";
 import { createServer as createViteServer } from "vite";
 import { createCredentialStore } from "./credential-store.mjs";
 import {
+  fetchAccountUsage,
   listAccountSessions,
   revokeAccountSession,
   revokeAllAccountSessions,
@@ -34,6 +35,8 @@ const PROXY_CONNECTION_RETRY_BASE_MS = Math.max(1, Number(process.env.PROXY_CONN
 const PROXY_CONNECTION_RETRY_MAX_MS = 15_000;
 const PAGE_SIZE = 20;
 const MAX_LOG_CHARS = 80_000;
+const SUB2API_ACCOUNT_STATUS_CACHE_TTL_MS = readDurationEnv("SUB2API_ACCOUNT_STATUS_CACHE_TTL_MS", 15_000, 1_000);
+const ACCOUNT_USAGE_CACHE_TTL_MS = readDurationEnv("ACCOUNT_USAGE_CACHE_TTL_MS", 60_000, 1_000);
 const JOB_META_FILENAME = "job-meta.json";
 const LOGIN_CHECKPOINT_FILENAME = "login-checkpoint.json";
 const TOTP_SETUP_RESULT_FILENAME = "totp-setup-result.json";
@@ -41,6 +44,15 @@ const PASSWORD_ADD_RESULT_FILENAME = "password-add-result.json";
 const SUB2API_SETTINGS_FILENAME = "sub2api-settings.json";
 const SUB2API_MONITOR_FILENAME = "sub2api-monitor.json";
 const SUB2API_WS_MODES = new Set(["off", "ctx_pool", "passthrough", "http_bridge"]);
+const SUB2API_ACCOUNT_NAME_TEMPLATE_KEYS = new Set([
+  "email",
+  "planType",
+  "plan_type",
+  "accountId",
+  "account_id",
+  "id",
+  "name",
+]);
 const SUB2API_MONITOR_INTERVAL_MS = readDurationEnv("SUB2API_MONITOR_INTERVAL_MS", 5 * 60_000, 1_000);
 const SUB2API_AUTO_REPAIR_COOLDOWN_MS = readDurationEnv("SUB2API_AUTO_REPAIR_COOLDOWN_MS", 5 * 60_000, 0);
 const MAIL_POLL_INTERVAL_MS = 2_500;
@@ -85,6 +97,13 @@ let sub2ApiSettingsConfig = null;
 let sub2ApiMonitorConfig = null;
 let sub2ApiMonitorTimer = null;
 let sub2ApiMonitorPromise = null;
+let sub2ApiAccountStatusPromise = null;
+let sub2ApiAccountStatusCache = {
+  backend: null,
+  fetchedAt: null,
+  accounts: new Map(),
+};
+const accountUsageCache = new Map();
 let mailRequestConfig = { method: "GET", url: null, headers: {} };
 const sub2ApiRequestControllers = new Set();
 const sub2ApiRequestPromises = new Set();
@@ -134,6 +153,7 @@ scheduleSub2ApiMonitor();
 const vite = await createViteServer({
   root: WEB_ROOT,
   configFile: false,
+  cacheDir: path.join(OUTPUT_ROOT, ".vite"),
   appType: "spa",
   plugins: [react()],
   server: {
@@ -230,6 +250,10 @@ async function handleApi(req, res, requestUrl) {
         passwordAdd: true,
         forceRelogin: true,
         accountSessions: true,
+        accountUsage: true,
+        sub2apiAccountStatus: true,
+        sub2apiAccountToggle: true,
+        sub2apiAccountPriority: true,
       },
     });
     return;
@@ -242,14 +266,18 @@ async function handleApi(req, res, requestUrl) {
 
   if (req.method === "GET" && requestUrl.pathname === "/api/jobs") {
     const requestedPage = Math.max(1, Number.parseInt(requestUrl.searchParams.get("page") || "1", 10) || 1);
-    await sendJobsPage(res, requestedPage);
+    await sendJobsPage(res, requestedPage, null, normalizeJobFilters({
+      planType: requestUrl.searchParams.get("planType"),
+      sub2apiPool: requestUrl.searchParams.get("sub2apiPool"),
+      sub2apiEnabled: requestUrl.searchParams.get("sub2apiEnabled"),
+    }));
     return;
   }
 
   if (req.method === "POST" && requestUrl.pathname === "/api/jobs/query") {
     const body = await readJson(req);
     const requestedPage = Math.max(1, Number.parseInt(body.page || "1", 10) || 1);
-    await sendJobsPage(res, requestedPage, normalizeEmailFilter(body.emails));
+    await sendJobsPage(res, requestedPage, normalizeEmailFilter(body.emails), normalizeJobFilters(body));
     return;
   }
 
@@ -464,11 +492,13 @@ async function handleApi(req, res, requestUrl) {
       const { proxy_key: _proxyKey, ...accountData } = account;
       const credentials = { ...(account.credentials || {}) };
       const extra = buildSub2ApiAccountExtra(account.extra, config);
+      const accountName = renderSub2ApiAccountName(config.accountNameTemplate, account);
       if (config.modelWhitelist.length) {
         credentials.model_mapping = Object.fromEntries(config.modelWhitelist.map((model) => [model, model]));
       }
       return {
         ...accountData,
+        ...(accountName ? { name: accountName } : {}),
         credentials,
         extra,
         status: "active",
@@ -485,6 +515,7 @@ async function handleApi(req, res, requestUrl) {
       headers: { "Idempotency-Key": idempotencyKey },
       body: JSON.stringify({ accounts }),
     });
+    invalidateSub2ApiAccountStatusCache();
 
     sendJson(res, 200, {
       selected: selected.length,
@@ -492,6 +523,90 @@ async function handleApi(req, res, requestUrl) {
       skipped: selected.length - downloadable.length,
       groupIds: config.groupIds,
       result,
+    });
+    return;
+  }
+
+  if (req.method === "GET" && requestUrl.pathname === "/api/sub2api/account-status") {
+    const forceRefresh = requestUrl.searchParams.get("refresh") === "1";
+    const state = await loadSub2ApiAccountStatus({ forceRefresh });
+    sendJson(res, 200, publicSub2ApiAccountStatusState(state));
+    return;
+  }
+
+  const sub2ApiSchedulableMatch = /^\/api\/sub2api\/accounts\/([a-f0-9-]+)\/schedulable$/.exec(requestUrl.pathname);
+  if (req.method === "POST" && sub2ApiSchedulableMatch) {
+    const body = await readJson(req);
+    if (typeof body.enabled !== "boolean") throw httpError(400, "启用状态必须是布尔值");
+    const job = jobs.get(sub2ApiSchedulableMatch[1]);
+    if (!job) {
+      sendJson(res, 404, { error: "Login flow not found" });
+      return;
+    }
+    const config = sub2ApiSettingsConfig || sub2ApiMonitorConfig;
+    if (!config?.baseUrl || !config?.adminApiKey) throw httpError(409, "请先配置 Sub2API 后端和管理员 API Key");
+    const state = await loadSub2ApiAccountStatus({ forceRefresh: true });
+    const entry = state.accounts.get(job.email.toLowerCase());
+    if (!entry?.accountIds?.length) throw httpError(409, `${job.email} 尚未加入 Sub2API 号池`);
+    await Promise.all(entry.accountIds.map((accountId) => requestSub2Api(
+      config,
+      `/api/v1/admin/accounts/${encodeURIComponent(accountId)}/schedulable`,
+      {
+        method: "POST",
+        body: JSON.stringify({ schedulable: body.enabled }),
+      },
+    )));
+    const nextEntry = {
+      ...entry,
+      enabled: body.enabled,
+      fetchedAt: new Date().toISOString(),
+    };
+    state.accounts.set(job.email.toLowerCase(), nextEntry);
+    state.fetchedAt = new Date().toISOString();
+    sendJson(res, 200, { status: publicSub2ApiAccountStatusEntry(nextEntry) });
+    return;
+  }
+
+  const sub2ApiPriorityMatch = /^\/api\/sub2api\/accounts\/([a-f0-9-]+)\/priority$/.exec(requestUrl.pathname);
+  if ((req.method === "POST" || req.method === "PUT") && sub2ApiPriorityMatch) {
+    const body = await readJson(req);
+    const priority = parseOptionalSub2ApiInteger(body?.priority, "优先级", 0, 10000);
+    if (priority === null) throw httpError(400, "优先级必须是 0 到 10000 的整数");
+    const job = jobs.get(sub2ApiPriorityMatch[1]);
+    if (!job) {
+      sendJson(res, 404, { error: "Login flow not found" });
+      return;
+    }
+    const config = sub2ApiSettingsConfig || sub2ApiMonitorConfig;
+    if (!config?.baseUrl || !config?.adminApiKey) throw httpError(409, "请先配置 Sub2API 后端和管理员 API Key");
+    const state = await loadSub2ApiAccountStatus({ forceRefresh: true });
+    const entry = state.accounts.get(job.email.toLowerCase());
+    const accountIds = [...new Set(entry?.accountIds || [])];
+    if (!accountIds.length) throw httpError(409, `${job.email} 尚未加入 Sub2API 号池`);
+    try {
+      await Promise.all(accountIds.map((accountId) => requestSub2Api(
+        config,
+        `/api/v1/admin/accounts/${encodeURIComponent(accountId)}`,
+        {
+          method: "PUT",
+          body: JSON.stringify({ priority }),
+        },
+      )));
+    } finally {
+      invalidateSub2ApiAccountStatusCache();
+    }
+    const refreshedState = await loadSub2ApiAccountStatus({ forceRefresh: true });
+    const refreshedEntry = refreshedState.accounts.get(job.email.toLowerCase()) || {
+      ...(entry || {}),
+      email: job.email.toLowerCase(),
+      accountIds,
+      priority,
+      fetchedAt: new Date().toISOString(),
+    };
+    sendJson(res, 200, {
+      updated: accountIds.length,
+      priority,
+      status: publicSub2ApiAccountStatusEntry(refreshedEntry),
     });
     return;
   }
@@ -505,6 +620,7 @@ async function handleApi(req, res, requestUrl) {
     const body = await readJson(req);
     const config = normalizeSub2ApiConfig(body.config, { inheritStoredFields: true });
     sub2ApiSettingsConfig = config;
+    invalidateSub2ApiAccountStatusCache();
     await persistSub2ApiSettingsConfiguration();
     sendJson(res, 200, publicSub2ApiSettingsState());
     return;
@@ -519,6 +635,7 @@ async function handleApi(req, res, requestUrl) {
     const body = await readJson(req);
     const config = normalizeSub2ApiConfig(body.config, { inheritStoredFields: true });
     sub2ApiSettingsConfig = config;
+    invalidateSub2ApiAccountStatusCache();
     await persistSub2ApiSettingsConfiguration();
     sub2ApiMonitorConfig = { ...config, enabled: body.enabled === true };
     sub2ApiMonitorState.lastError = null;
@@ -554,7 +671,7 @@ async function handleApi(req, res, requestUrl) {
     return;
   }
 
-  const match = /^\/api\/jobs\/([a-f0-9-]+)(?:\/(input|cancel|retry|regenerate|relogin|setup-2fa|replace-2fa|add-password|credentials|logs|download|sms-number|luban-number|sessions(?:\/(?:logout|logout-all))?))?$/.exec(requestUrl.pathname);
+  const match = /^\/api\/jobs\/([a-f0-9-]+)(?:\/(input|cancel|retry|regenerate|relogin|setup-2fa|replace-2fa|add-password|credentials|usage|logs|download|sms-number|luban-number|sessions(?:\/(?:logout|logout-all))?))?$/.exec(requestUrl.pathname);
   if (!match) {
     sendJson(res, 404, { error: "Not found" });
     return;
@@ -581,6 +698,16 @@ async function handleApi(req, res, requestUrl) {
       sendJson(res, 200, { sessions: await listAccountSessions(job) });
     } catch (error) {
       throw sessionApiError(error);
+    }
+    return;
+  }
+  if (req.method === "GET" && action === "usage") {
+    if (!job.resultSaved) throw httpError(409, "账号授权尚未完成，暂时没有可读取的官方额度");
+    try {
+      const usage = await getAccountUsage(job, requestUrl.searchParams.get("refresh") === "1");
+      sendJson(res, 200, { usage });
+    } catch (error) {
+      throw accountUsageApiError(error);
     }
     return;
   }
@@ -660,6 +787,7 @@ async function handleApi(req, res, requestUrl) {
     await withEmailJobLock(job.email, async () => {
       persisted = await updateStoredCredentialFields(job, body);
     });
+    accountUsageCache.delete(job.id);
     sendJson(res, 200, { credentials: await publicCredentialDetails(job, persisted), job: publicJob(job) });
     return;
   }
@@ -679,13 +807,17 @@ async function handleApi(req, res, requestUrl) {
   sendJson(res, 405, { error: "Method not allowed" });
 }
 
-async function sendJobsPage(res, requestedPage, emailFilter = null) {
+async function sendJobsPage(res, requestedPage, emailFilter = null, filters = {}) {
   await syncCompletedOutputs();
+  if (filters.sub2apiPool || filters.sub2apiEnabled) {
+    await loadSub2ApiAccountStatus();
+  }
   const allJobs = listUniqueJobs();
   const emailSet = emailFilter?.length ? new Set(emailFilter) : null;
-  const visibleJobs = emailSet
-    ? allJobs.filter((job) => emailSet.has(job.email.toLowerCase()))
-    : allJobs;
+  const visibleJobs = allJobs.filter((job) => {
+    if (emailSet && !emailSet.has(job.email.toLowerCase())) return false;
+    return matchesJobFilters(job, filters);
+  });
   const total = visibleJobs.length;
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
   const page = Math.min(requestedPage, totalPages);
@@ -694,13 +826,52 @@ async function sendJobsPage(res, requestedPage, emailFilter = null) {
     jobs: visibleJobs.slice(start, start + PAGE_SIZE).map(publicJob),
     selection: visibleJobs.map(publicSelectionJob),
     pagination: { page, pageSize: PAGE_SIZE, total, totalPages, totalAll: allJobs.length },
-    filter: { active: Boolean(emailSet), requested: emailFilter?.length || 0, matched: total },
+    filter: {
+      active: Boolean(emailSet || filters.planType || filters.sub2apiPool || filters.sub2apiEnabled),
+      requested: emailFilter?.length || 0,
+      matched: total,
+      planType: filters.planType || "",
+      sub2apiPool: filters.sub2apiPool || "",
+      sub2apiEnabled: filters.sub2apiEnabled || "",
+    },
+    filterOptions: {
+      planTypes: [...new Set(allJobs.map((job) => job.planType).filter(Boolean))].sort(),
+    },
     stats: {
       active: allJobs.filter(occupiesActiveSlot).length,
       queued: allJobs.filter((job) => job.status === "queued").length,
       completed: allJobs.filter((job) => job.status === "completed").length,
     },
   });
+}
+
+function normalizeJobFilters(value) {
+  const source = value && typeof value === "object" ? value : {};
+  const planTypeValue = String(source.planType || "").trim();
+  const sub2apiPoolValue = String(source.sub2apiPool || "").trim().toLowerCase();
+  const sub2apiEnabledValue = String(source.sub2apiEnabled || "").trim().toLowerCase();
+  const allowedPoolValues = new Set(["added", "not_added", "unknown"]);
+  const allowedEnabledValues = new Set(["enabled", "disabled", "unknown"]);
+  return {
+    planType: planTypeValue || null,
+    sub2apiPool: allowedPoolValues.has(sub2apiPoolValue) ? sub2apiPoolValue : null,
+    sub2apiEnabled: allowedEnabledValues.has(sub2apiEnabledValue) ? sub2apiEnabledValue : null,
+  };
+}
+
+function matchesJobFilters(job, filters) {
+  if (filters.planType) {
+    const actualPlanType = job.planType || "__unknown__";
+    if (actualPlanType !== filters.planType) return false;
+  }
+  const sub2ApiStatus = getSub2ApiAccountStatusForJob(job);
+  if (filters.sub2apiPool === "added" && sub2ApiStatus.inPool !== true) return false;
+  if (filters.sub2apiPool === "not_added" && sub2ApiStatus.inPool !== false) return false;
+  if (filters.sub2apiPool === "unknown" && sub2ApiStatus.inPool !== null) return false;
+  if (filters.sub2apiEnabled === "enabled" && sub2ApiStatus.enabled !== true) return false;
+  if (filters.sub2apiEnabled === "disabled" && sub2ApiStatus.enabled !== false) return false;
+  if (filters.sub2apiEnabled === "unknown" && sub2ApiStatus.enabled !== null) return false;
+  return true;
 }
 
 function normalizeEmailFilter(value) {
@@ -2567,6 +2738,9 @@ function normalizeSub2ApiConfig(value, options = {}) {
     0,
     10000,
   );
+  const accountNameTemplate = normalizeSub2ApiAccountNameTemplate(
+    Object.hasOwn(config, "accountNameTemplate") ? config.accountNameTemplate : stored.accountNameTemplate,
+  );
   const modelWhitelist = parseSub2ApiModelWhitelist(
     Object.hasOwn(config, "modelWhitelist") ? config.modelWhitelist : stored.modelWhitelist,
   );
@@ -2581,7 +2755,45 @@ function normalizeSub2ApiConfig(value, options = {}) {
       ?? stored.wsMode
       ?? "off",
   );
-  return { baseUrl, adminApiKey, groupIds, proxyId, concurrency, loadFactor, priority, modelWhitelist, codexFingerprintMode, wsMode };
+  return { baseUrl, adminApiKey, groupIds, proxyId, concurrency, loadFactor, priority, accountNameTemplate, modelWhitelist, codexFingerprintMode, wsMode };
+}
+
+function normalizeSub2ApiAccountNameTemplate(value) {
+  const text = String(value ?? "").trim();
+  if (text.length > 256) throw httpError(400, "账号命名模板最多 256 个字符");
+  if (/[\r\n]/.test(text)) throw httpError(400, "账号命名模板不能包含换行");
+  const unsupported = [...text.matchAll(/\{([^{}]*)\}/g)]
+    .map((match) => match[1])
+    .filter((key) => !SUB2API_ACCOUNT_NAME_TEMPLATE_KEYS.has(key));
+  if (unsupported.length) {
+    throw httpError(400, `账号命名模板包含不支持的占位符：${unsupported[0]}`);
+  }
+  return text;
+}
+
+function renderSub2ApiAccountName(template, account) {
+  if (!template) return String(account?.name || "").trim().slice(0, 256);
+  const email = sub2ApiAccountEmail(account) || "";
+  const planType = extractPlanTypeFromAccount(account) || "";
+  const accountId = String(
+    account?.id
+      ?? account?.account_id
+      ?? account?.credentials?.chatgpt_account_id
+      ?? account?.credentials?.account_id
+      ?? account?.credentials?.accountId
+      ?? "",
+  ).trim();
+  const values = {
+    email,
+    planType,
+    plan_type: planType,
+    accountId,
+    account_id: accountId,
+    id: accountId,
+    name: String(account?.name || "").trim(),
+  };
+  const rendered = template.replace(/\{(email|planType|plan_type|accountId|account_id|id|name)\}/g, (_match, key) => values[key] || "").trim();
+  return (rendered || values.name || email).slice(0, 256);
 }
 
 function normalizeSub2ApiWsMode(value) {
@@ -2694,6 +2906,7 @@ function serializeSub2ApiConfig(config) {
     concurrency: config.concurrency,
     loadFactor: config.loadFactor,
     priority: config.priority,
+    accountNameTemplate: config.accountNameTemplate,
     modelWhitelist: config.modelWhitelist,
     codexFingerprintMode: config.codexFingerprintMode,
     wsMode: config.wsMode,
@@ -3025,12 +3238,203 @@ async function listSub2ApiErrorAccounts(config) {
 }
 
 function sub2ApiAccountEmail(account) {
-  const direct = [account?.credentials?.email, account?.extra?.email]
+  const direct = [
+    account?.email,
+    account?.account_email,
+    account?.credentials?.email,
+    account?.credentials?.account_email,
+    account?.extra?.email,
+  ]
     .map((value) => String(value || "").trim().toLowerCase())
     .find(isEmail);
   if (direct) return direct;
   const match = String(account?.name || "").toLowerCase().match(/[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9.-]+\.[a-z]{2,}/i);
   return match && isEmail(match[0]) ? match[0] : null;
+}
+
+async function loadSub2ApiAccountStatus({ forceRefresh = false } = {}) {
+  const config = sub2ApiSettingsConfig || sub2ApiMonitorConfig;
+  if (!config?.baseUrl || !config?.adminApiKey) {
+    sub2ApiAccountStatusCache = { backend: null, fetchedAt: null, accounts: new Map() };
+    return sub2ApiAccountStatusCache;
+  }
+  const backend = monitorBackendIdentity(config);
+  const cacheAge = sub2ApiAccountStatusCache.fetchedAt
+    ? Date.now() - Date.parse(sub2ApiAccountStatusCache.fetchedAt)
+    : Number.POSITIVE_INFINITY;
+  if (!forceRefresh && sub2ApiAccountStatusCache.backend === backend && cacheAge < SUB2API_ACCOUNT_STATUS_CACHE_TTL_MS) {
+    return sub2ApiAccountStatusCache;
+  }
+  if (sub2ApiAccountStatusPromise) return sub2ApiAccountStatusPromise;
+  sub2ApiAccountStatusPromise = (async () => {
+    const remoteAccounts = await listSub2ApiAccounts(config);
+    const accounts = new Map();
+    const fetchedAt = new Date().toISOString();
+    for (const remoteAccount of remoteAccounts) {
+      const email = sub2ApiAccountEmail(remoteAccount);
+      const accountId = normalizeSub2ApiAccountId(remoteAccount?.id);
+      if (!email || !accountId) continue;
+      const groupIds = sub2ApiAccountGroupIds(remoteAccount);
+      const enabled = sub2ApiAccountSchedulable(remoteAccount);
+      const priority = sub2ApiAccountPriority(remoteAccount);
+      const current = accounts.get(email);
+      if (!current) {
+        accounts.set(email, {
+          email,
+          accountIds: [accountId],
+          groupIds,
+          enabled,
+          priority,
+          remoteStatus: String(remoteAccount?.status || "").trim() || null,
+          fetchedAt,
+        });
+        continue;
+      }
+      current.accountIds = [...new Set([...current.accountIds, accountId])];
+      current.groupIds = [...new Set([...current.groupIds, ...groupIds])];
+      current.enabled = mergeSub2ApiBoolean(current.enabled, enabled);
+      current.priority = mergeSub2ApiPriority(current.priority, priority);
+      current.remoteStatus ||= String(remoteAccount?.status || "").trim() || null;
+    }
+    sub2ApiAccountStatusCache = { backend, fetchedAt, accounts };
+    return sub2ApiAccountStatusCache;
+  })().finally(() => {
+    sub2ApiAccountStatusPromise = null;
+  });
+  return sub2ApiAccountStatusPromise;
+}
+
+function invalidateSub2ApiAccountStatusCache() {
+  sub2ApiAccountStatusCache = { backend: null, fetchedAt: null, accounts: new Map() };
+}
+
+function publicSub2ApiAccountStatusState(state = sub2ApiAccountStatusCache) {
+  const accounts = {};
+  for (const [email, entry] of state.accounts || []) accounts[email] = publicSub2ApiAccountStatusEntry(entry);
+  return {
+    configured: Boolean(state.backend && state.fetchedAt),
+    fetchedAt: state.fetchedAt || null,
+    accounts,
+  };
+}
+
+function publicSub2ApiAccountStatusEntry(entry) {
+  return {
+    email: entry.email,
+    accountId: entry.accountIds?.[0] || null,
+    accountIds: [...(entry.accountIds || [])],
+    inPool: true,
+    enabled: entry.enabled ?? null,
+    priority: entry.priority ?? null,
+    groupIds: [...(entry.groupIds || [])],
+    remoteStatus: entry.remoteStatus || null,
+    fetchedAt: entry.fetchedAt || null,
+  };
+}
+
+function getSub2ApiAccountStatusForJob(job) {
+  const config = sub2ApiSettingsConfig || sub2ApiMonitorConfig;
+  const expectedBackend = config?.baseUrl ? monitorBackendIdentity(config) : null;
+  if (!sub2ApiAccountStatusCache.fetchedAt || sub2ApiAccountStatusCache.backend !== expectedBackend) {
+    return { inPool: null, enabled: null, priority: null, accountId: null, accountIds: [], groupIds: [], remoteStatus: null };
+  }
+  const entry = sub2ApiAccountStatusCache.accounts.get(String(job.email || "").toLowerCase());
+  if (!entry) return { inPool: false, enabled: null, priority: null, accountId: null, accountIds: [], groupIds: [], remoteStatus: null };
+  return {
+    inPool: true,
+    enabled: entry.enabled ?? null,
+    priority: entry.priority ?? null,
+    accountId: entry.accountIds?.[0] || null,
+    accountIds: [...(entry.accountIds || [])],
+    groupIds: [...(entry.groupIds || [])],
+    remoteStatus: entry.remoteStatus || null,
+  };
+}
+
+function normalizeSub2ApiAccountId(value) {
+  const id = String(value ?? "").trim();
+  return id && id.length <= 128 && !/[/?#]/.test(id) ? id : null;
+}
+
+function sub2ApiAccountGroupIds(account) {
+  const values = [
+    ...(Array.isArray(account?.group_ids) ? account.group_ids : []),
+    ...(Array.isArray(account?.groupIds) ? account.groupIds : []),
+    ...(Array.isArray(account?.account_groups) ? account.account_groups.map((item) => item?.group_id ?? item?.groupId ?? item?.id) : []),
+    ...(Array.isArray(account?.groups) ? account.groups.map((item) => item?.id ?? item?.group_id ?? item?.groupId) : []),
+  ];
+  return [...new Set(values.map((value) => String(value ?? "").trim()).filter(Boolean))];
+}
+
+function sub2ApiAccountSchedulable(account) {
+  for (const value of [account?.schedulable, account?.is_schedulable, account?.enabled, account?.is_enabled]) {
+    if (typeof value === "boolean") return value;
+    if (value === 1 || value === "1" || String(value).toLowerCase() === "true") return true;
+    if (value === 0 || value === "0" || String(value).toLowerCase() === "false") return false;
+  }
+  return null;
+}
+
+function sub2ApiAccountPriority(account) {
+  for (const value of [account?.priority, account?.extra?.priority, account?.credentials?.priority, account?.settings?.priority]) {
+    if (value === null || value === undefined || String(value).trim() === "") continue;
+    const number = Number(value);
+    if (Number.isSafeInteger(number) && number >= 0) return number;
+    const text = String(value).trim();
+    if (text.length <= 64 && !/[\r\n]/.test(text)) return text;
+  }
+  return null;
+}
+
+function mergeSub2ApiPriority(current, next) {
+  return current === null || current === undefined ? (next ?? null) : current;
+}
+
+function mergeSub2ApiBoolean(current, next) {
+  if (current === null || current === undefined) return next ?? null;
+  if (next === null || next === undefined) return current;
+  return current === true && next === true;
+}
+
+async function listSub2ApiAccounts(config) {
+  const accounts = [];
+  const pageSize = 100;
+  let page = 1;
+  let pages = 1;
+  do {
+    const query = new URLSearchParams({
+      page: String(page),
+      page_size: String(pageSize),
+      platform: "openai",
+    });
+    const payload = await requestSub2Api(config, `/api/v1/admin/accounts?${query}`);
+    const data = payload?.data && typeof payload.data === "object" ? payload.data : payload;
+    const items = Array.isArray(data)
+      ? data
+      : Array.isArray(data?.items)
+        ? data.items
+        : Array.isArray(data?.data)
+          ? data.data
+          : Array.isArray(data?.list)
+            ? data.list
+            : Array.isArray(data?.records)
+              ? data.records
+              : Array.isArray(data?.accounts)
+                ? data.accounts
+                : Array.isArray(payload?.accounts)
+                  ? payload.accounts
+                  : [];
+    accounts.push(...items.filter((account) => account && typeof account === "object"));
+    const reportedPages = Number(data?.pages ?? data?.total_pages ?? data?.totalPages);
+    const reportedTotal = Number(data?.total ?? data?.total_count ?? data?.count);
+    pages = Number.isSafeInteger(reportedPages) && reportedPages > 0
+      ? reportedPages
+      : Number.isSafeInteger(reportedTotal) && reportedTotal >= 0
+        ? Math.max(page, Math.ceil(reportedTotal / pageSize))
+        : items.length >= pageSize ? page + 1 : page;
+    page += 1;
+  } while (page <= pages && page <= 1_000);
+  return accounts;
 }
 
 function isSub2ApiAccountInMonitoredGroups(account, groupIds) {
@@ -3093,9 +3497,14 @@ async function performSub2ApiAutoRepairSuccess(job) {
         ...localAccount.credentials,
       };
       const extra = buildSub2ApiAccountExtra(remoteAccount.extra, operation.config);
+      const accountName = renderSub2ApiAccountName(operation.config.accountNameTemplate, {
+        ...localAccount,
+        id: remoteAccount.id,
+        name: remoteAccount.name,
+      });
       await requestSub2Api(operation.config, `/api/v1/admin/accounts/${accountId}`, {
         method: "PUT",
-        body: JSON.stringify({ credentials, extra }),
+        body: JSON.stringify({ credentials, extra, ...(accountName ? { name: accountName } : {}) }),
       });
       await requestSub2Api(operation.config, `/api/v1/admin/accounts/${accountId}/clear-error`, {
         method: "POST",
@@ -3202,6 +3611,7 @@ async function exportSourceAccounts(res, ids) {
 
 function publicJob(job) {
   const autoRepair = getAutoRepairEligibility(job);
+  const sub2ApiStatus = getSub2ApiAccountStatusForJob(job);
   return {
     id: job.id,
     email: job.email,
@@ -3215,6 +3625,13 @@ function publicJob(job) {
     lastOperationType: job.lastOperationType || "initial_authorization",
     completedAt: job.completedAt,
     planType: job.planType || null,
+    sub2apiInPool: sub2ApiStatus.inPool,
+    sub2apiEnabled: sub2ApiStatus.enabled,
+    sub2apiPriority: sub2ApiStatus.priority,
+    sub2apiAccountId: sub2ApiStatus.accountId,
+    sub2apiAccountIds: sub2ApiStatus.accountIds,
+    sub2apiGroupIds: sub2ApiStatus.groupIds,
+    sub2apiRemoteStatus: sub2ApiStatus.remoteStatus,
     lastError: job.lastError,
     canDownload: Boolean(job.resultSaved),
     loginMode: job.loginMode || (job.mailApiUrl ? "email_otp" : "manual"),
@@ -3258,6 +3675,29 @@ function publicJob(job) {
     attempt: job.attempt,
     queuePosition: job.status === "queued" ? getQueuePosition(job) : 0,
   };
+}
+
+async function getAccountUsage(job, forceRefresh = false) {
+  const key = String(job?.id || "");
+  if (!key) throw new Error("ACCOUNT_USAGE_CREDENTIALS_UNAVAILABLE: 账号标识无效");
+  const operationAt = String(job.lastOperationAt || job.updatedAt || "");
+  const cached = accountUsageCache.get(key);
+  if (cached?.promise) return cached.promise;
+  if (!forceRefresh && cached?.value && cached.operationAt === operationAt
+    && Date.now() - cached.cachedAt < ACCOUNT_USAGE_CACHE_TTL_MS) {
+    return cached.value;
+  }
+  const promise = fetchAccountUsage(job)
+    .then((value) => {
+      accountUsageCache.set(key, { value, cachedAt: Date.now(), operationAt });
+      return value;
+    })
+    .catch((error) => {
+      accountUsageCache.delete(key);
+      throw error;
+    });
+  accountUsageCache.set(key, { promise, operationAt });
+  return promise;
 }
 
 async function publicCredentialDetails(job, persisted = null) {
@@ -3327,11 +3767,17 @@ async function readPlanTypeFromOutput(outputPath) {
 }
 
 function publicSelectionJob(job) {
+  const sub2ApiStatus = getSub2ApiAccountStatusForJob(job);
   return {
     id: job.id,
     email: job.email,
     status: job.status,
     planType: job.planType || null,
+    sub2apiInPool: sub2ApiStatus.inPool,
+    sub2apiEnabled: sub2ApiStatus.enabled,
+    sub2apiPriority: sub2ApiStatus.priority,
+    sub2apiAccountId: sub2ApiStatus.accountId,
+    sub2apiAccountIds: sub2ApiStatus.accountIds,
     canDownload: Boolean(job.resultSaved),
     canRetry: ["failed", "canceled", "reauth_required", "resume_available"].includes(job.status),
     canRegenerate: job.status === "completed" && job.resultSaved,
@@ -3553,6 +3999,7 @@ async function deleteJobsByEmail(email) {
     job.child?.kill("SIGTERM");
     job.child = null;
     directories.add(path.dirname(job.outputPath));
+    accountUsageCache.delete(job.id);
     jobs.delete(job.id);
   });
   await Promise.allSettled(matching.map((job) => job.metadataWritePromise).filter(Boolean));
@@ -5008,6 +5455,21 @@ function sessionApiError(error) {
               ? 403
               : 502;
   return httpError(status, message.replace(/^SESSION_[A-Z_]+:\s*/, ""));
+}
+
+function accountUsageApiError(error) {
+  if (error?.status) return error;
+  const message = String(error?.message || "ACCOUNT_USAGE_PROVIDER_ERROR: 官方额度请求失败")
+    .replace(/[\r\n]+/g, " ")
+    .slice(0, 320);
+  const status = /ACCOUNT_USAGE_CREDENTIALS_UNAVAILABLE|SESSION_CREDENTIALS_UNAVAILABLE|SESSION_TOKEN_EXPIRED/.test(message)
+    ? 409
+    : /SESSION_PROVIDER_ERROR: HTTP 401/.test(message)
+      ? 401
+      : /SESSION_PROVIDER_ERROR: HTTP 403/.test(message)
+        ? 403
+        : 502;
+  return httpError(status, message.replace(/^(?:ACCOUNT_USAGE|SESSION)_[A-Z_]+:\s*/, ""));
 }
 
 process.on("SIGINT", () => void shutdown().catch(reportShutdownFailure));

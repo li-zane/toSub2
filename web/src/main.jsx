@@ -93,6 +93,10 @@ function App() {
   const [filterText, setFilterText] = useState("");
   const [filterError, setFilterError] = useState("");
   const [emailFilter, setEmailFilter] = useState([]);
+  const [planTypeFilter, setPlanTypeFilter] = useState("");
+  const [sub2apiPoolFilter, setSub2apiPoolFilter] = useState("");
+  const [sub2apiEnabledFilter, setSub2apiEnabledFilter] = useState("");
+  const [planTypeOptions, setPlanTypeOptions] = useState([]);
   const [error, setError] = useState("");
   const [expandedJobId, setExpandedJobId] = useState(null);
   const [selectedJobIds, setSelectedJobIds] = useState(() => new Set());
@@ -139,6 +143,15 @@ function App() {
   const [planTypeMappingError, setPlanTypeMappingError] = useState("");
   const [credentialJob, setCredentialJob] = useState(null);
   const [sessionJob, setSessionJob] = useState(null);
+  const [sub2apiAccountStatus, setSub2apiAccountStatus] = useState({ configured: false, fetchedAt: null, accounts: {} });
+  const [sub2apiToggleBusy, setSub2apiToggleBusy] = useState(() => new Set());
+  const [sub2apiPriorityBusy, setSub2apiPriorityBusy] = useState(() => new Set());
+  const [accountUsageByJobId, setAccountUsageByJobId] = useState({});
+
+  const accountUsageJobKey = jobs
+    .filter((job) => job.canDownload)
+    .map((job) => `${job.id}:${job.lastOperationAt || job.updatedAt || ""}`)
+    .join("|");
 
   useEffect(() => writeLocalJson(SMS_PROVIDER_SETTINGS_KEY, smsSettings), [smsSettings]);
   useEffect(() => writeLocalJson(MAIL_REQUEST_SETTINGS_KEY, mailRequestSettings), [mailRequestSettings]);
@@ -180,12 +193,22 @@ function App() {
     let timer;
     const poll = async () => {
       try {
+        const filters = {
+          planType: planTypeFilter || undefined,
+          sub2apiPool: sub2apiPoolFilter || undefined,
+          sub2apiEnabled: sub2apiEnabledFilter || undefined,
+        };
         const data = emailFilter.length
           ? await apiFetch(token, "/api/jobs/query", {
               method: "POST",
-              body: JSON.stringify({ page, emails: emailFilter }),
+              body: JSON.stringify({ page, emails: emailFilter, ...filters }),
             })
-          : await apiFetch(token, `/api/jobs?page=${page}`);
+          : await apiFetch(token, `/api/jobs?${new URLSearchParams({
+              page: String(page),
+              ...(filters.planType ? { planType: filters.planType } : {}),
+              ...(filters.sub2apiPool ? { sub2apiPool: filters.sub2apiPool } : {}),
+              ...(filters.sub2apiEnabled ? { sub2apiEnabled: filters.sub2apiEnabled } : {}),
+            }).toString()}`);
         if (!stopped) {
           setJobs(data.jobs);
           setCredentialJob((current) => data.jobs.find((job) => job.id === current?.id) || current);
@@ -193,6 +216,7 @@ function App() {
           setJobSelectionIndex(data.selection || data.jobs);
           setPagination(data.pagination || { page, pageSize: 20, total: data.jobs.length, totalPages: 1 });
           setStats(data.stats || { active: 0, queued: 0, completed: 0 });
+          setPlanTypeOptions(Array.isArray(data.filterOptions?.planTypes) ? data.filterOptions.planTypes : []);
           if (data.pagination?.page && data.pagination.page !== page) setPage(data.pagination.page);
           setError("");
         }
@@ -207,7 +231,7 @@ function App() {
       stopped = true;
       window.clearTimeout(timer);
     };
-  }, [token, page, emailFilter]);
+  }, [token, page, emailFilter, planTypeFilter, sub2apiPoolFilter, sub2apiEnabledFilter]);
 
   useEffect(() => {
     if (!token || !features.sub2apiMonitor) return undefined;
@@ -241,6 +265,71 @@ function App() {
       stopped = true;
     };
   }, [token]);
+
+  useEffect(() => {
+    if (!token || !features.sub2apiAccountStatus) return undefined;
+    let stopped = false;
+    const load = async () => {
+      try {
+        if (!stopped) await refreshSub2ApiAccountStatus();
+      } catch {
+        // A missing or temporarily unavailable Sub2API backend leaves the local task list usable.
+      }
+    };
+    void load();
+    const timer = window.setInterval(load, 15_000);
+    return () => {
+      stopped = true;
+      window.clearInterval(timer);
+    };
+  }, [token, features.sub2apiAccountStatus, sub2apiSettings.baseUrl, sub2apiSettings.hasStoredAdminApiKey]);
+
+  useEffect(() => {
+    if (!token || !features.accountUsage) return undefined;
+    const usageJobs = jobs.filter((job) => job.canDownload);
+    const usageJobIds = usageJobs.map((job) => job.id);
+    let stopped = false;
+    setAccountUsageByJobId((current) => {
+      const next = { ...current };
+      for (const jobId of Object.keys(next)) {
+        if (!usageJobIds.includes(jobId)) delete next[jobId];
+      }
+      for (const jobId of usageJobIds) {
+        if (!next[jobId]) next[jobId] = { status: "loading" };
+      }
+      return next;
+    });
+
+    let loading = false;
+    const load = async () => {
+      if (stopped || loading) return;
+      loading = true;
+      try {
+        const results = await Promise.all(usageJobs.map(async (job) => {
+          try {
+            const data = await apiFetch(token, `/api/jobs/${encodeURIComponent(job.id)}/usage`);
+            return [job.id, { status: "ready", ...(data.usage || {}) }];
+          } catch (requestError) {
+            return [job.id, { status: "error", error: requestError.message }];
+          }
+        }));
+        if (!stopped) {
+          setAccountUsageByJobId((current) => ({
+            ...current,
+            ...Object.fromEntries(results),
+          }));
+        }
+      } finally {
+        loading = false;
+      }
+    };
+    void load();
+    const timer = window.setInterval(load, 60_000);
+    return () => {
+      stopped = true;
+      window.clearInterval(timer);
+    };
+  }, [token, features.accountUsage, accountUsageJobKey]);
 
   const pageJobIds = useMemo(() => jobs.map((job) => job.id), [jobs]);
   const smsProviderDefinitions = Array.isArray(features.smsProviders) ? features.smsProviders : [];
@@ -281,6 +370,29 @@ function App() {
   const passwordAddSelectedCount = selectedJobs.filter((job) => job.canAddPassword).length;
   const canAddPasswordSelected = selectedJobs.length > 0 && selectedJobs.length === selectedJobIds.size
     && passwordAddSelectedCount > 0;
+  const hasJobFilters = Boolean(emailFilter.length || planTypeFilter || sub2apiPoolFilter || sub2apiEnabledFilter);
+  const availablePlanTypes = [...new Set([
+    ...planTypeOptions,
+    ...jobs.map((job) => job.planType).filter(Boolean),
+    ...(planTypeFilter && planTypeFilter !== "__unknown__" ? [planTypeFilter] : []),
+  ])].sort();
+
+  async function refreshAccountUsage(jobId) {
+    if (!token || !features.accountUsage) return;
+    setAccountUsageByJobId((current) => ({ ...current, [jobId]: { status: "loading" } }));
+    try {
+      const data = await apiFetch(token, `/api/jobs/${encodeURIComponent(jobId)}/usage?refresh=1`);
+      setAccountUsageByJobId((current) => ({
+        ...current,
+        [jobId]: { status: "ready", ...(data.usage || {}) },
+      }));
+    } catch (requestError) {
+      setAccountUsageByJobId((current) => ({
+        ...current,
+        [jobId]: { status: "error", error: requestError.message },
+      }));
+    }
+  }
 
   function openSmsSettings() {
     const draft = withSmsProviderDefaults(smsProviderDefinitions, smsSettings);
@@ -345,6 +457,14 @@ function App() {
     }
   }
 
+  async function refreshSub2ApiAccountStatus(forceRefresh = false) {
+    const data = await apiFetch(token, `/api/sub2api/account-status${forceRefresh ? "?refresh=1" : ""}`);
+    setSub2apiAccountStatus(data);
+    setJobs((current) => current.map((job) => mergeSub2ApiStatusIntoJob(job, data)));
+    setJobSelectionIndex((current) => current.map((job) => mergeSub2ApiStatusIntoJob(job, data)));
+    return data;
+  }
+
   async function saveSub2ApiSettings(event) {
     event.preventDefault();
     const baseUrl = String(sub2apiSettingsDraft.baseUrl || "").trim();
@@ -377,6 +497,7 @@ function App() {
         : { ...savedSettings, enabled: false };
       setSub2apiSettings(mergeServerSub2ApiSettings(nextSettings, { ...savedSettings, ...monitor }));
       setSub2apiMonitorStatus((current) => ({ ...current, ...monitor }));
+      void refreshSub2ApiAccountStatus(true).catch(() => {});
       setSub2apiSettingsOpen(false);
       setSub2apiSettingsError("");
     } catch (requestError) {
@@ -419,6 +540,84 @@ function App() {
     });
   }
 
+  async function toggleSub2ApiAccount(job, enabled) {
+    if (!job?.sub2apiInPool || sub2apiToggleBusy.has(job.id)) return;
+    setSub2apiToggleBusy((current) => new Set(current).add(job.id));
+    try {
+      const data = await apiFetch(token, `/api/sub2api/accounts/${encodeURIComponent(job.id)}/schedulable`, {
+        method: "POST",
+        body: JSON.stringify({ enabled }),
+      });
+      const status = data.status || {};
+      const fields = sub2ApiStatusJobFields(status);
+      setJobs((current) => current.map((item) => item.id === job.id ? { ...item, ...fields } : item));
+      setJobSelectionIndex((current) => current.map((item) => item.id === job.id ? { ...item, ...fields } : item));
+      setSub2apiAccountStatus((current) => ({
+        ...current,
+        fetchedAt: status.fetchedAt || current.fetchedAt,
+        accounts: {
+          ...(current.accounts || {}),
+          [String(job.email || "").toLowerCase()]: status,
+        },
+      }));
+      setError("");
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally {
+      setSub2apiToggleBusy((current) => {
+        const next = new Set(current);
+        next.delete(job.id);
+        return next;
+      });
+    }
+  }
+
+  async function updateSub2ApiPriority(job, priority) {
+    if (!job?.sub2apiInPool || sub2apiPriorityBusy.has(job.id)) return;
+    setSub2apiPriorityBusy((current) => new Set(current).add(job.id));
+    try {
+      const data = await apiFetch(token, `/api/sub2api/accounts/${encodeURIComponent(job.id)}/priority`, {
+        method: "POST",
+        body: JSON.stringify({ priority }),
+      });
+      const status = {
+        ...(data.status || {}),
+        priority: data.status?.priority ?? data.priority ?? null,
+      };
+      const fields = sub2ApiStatusJobFields(status);
+      const emailKey = String(job.email || "").toLowerCase();
+      setJobs((current) => current.map((item) => (
+        item.id === job.id || String(item.email || "").toLowerCase() === emailKey
+          ? { ...item, ...fields }
+          : item
+      )));
+      setJobSelectionIndex((current) => current.map((item) => (
+        item.id === job.id || String(item.email || "").toLowerCase() === emailKey
+          ? { ...item, ...fields }
+          : item
+      )));
+      setSub2apiAccountStatus((current) => ({
+        ...current,
+        configured: true,
+        fetchedAt: status.fetchedAt || current.fetchedAt,
+        accounts: {
+          ...(current.accounts || {}),
+          [emailKey]: status,
+        },
+      }));
+      setUploadNotice(`已更新 ${job.email} 的 Sub2API 优先级为 ${status.priority}`);
+      setError("");
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally {
+      setSub2apiPriorityBusy((current) => {
+        const next = new Set(current);
+        next.delete(job.id);
+        return next;
+      });
+    }
+  }
+
   function formatSub2ApiUploadNotice(data) {
     const result = data.result || {};
     const created = result.account_created ?? result.success ?? data.uploaded;
@@ -438,6 +637,7 @@ function App() {
     try {
       const data = await performSub2ApiUpload(ids);
       setUploadNotice(formatSub2ApiUploadNotice(data));
+      void refreshSub2ApiAccountStatus(true).catch(() => {});
       setSelectedJobIds(new Set());
       setError("");
     } catch (requestError) {
@@ -746,10 +946,20 @@ function App() {
   function clearEmailFilter() {
     setEmailFilter([]);
     setFilterText("");
+    setPlanTypeFilter("");
+    setSub2apiPoolFilter("");
+    setSub2apiEnabledFilter("");
     setSelectedJobIds(new Set());
     setExpandedJobId(null);
     setPage(1);
     setFilterError("");
+  }
+
+  function applyColumnFilter(setter, value) {
+    setter(value);
+    setSelectedJobIds(new Set());
+    setExpandedJobId(null);
+    setPage(1);
   }
 
   function toggleJobSelection(jobId) {
@@ -1194,7 +1404,52 @@ function App() {
                   />
                 </th>
                 <th>账号</th>
-                <th>Plan type</th>
+                <th>
+                  <div className="column-filter-heading">
+                    <span>Plan type</span>
+                    <select
+                      value={planTypeFilter}
+                      onChange={(event) => applyColumnFilter(setPlanTypeFilter, event.target.value)}
+                      aria-label="筛选 Plan type"
+                    >
+                      <option value="">全部</option>
+                      <option value="__unknown__">未知</option>
+                      {availablePlanTypes.map((value) => <option key={value} value={value}>{formatPlanTypeLabel(value, planTypeMapping)}</option>)}
+                    </select>
+                  </div>
+                </th>
+                <th className="usage-heading">官方用量</th>
+                <th>
+                  <div className="column-filter-heading">
+                    <span>Sub2API 号池</span>
+                    <select
+                      value={sub2apiPoolFilter}
+                      onChange={(event) => applyColumnFilter(setSub2apiPoolFilter, event.target.value)}
+                      aria-label="筛选 Sub2API 号池状态"
+                    >
+                      <option value="">全部</option>
+                      <option value="added">已加入</option>
+                      <option value="not_added">未加入</option>
+                      <option value="unknown">未同步</option>
+                    </select>
+                  </div>
+                </th>
+                <th>
+                  <div className="column-filter-heading">
+                    <span>号池启用</span>
+                    <select
+                      value={sub2apiEnabledFilter}
+                      onChange={(event) => applyColumnFilter(setSub2apiEnabledFilter, event.target.value)}
+                      aria-label="筛选号池启用状态"
+                    >
+                      <option value="">全部</option>
+                      <option value="enabled">已启用</option>
+                      <option value="disabled">已停用</option>
+                      <option value="unknown">未知</option>
+                    </select>
+                  </div>
+                </th>
+                <th className="priority-heading">Sub2API 优先级</th>
                 <th>状态</th>
                 <th>当前操作</th>
                 <th>开始时间</th>
@@ -1203,7 +1458,7 @@ function App() {
               </tr>
             </thead>
             <tbody>
-              {!jobs.length && <EmptyState filtered={emailFilter.length > 0} />}
+              {!jobs.length && <EmptyState filtered={hasJobFilters} />}
               {jobs.map((job) => (
                 <React.Fragment key={job.id}>
                   <JobRow
@@ -1219,11 +1474,20 @@ function App() {
                     smsProvider={activeSmsProvider}
                     onUpload={() => uploadSelected([job.id])}
                     sub2apiUploadAvailable={Boolean(features.sub2apiUpload && hasUsableSub2ApiSettings(sub2apiSettings))}
+                    sub2apiToggleAvailable={Boolean(features.sub2apiAccountToggle && hasUsableSub2ApiSettings(sub2apiSettings))}
+                    sub2apiToggleBusy={sub2apiToggleBusy.has(job.id)}
+                    onToggleSub2Api={(enabled) => toggleSub2ApiAccount(job, enabled)}
+                    sub2apiPriorityAvailable={Boolean(features.sub2apiAccountPriority && hasUsableSub2ApiSettings(sub2apiSettings))}
+                    sub2apiPriorityBusy={sub2apiPriorityBusy.has(job.id)}
+                    onUpdateSub2ApiPriority={(priority) => updateSub2ApiPriority(job, priority)}
                     totpSetupAvailable={Boolean(features.totpSetup)}
                     passwordAddAvailable={Boolean(features.passwordAdd)}
                     forceReloginAvailable={Boolean(features.forceRelogin)}
                     accountProxyUrl={accountProxyUrl}
                     planTypeMapping={planTypeMapping}
+                    accountUsage={accountUsageByJobId[job.id]}
+                    accountUsageAvailable={Boolean(features.accountUsage)}
+                    onRefreshUsage={() => refreshAccountUsage(job.id)}
                     credentialsAvailable={Boolean(features.credentialDetails)}
                     onOpenCredentials={() => setCredentialJob(job)}
                     sessionsAvailable={Boolean(features.accountSessions)}
@@ -1231,7 +1495,7 @@ function App() {
                   />
                   {expandedJobId === job.id && (
                     <tr className="log-row">
-                      <td colSpan="8"><JobLogs token={token} jobId={job.id} /></td>
+                      <td colSpan="12"><JobLogs token={token} jobId={job.id} /></td>
                     </tr>
                   )}
                 </React.Fragment>
@@ -1628,6 +1892,18 @@ function App() {
                 />
               </label>
               <label className="settings-field wide-settings-field">
+                <span>账号命名模板</span>
+                <input
+                  type="text"
+                  maxLength="256"
+                  value={sub2apiSettingsDraft.accountNameTemplate}
+                  onChange={(event) => setSub2apiSettingsDraft((current) => ({ ...current, accountNameTemplate: event.target.value }))}
+                  placeholder="例如：chatgpt-{email}"
+                  spellCheck="false"
+                />
+                <small className="settings-field-hint">留空保留导入文件原名；支持 {'{email}'}、{'{planType}'}、{'{accountId}'}、{'{name}'}</small>
+              </label>
+              <label className="settings-field wide-settings-field">
                 <span>允许使用的模型</span>
                 <textarea
                   className="sub2api-model-textarea"
@@ -1813,7 +2089,7 @@ function App() {
 function EmptyState({ filtered = false }) {
   return (
     <tr>
-      <td colSpan="8">
+      <td colSpan="12">
         <div className="empty-state">
           <div><Mail size={24} /></div>
           <h3>{filtered ? "没有匹配账号" : "暂无授权任务"}</h3>
@@ -1824,11 +2100,21 @@ function EmptyState({ filtered = false }) {
   );
 }
 
-function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggleSelected, selectionSupported, smsProviderAvailable, smsProvider, onUpload, sub2apiUploadAvailable, totpSetupAvailable, passwordAddAvailable, forceReloginAvailable, accountProxyUrl, planTypeMapping, credentialsAvailable, onOpenCredentials, sessionsAvailable, onOpenSessions }) {
+function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggleSelected, selectionSupported, smsProviderAvailable, smsProvider, onUpload, sub2apiUploadAvailable, sub2apiToggleAvailable, sub2apiToggleBusy, onToggleSub2Api, sub2apiPriorityAvailable, sub2apiPriorityBusy, onUpdateSub2ApiPriority, totpSetupAvailable, passwordAddAvailable, forceReloginAvailable, accountProxyUrl, planTypeMapping, accountUsage, accountUsageAvailable, onRefreshUsage, credentialsAvailable, onOpenCredentials, sessionsAvailable, onOpenSessions }) {
   const [value, setValue] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  const [priorityValue, setPriorityValue] = useState(() => job.sub2apiPriority === null || job.sub2apiPriority === undefined ? "" : String(job.sub2apiPriority));
+  const [accountNameCopied, setAccountNameCopied] = useState(false);
 
   useEffect(() => setValue(""), [job.status]);
+  useEffect(() => {
+    setPriorityValue(job.sub2apiPriority === null || job.sub2apiPriority === undefined ? "" : String(job.sub2apiPriority));
+  }, [job.sub2apiPriority]);
+
+  function savePriority() {
+    if (!sub2apiPriorityAvailable || job.sub2apiInPool !== true || sub2apiPriorityBusy) return;
+    onUpdateSub2ApiPriority(priorityValue.trim());
+  }
 
   async function sendInput(action, submittedValue = value) {
     setSubmitting(true);
@@ -1942,6 +2228,16 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
     }
   }
 
+  async function copyAccountName() {
+    try {
+      await copyText(job.email || "");
+      setAccountNameCopied(true);
+      window.setTimeout(() => setAccountNameCopied(false), 1_600);
+    } catch {
+      onError("无法自动复制账号名，请手动选择账号名");
+    }
+  }
+
   async function requestSmsNumber() {
     if (!smsProvider.ready) return;
     setSubmitting(true);
@@ -1987,12 +2283,69 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
       <td>
         <div className="account-cell">
           <div className="account-avatar">{job.email.slice(0, 1).toUpperCase()}</div>
-          <div className="account-details"><strong>{job.email}</strong><span>{shortId(job.id)}</span></div>
+          <div className="account-details">
+            <button type="button" className={`account-name-copy ${accountNameCopied ? "copied" : ""}`} onClick={copyAccountName} title={accountNameCopied ? "已复制" : "点击复制账号名"} aria-label={`复制账号名 ${job.email}`}>
+              <strong>{job.email}</strong>
+              {accountNameCopied ? <Check size={13} aria-hidden="true" /> : <Copy size={13} aria-hidden="true" />}
+            </button>
+            <span>{shortId(job.id)}</span>
+          </div>
           <LoginMethodBadge job={job} />
         </div>
       </td>
       <td className={`plan-cell ${job.planType ? "" : "unknown"}`} title={job.planType || "未知"}>
         <span className="plan-tag">{formatPlanTypeLabel(job.planType, planTypeMapping)}</span>
+      </td>
+      <td className="usage-cell-column">
+        <AccountUsageCell usage={accountUsage} available={job.canDownload} enabled={accountUsageAvailable} onRefresh={onRefreshUsage} />
+      </td>
+      <td className="pool-status-cell">
+        <Sub2ApiPoolBadge inPool={job.sub2apiInPool} />
+      </td>
+      <td className="pool-enabled-cell">
+        <Sub2ApiEnabledToggle
+          inPool={job.sub2apiInPool}
+          enabled={job.sub2apiEnabled}
+          available={sub2apiToggleAvailable}
+          busy={sub2apiToggleBusy}
+          onChange={onToggleSub2Api}
+        />
+      </td>
+      <td
+        className={`sub2api-priority-cell ${job.sub2apiInPool !== true ? "unknown" : ""}`}
+        title={job.sub2apiInPool !== true ? "尚未同步 Sub2API 优先级" : "编辑并保存 Sub2API 优先级"}
+      >
+        {job.sub2apiInPool === true ? (
+          <div className="sub2api-priority-editor">
+            <input
+              type="number"
+              min="0"
+              max="10000"
+              step="1"
+              inputMode="numeric"
+              value={priorityValue}
+              onChange={(event) => setPriorityValue(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  event.preventDefault();
+                  savePriority();
+                }
+              }}
+              disabled={!sub2apiPriorityAvailable || sub2apiPriorityBusy}
+              aria-label={`编辑 ${job.email} 的 Sub2API 优先级`}
+            />
+            <button
+              type="button"
+              className="icon-button priority-save-button"
+              onClick={savePriority}
+              disabled={!sub2apiPriorityAvailable || sub2apiPriorityBusy}
+              title="保存 Sub2API 优先级"
+              aria-label="保存 Sub2API 优先级"
+            >
+              {sub2apiPriorityBusy ? <LoaderCircle className="spin" size={15} /> : <Check size={15} />}
+            </button>
+          </div>
+        ) : "—"}
       </td>
       <td><StatusBadge status={job.status} /></td>
       <td className="step-cell">
@@ -2087,7 +2440,7 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
         <time dateTime={job.lastOperationAt || job.createdAt}>{formatDateTime(job.lastOperationAt || job.createdAt)}</time>
         <span>{operationLabel(job.lastOperationType)}</span>
       </td>
-      <td>
+      <td className="actions-cell">
         <div className="row-actions">
           {credentialsAvailable && (
             <button type="button" className="icon-button" onClick={onOpenCredentials} disabled={submitting} title="查看或修改账号凭据">
@@ -2714,6 +3067,143 @@ function StatusBadge({ status }) {
   return <span className={`status-badge ${status}`}>{config[1]}{config[0]}</span>;
 }
 
+function AccountUsageCell({ usage, available, enabled, onRefresh }) {
+  if (!enabled) {
+    return <span className="usage-state muted" title="服务端尚未启用官方额度接口">未启用</span>;
+  }
+  if (!available) {
+    return <span className="usage-state muted">待授权</span>;
+  }
+  if (!usage || usage.status === "loading") {
+    return <span className="usage-state muted">查询中...</span>;
+  }
+  if (usage.status === "error") {
+    return (
+      <button type="button" className="usage-retry" onClick={onRefresh} title={usage.error || "重新读取官方额度"}>
+        <RefreshCw size={13} />重试
+      </button>
+    );
+  }
+  const primary = usage.primary;
+  const secondary = usage.secondary;
+  const credits = usage.credits;
+  if (!primary && !secondary && !credits && usage.allowed === null && usage.limitReached === null) {
+    return <span className="usage-state muted">暂无数据</span>;
+  }
+  const restricted = usage.limitReached === true || usage.allowed === false || credits?.overageLimitReached === true;
+  const windows = [
+    { key: "primary", label: usageWindowLabel("5h", primary), value: primary },
+    { key: "secondary", label: usageWindowLabel("7d", secondary), value: secondary },
+  ].filter((item) => item.value);
+  return (
+    <div className={`account-usage ${restricted ? "restricted" : ""}`} title={usage.fetchedAt ? `官方接口更新于 ${formatDateTime(usage.fetchedAt)}` : "官方接口额度"}>
+      <span className="usage-state">{restricted ? "受限" : usage.allowed === true ? "可用" : "已读取"}</span>
+      {windows.map((item) => <UsageWindowProgress key={item.key} tone={item.key} label={item.label} window={item.value} />)}
+      {credits && credits.unlimited === true && <span className="usage-window">无限额度</span>}
+      {credits && credits.balance !== null && <span className="usage-window">额度 {credits.balance}</span>}
+    </div>
+  );
+}
+
+function UsageWindowProgress({ tone, label, window }) {
+  const percent = usageWindowPercent(window);
+  const percentText = percent === null ? "—" : `${Math.round(percent)}%`;
+  const resetText = formatUsageReset(window);
+  return (
+    <div className="usage-window-block" title={`${label}窗口${percent === null ? "暂无百分比" : `已用 ${percentText}`}${resetText ? `，${resetText}` : ""}`}>
+      <span className={`usage-window-label ${tone}`}>{label}</span>
+      <div
+        className={`usage-progress ${percent === null ? "empty" : percent >= 100 ? "critical" : percent >= 80 ? "warning" : ""}`}
+        role="progressbar"
+        aria-label={`${label}窗口用量`}
+        aria-valuemin="0"
+        aria-valuemax="100"
+        aria-valuenow={percent === null ? undefined : Math.round(percent)}
+      >
+        <span style={{ width: percent === null ? "0%" : `${percent}%` }} />
+      </div>
+      <strong className="usage-window-percent">{percentText}</strong>
+      {resetText && <span className="usage-window-reset">{resetText}</span>}
+    </div>
+  );
+}
+
+function usageWindowPercent(window) {
+  const direct = Number(window?.usedPercent);
+  if (Number.isFinite(direct)) return Math.min(100, Math.max(0, direct));
+  const used = Number(window?.used);
+  const limit = Number(window?.limit);
+  if (Number.isFinite(used) && Number.isFinite(limit) && limit > 0) {
+    return Math.min(100, Math.max(0, (used / limit) * 100));
+  }
+  const remaining = Number(window?.remaining);
+  if (Number.isFinite(remaining) && Number.isFinite(limit) && limit > 0) {
+    return Math.min(100, Math.max(0, ((limit - remaining) / limit) * 100));
+  }
+  return null;
+}
+
+function usageWindowLabel(fallback, window) {
+  const seconds = Number(window?.limitWindowSeconds);
+  if (!Number.isFinite(seconds) || seconds <= 0) return fallback;
+  if (seconds >= 86_400) return `${Math.round(seconds / 86_400)}d`;
+  if (seconds >= 3_600) return `${Math.round(seconds / 3_600)}h`;
+  if (seconds >= 60) return `${Math.round(seconds / 60)}m`;
+  return `${Math.round(seconds)}s`;
+}
+
+function formatUsageReset(window) {
+  if (Number.isFinite(Number(window?.resetAfterSeconds))) {
+    return `${formatUsageDuration(window.resetAfterSeconds)}后重置`;
+  }
+  if (window?.resetAt) return `${formatUsageResetAt(window.resetAt)}重置`;
+  return "";
+}
+
+function formatUsageDuration(seconds) {
+  const value = Math.max(0, Math.round(Number(seconds) || 0));
+  if (value < 60) return `${value}秒`;
+  if (value < 3600) return `${Math.floor(value / 60)}分`;
+  if (value < 86_400) return `${Math.floor(value / 3600)}小时`;
+  return `${Math.floor(value / 86_400)}天`;
+}
+
+function formatUsageResetAt(value) {
+  const timestamp = new Date(value).getTime();
+  if (!Number.isFinite(timestamp)) return "待重置";
+  const seconds = Math.max(0, Math.round((timestamp - Date.now()) / 1000));
+  return seconds <= 86_400 ? `${formatUsageDuration(seconds)}后` : formatDateTime(value);
+}
+
+function Sub2ApiPoolBadge({ inPool }) {
+  const state = inPool === true ? "added" : inPool === false ? "not-added" : "unknown";
+  const label = inPool === true ? "已加入" : inPool === false ? "未加入" : "未同步";
+  return <span className={`pool-badge ${state}`}>{label}</span>;
+}
+
+function Sub2ApiEnabledToggle({ inPool, enabled, available, busy, onChange }) {
+  if (inPool !== true) {
+    return <span className="pool-state-muted">{inPool === false ? "未加入号池" : "未同步"}</span>;
+  }
+  const known = typeof enabled === "boolean";
+  const disabled = !available || !known || busy;
+  return (
+    <button
+      type="button"
+      role="switch"
+      className={`status-toggle ${enabled === true ? "on" : ""}`}
+      aria-checked={enabled === true}
+      aria-label={known ? (enabled ? "停用号池账号" : "启用号池账号") : "号池启用状态未知"}
+      title={!available ? "请先配置 Sub2API" : known ? (enabled ? "点击停用" : "点击启用") : "正在同步号池状态"}
+      disabled={disabled}
+      onClick={() => onChange?.(!enabled)}
+    >
+      <span className="status-toggle-track"><span className="status-toggle-thumb">{busy ? <LoaderCircle className="spin" size={11} /> : null}</span></span>
+      <span className="status-toggle-label">{busy ? "更新中" : known ? (enabled ? "启用" : "停用") : "未知"}</span>
+    </button>
+  );
+}
+
 function LoginMethodBadge({ job }) {
   if (job.loginMode === "password") {
     const methods = ["密码", job.autoEmailOtp ? "自动收码" : "", job.hasTotpKey ? "2FA" : ""].filter(Boolean);
@@ -2843,6 +3333,24 @@ async function apiFetch(token, url, options = {}) {
     },
   });
   return readResponse(response);
+}
+
+async function copyText(value) {
+  const text = String(value ?? "");
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.opacity = "0";
+  document.body.appendChild(textarea);
+  textarea.select();
+  const copied = document.execCommand("copy");
+  textarea.remove();
+  if (!copied) throw new Error("clipboard unavailable");
 }
 
 async function readResponse(response) {
@@ -3126,6 +3634,7 @@ function normalizeSub2ApiSettings(value) {
     concurrency: String(stored.concurrency ?? ""),
     loadFactor: String(stored.loadFactor ?? ""),
     priority: String(stored.priority ?? ""),
+    accountNameTemplate: String(stored.accountNameTemplate || ""),
     modelWhitelist: String(stored.modelWhitelist || ""),
     codexFingerprintMode: ["off", "device", "session", "full"].includes(stored.codexFingerprintMode)
       ? stored.codexFingerprintMode
@@ -3276,6 +3785,26 @@ function writeLocalTextSetting(key, value) {
   } catch {
     // Private browsing modes may disable localStorage; the current tab still works.
   }
+}
+
+function sub2ApiStatusJobFields(status) {
+  return {
+    sub2apiInPool: status?.inPool ?? null,
+    sub2apiEnabled: status?.enabled ?? null,
+    sub2apiPriority: status?.priority ?? null,
+    sub2apiAccountId: status?.accountId || null,
+    sub2apiAccountIds: Array.isArray(status?.accountIds) ? status.accountIds : [],
+    sub2apiGroupIds: Array.isArray(status?.groupIds) ? status.groupIds : [],
+    sub2apiRemoteStatus: status?.remoteStatus || null,
+  };
+}
+
+function mergeSub2ApiStatusIntoJob(job, state) {
+  if (!state?.fetchedAt) return job;
+  const key = String(job.email || "").toLowerCase();
+  const status = state.accounts?.[key];
+  if (!status) return { ...job, ...sub2ApiStatusJobFields({ inPool: false }) };
+  return { ...job, ...sub2ApiStatusJobFields(status) };
 }
 
 function mergeJobs(...groups) {

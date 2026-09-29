@@ -18,6 +18,7 @@ const legacyConfig = {
   concurrency: null,
   loadFactor: null,
   priority: null,
+  accountNameTemplate: "{email}",
   modelWhitelist: ["gpt-5"],
   codexFingerprintMode: "session",
   wsMode: "ctx_pool",
@@ -55,6 +56,7 @@ try {
   assert.equal(state.config.baseUrl, legacyConfig.baseUrl);
   assert.deepEqual(state.config.groupIds, legacyConfig.groupIds);
   assert.equal(state.config.wsMode, legacyConfig.wsMode);
+  assert.equal(state.config.accountNameTemplate, legacyConfig.accountNameTemplate);
   assert.equal(Object.hasOwn(state.config, "adminApiKey"), false);
   assert.equal(persisted.config.adminApiKey, legacyConfig.adminApiKey);
   assert.equal(persisted.config.baseUrl, legacyConfig.baseUrl);

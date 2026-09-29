@@ -11,6 +11,8 @@ const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "
 const outputRoot = await fs.mkdtemp(path.join(os.tmpdir(), "tosub2-console-"));
 const port = await findAvailablePort();
 const baseUrl = `http://127.0.0.1:${port}`;
+const officialPort = await findAvailablePort();
+const officialUrl = `http://127.0.0.1:${officialPort}`;
 const sub2apiPort = await findAvailablePort();
 const sub2apiUrl = `http://127.0.0.1:${sub2apiPort}`;
 let uploadedAccounts = [];
@@ -111,6 +113,9 @@ const sub2api = http.createServer(async (req, res) => {
     const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
     const accountId = Number(schedulableMatch[1]);
     scheduledRemoteAccounts.set(accountId, body.schedulable);
+    remoteErrorAccounts = remoteErrorAccounts.map((account) => (
+      Number(account.id) === accountId ? { ...account, schedulable: body.schedulable } : account
+    ));
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ code: 0, message: "success", data: { id: accountId, schedulable: body.schedulable } }));
     return;
@@ -118,6 +123,29 @@ const sub2api = http.createServer(async (req, res) => {
   res.writeHead(404, { "content-type": "application/json" });
   res.end(JSON.stringify({ message: "not found" }));
 });
+const officialRequests = [];
+const officialAccessToken = `header.${Buffer.from(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 3_600 })).toString("base64url")}.signature`;
+const officialApi = http.createServer(async (req, res) => {
+  officialRequests.push({ method: req.method, url: req.url, authorization: req.headers.authorization });
+  res.writeHead(200, { "content-type": "application/json" });
+  if (req.method === "POST" && req.url === "/oauth/token") {
+    res.end(JSON.stringify({ access_token: officialAccessToken, refresh_token: "mock-refresh-rotated" }));
+    return;
+  }
+  if (req.method === "GET" && req.url === "/backend-api/wham/usage") {
+    res.end(JSON.stringify({
+      plan_type: "pro",
+      rate_limit: {
+        allowed: true,
+        limit_reached: false,
+        primary_window: { used_percent: 18, reset_after_seconds: 3_600 },
+      },
+    }));
+    return;
+  }
+  res.end(JSON.stringify({ error: "not found" }));
+});
+await new Promise((resolve) => officialApi.listen(officialPort, "127.0.0.1", resolve));
 await new Promise((resolve) => sub2api.listen(sub2apiPort, "127.0.0.1", resolve));
 const child = spawn(process.execPath, [
   path.join(projectRoot, "src", "console-server.mjs"),
@@ -131,6 +159,9 @@ const child = spawn(process.execPath, [
     ...process.env,
     ONBOARDING_OUTPUT_ROOT: outputRoot,
     ONBOARDING_PROTOCOL_SCRIPT: path.join(projectRoot, "test", "mock-protocol-login.mjs"),
+    CHATGPT_BASE: officialUrl,
+    AUTH_BASE: officialUrl,
+    TOSUB2_SESSION_NATIVE_HTTP: "1",
     TOSUB2_TLS_PROFILE: "chrome142",
     PROXY_CONNECTION_RETRY_BASE_MS: "1",
     SUB2API_AUTO_REPAIR_COOLDOWN_MS: "0",
@@ -241,6 +272,24 @@ try {
 
   let job = await waitForJob(headers, jobId, (value) => value.status === "completed");
   assert.equal(job.canDownload, true);
+
+  const usageResponse = await fetch(`${baseUrl}/api/jobs/${jobId}/usage`, { headers });
+  const usageText = await usageResponse.text();
+  assert.equal(usageResponse.status, 200, usageText);
+  const usage = JSON.parse(usageText).usage;
+  assert.equal(usage.planType, "pro");
+  assert.equal(usage.primary.usedPercent, 18);
+  assert.equal(usage.primary.resetAfterSeconds, 3_600);
+  const cachedUsageResponse = await fetch(`${baseUrl}/api/jobs/${jobId}/usage`, { headers });
+  const cachedUsageText = await cachedUsageResponse.text();
+  assert.equal(cachedUsageResponse.status, 200, cachedUsageText);
+  const officialUsageRequests = officialRequests.filter((request) => request.url === "/backend-api/wham/usage");
+  assert.equal(officialUsageRequests.length, 1);
+  assert.ok(officialUsageRequests[0].authorization?.startsWith("Bearer "));
+  const refreshedUsageResponse = await fetch(`${baseUrl}/api/jobs/${jobId}/usage?refresh=1`, { headers });
+  const refreshedUsageText = await refreshedUsageResponse.text();
+  assert.equal(refreshedUsageResponse.status, 200, refreshedUsageText);
+  assert.equal(officialRequests.filter((request) => request.url === "/backend-api/wham/usage").length, 2);
 
   const downloadResponse = await fetch(`${baseUrl}/api/jobs/${jobId}/download`, { headers });
   assert.equal(downloadResponse.status, 200);
@@ -629,6 +678,7 @@ try {
     proxyId: "3",
     codexFingerprintMode: "device",
     wsMode: "passthrough",
+    accountNameTemplate: "managed-{email}",
   };
   const settingsSaveResponse = await fetch(`${baseUrl}/api/sub2api/settings`, {
     method: "POST",
@@ -640,11 +690,13 @@ try {
   const savedSettings = JSON.parse(settingsSaveText);
   assert.equal(savedSettings.config.baseUrl, sub2apiUrl);
   assert.equal(savedSettings.config.wsMode, "passthrough");
+  assert.equal(savedSettings.config.accountNameTemplate, "managed-{email}");
   assert.equal(savedSettings.hasAdminApiKey, true);
   assert.equal(Object.hasOwn(savedSettings.config, "adminApiKey"), false);
   const persistedSettings = JSON.parse(await fs.readFile(path.join(outputRoot, "sub2api-settings.json"), "utf8"));
   assert.equal(persistedSettings.config.adminApiKey, "test-admin-key");
   assert.equal(persistedSettings.config.wsMode, "passthrough");
+  assert.equal(persistedSettings.config.accountNameTemplate, "managed-{email}");
 
   const settingsReadResponse = await fetch(`${baseUrl}/api/sub2api/settings`, { headers });
   const settingsRead = await settingsReadResponse.json();
@@ -681,7 +733,7 @@ try {
     headers,
     body: JSON.stringify({
       ids: [profileJob.id, "missing-job-is-filtered-by-selection-limit"],
-      config: { baseUrl: sub2apiUrl, adminApiKey: "test-admin-key", groupIds: ["7", "8"], proxyId: "3", concurrency: "10", loadFactor: "100", priority: "1", modelWhitelist: "gpt-5\ngpt-5-mini", codexFingerprintMode: "full", wsMode: "http_bridge" },
+      config: { baseUrl: sub2apiUrl, adminApiKey: "test-admin-key", groupIds: ["7", "8"], proxyId: "3", concurrency: "10", loadFactor: "100", priority: "1", accountNameTemplate: "managed-{email}-{accountId}", modelWhitelist: "gpt-5\ngpt-5-mini", codexFingerprintMode: "full", wsMode: "http_bridge" },
     }),
   });
   assert.equal(uploadResponse.status, 404);
@@ -691,7 +743,7 @@ try {
     headers,
     body: JSON.stringify({
       ids: [profileJob.id],
-      config: { baseUrl: sub2apiUrl, adminApiKey: "test-admin-key", groupIds: ["7", "8"], proxyId: "3", concurrency: "10", loadFactor: "100", priority: "1", modelWhitelist: "gpt-5\ngpt-5-mini", codexFingerprintMode: "full", wsMode: "http_bridge" },
+      config: { baseUrl: sub2apiUrl, adminApiKey: "test-admin-key", groupIds: ["7", "8"], proxyId: "3", concurrency: "10", loadFactor: "100", priority: "1", accountNameTemplate: "managed-{email}-{accountId}", modelWhitelist: "gpt-5\ngpt-5-mini", codexFingerprintMode: "full", wsMode: "http_bridge" },
     }),
   });
   const validUploadText = await validUploadResponse.text();
@@ -704,6 +756,7 @@ try {
   assert.equal(uploadedAccounts[0].concurrency, 10);
   assert.equal(uploadedAccounts[0].load_factor, 100);
   assert.equal(uploadedAccounts[0].priority, 1);
+  assert.equal(uploadedAccounts[0].name, "managed-account-profile@example.com-test-account-account-profile@example.com");
   assert.equal(uploadedAccounts[0].status, "active");
   assert.equal(uploadedAccounts[0].schedulable, true);
   assert.equal(uploadedAccounts[0].extra.codex_fingerprint_mode, "full");
@@ -711,6 +764,117 @@ try {
   assert.equal(uploadedAccounts[0].extra.openai_oauth_responses_websockets_v2_enabled, true);
   assert.deepEqual(uploadedAccounts[0].credentials.model_mapping, { "gpt-5": "gpt-5", "gpt-5-mini": "gpt-5-mini" });
   assert.equal(uploadedAccounts[0].credentials.email, "account-profile@example.com");
+
+  remoteErrorAccounts = [{
+    id: 101,
+    name: "oauth---account-profile@example.com",
+    platform: "openai",
+    type: "oauth",
+    status: "active",
+    schedulable: false,
+    priority: 9,
+    credentials: { email: "account-profile@example.com" },
+    group_ids: [7, 8],
+  }];
+  const accountStatusResponse = await fetch(`${baseUrl}/api/sub2api/account-status?refresh=1`, { headers });
+  const accountStatusText = await accountStatusResponse.text();
+  assert.equal(accountStatusResponse.status, 200, accountStatusText);
+  const accountStatus = JSON.parse(accountStatusText);
+  assert.equal(accountStatus.accounts["account-profile@example.com"].inPool, true);
+  assert.equal(accountStatus.accounts["account-profile@example.com"].enabled, false);
+  assert.equal(accountStatus.accounts["account-profile@example.com"].priority, 9);
+  const statusPage = await (await fetch(`${baseUrl}/api/jobs`, { headers })).json();
+  assert.equal(statusPage.jobs.find((item) => item.email === "account-profile@example.com").sub2apiPriority, 9);
+  const addedFilter = await (await fetch(`${baseUrl}/api/jobs?sub2apiPool=added`, { headers })).json();
+  assert.equal(addedFilter.pagination.total, 1);
+  assert.equal(addedFilter.jobs[0].sub2apiInPool, true);
+  const disabledFilter = await (await fetch(`${baseUrl}/api/jobs?sub2apiEnabled=disabled`, { headers })).json();
+  assert.equal(disabledFilter.pagination.total, 1);
+  const notAddedFilter = await (await fetch(`${baseUrl}/api/jobs?sub2apiPool=not_added`, { headers })).json();
+  assert.ok(notAddedFilter.pagination.total > 1);
+  const toggleStatusResponse = await fetch(`${baseUrl}/api/sub2api/accounts/${profileJob.id}/schedulable`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ enabled: true }),
+  });
+  const toggleStatusText = await toggleStatusResponse.text();
+  assert.equal(toggleStatusResponse.status, 200, toggleStatusText);
+  assert.equal(JSON.parse(toggleStatusText).status.enabled, true);
+  assert.equal(scheduledRemoteAccounts.get(101), true);
+  const enabledFilter = await (await fetch(`${baseUrl}/api/jobs?sub2apiEnabled=enabled`, { headers })).json();
+  assert.equal(enabledFilter.pagination.total, 1);
+
+  const priorityUpdateResponse = await fetch(`${baseUrl}/api/sub2api/accounts/${profileJob.id}/priority`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ priority: 0 }),
+  });
+  const priorityUpdateText = await priorityUpdateResponse.text();
+  assert.equal(priorityUpdateResponse.status, 200, priorityUpdateText);
+  const priorityUpdate = JSON.parse(priorityUpdateText);
+  assert.equal(priorityUpdate.updated, 1);
+  assert.equal(priorityUpdate.priority, 0);
+  assert.equal(priorityUpdate.status.priority, 0);
+  assert.equal(updatedRemoteAccounts.get(101).priority, 0);
+  const locallyUpdatedPriorityJob = (await (await fetch(`${baseUrl}/api/jobs`, { headers })).json()).jobs
+    .find((item) => item.email === "account-profile@example.com");
+  assert.equal(locallyUpdatedPriorityJob.sub2apiPriority, 0);
+
+  const invalidPriorityResponse = await fetch(`${baseUrl}/api/sub2api/accounts/${profileJob.id}/priority`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ priority: 10001 }),
+  });
+  assert.equal(invalidPriorityResponse.status, 400);
+
+  remoteErrorAccounts = [
+    { ...remoteErrorAccounts[0], priority: 12 },
+    {
+      id: 102,
+      name: "oauth-duplicate---account-profile@example.com",
+      platform: "openai",
+      type: "oauth",
+      status: "active",
+      schedulable: true,
+      priority: 13,
+      credentials: { email: "account-profile@example.com" },
+      group_ids: [7],
+    },
+  ];
+  const externallyChangedStatusResponse = await fetch(`${baseUrl}/api/sub2api/account-status?refresh=1`, { headers });
+  const externallyChangedStatusText = await externallyChangedStatusResponse.text();
+  assert.equal(externallyChangedStatusResponse.status, 200, externallyChangedStatusText);
+  const externallyChangedStatus = JSON.parse(externallyChangedStatusText);
+  assert.deepEqual(externallyChangedStatus.accounts["account-profile@example.com"].accountIds, ["101", "102"]);
+  assert.equal(externallyChangedStatus.accounts["account-profile@example.com"].priority, 12);
+  const externallyChangedPage = await (await fetch(`${baseUrl}/api/jobs`, { headers })).json();
+  assert.equal(externallyChangedPage.jobs.find((item) => item.email === "account-profile@example.com").sub2apiPriority, 12);
+
+  const duplicatePriorityUpdateResponse = await fetch(`${baseUrl}/api/sub2api/accounts/${profileJob.id}/priority`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ priority: 6 }),
+  });
+  const duplicatePriorityUpdateText = await duplicatePriorityUpdateResponse.text();
+  assert.equal(duplicatePriorityUpdateResponse.status, 200, duplicatePriorityUpdateText);
+  const duplicatePriorityUpdate = JSON.parse(duplicatePriorityUpdateText);
+  assert.equal(duplicatePriorityUpdate.updated, 2);
+  assert.equal(duplicatePriorityUpdate.status.priority, 6);
+  assert.equal(updatedRemoteAccounts.get(101).priority, 6);
+  assert.equal(updatedRemoteAccounts.get(102).priority, 6);
+
+  const planFilterCreateResponse = await fetch(`${baseUrl}/api/jobs`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ email: "credential-smoke@example.com" }),
+  });
+  assert.equal(planFilterCreateResponse.status, 201);
+  const planFilterCreated = await planFilterCreateResponse.json();
+  const planFilterJob = await waitForJob(headers, planFilterCreated.job.id, (value) => value.status === "completed");
+  assert.equal(planFilterJob.planType, "plus");
+  const plusFilter = await (await fetch(`${baseUrl}/api/jobs?planType=plus`, { headers })).json();
+  assert.equal(plusFilter.pagination.total, 1);
+  assert.equal(plusFilter.jobs[0].planType, "plus");
 
   const legacyUploadResponse = await fetch(`${baseUrl}/api/sub2api/upload`, {
     method: "POST",
@@ -757,6 +921,16 @@ try {
     }),
   });
   assert.equal(invalidWsModeUploadResponse.status, 400, await invalidWsModeUploadResponse.text());
+
+  const invalidAccountNameTemplateResponse = await fetch(`${baseUrl}/api/sub2api/upload`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      ids: [profileJob.id],
+      config: { baseUrl: sub2apiUrl, adminApiKey: "test-admin-key", accountNameTemplate: "bad-{unknown}" },
+    }),
+  });
+  assert.equal(invalidAccountNameTemplateResponse.status, 400, await invalidAccountNameTemplateResponse.text());
 
   const invalidFingerprintUploadResponse = await fetch(`${baseUrl}/api/sub2api/upload`, {
     method: "POST",
@@ -1126,13 +1300,14 @@ try {
       phoneFallbackJobId,
       incompleteAuthorizationId,
       incompleteTotpId,
+      planFilterCreated.job.id,
     ] }),
   });
   if (!deleteResponse.ok) {
     throw new Error(`delete request failed with HTTP ${deleteResponse.status}: ${await deleteResponse.text()}`);
   }
   const deleted = await deleteResponse.json();
-  assert.equal(deleted.deleted, 27);
+  assert.equal(deleted.deleted, 28);
 
   const finalPage = await (await fetch(`${baseUrl}/api/jobs`, { headers })).json();
   assert.equal(finalPage.pagination.total, 0);
@@ -1143,6 +1318,7 @@ try {
 } finally {
   if (isRunning(child)) child.kill("SIGKILL");
   await Promise.race([childExit, delay(2_000)]);
+  await new Promise((resolve) => officialApi.close(resolve));
   await new Promise((resolve) => sub2api.close(resolve));
   await fs.rm(outputRoot, { recursive: true, force: true });
 }

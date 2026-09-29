@@ -38,6 +38,7 @@ try {
   assert.equal(bootstrap.features.credentialDetails, true);
   assert.equal(bootstrap.features.totpReplace, true);
   assert.equal(bootstrap.features.sub2apiPipeline, true);
+  assert.equal(bootstrap.features.accountUsage, true);
   const headers = {
     "content-type": "application/json",
     "x-console-token": bootstrap.token,

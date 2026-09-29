@@ -16,6 +16,61 @@ const REQUEST_TIMEOUT_MS = 30_000;
 const TOKEN_REFRESH_SKEW_SECONDS = 60;
 const MAX_IDENTIFIER_LENGTH = 256;
 const MAX_DEVICES = 500;
+const MAX_USAGE_TEXT_LENGTH = 128;
+const MAX_USAGE_WINDOW_SECONDS = 31_536_000;
+
+/**
+ * Read the official ChatGPT usage endpoint through the same OAuth transport
+ * used by the session manager. Only the normalized public shape is returned.
+ */
+export async function fetchAccountUsage(job) {
+  const result = await requestWithOAuth(job, "GET", "/wham/usage");
+  return {
+    ...normalizeAccountUsage(result.data),
+    fetchedAt: new Date().toISOString(),
+  };
+}
+
+export function normalizeAccountUsage(payload) {
+  const source = isRecord(payload) ? payload : {};
+  const rateLimit = firstRecord(source.rate_limit, source.rateLimit);
+  const usage = firstRecord(source.usage, source.message_cap, source.messageCap);
+  const primary = normalizeUsageWindow(
+    firstRecord(rateLimit?.primary_window, rateLimit?.primaryWindow, usage?.primary_window, usage?.primaryWindow)
+      || (hasUsageWindowFields(rateLimit) ? rateLimit : null)
+      || (hasUsageWindowFields(usage) ? usage : null),
+  );
+  const secondary = normalizeUsageWindow(
+    firstRecord(rateLimit?.secondary_window, rateLimit?.secondaryWindow, usage?.secondary_window, usage?.secondaryWindow),
+  );
+  const creditsSource = firstRecord(source.credits, source.credit_grant, source.creditGrant);
+  const planType = normalizeUsageText(
+    source.plan_type
+      || source.planType
+      || source.account?.plan_type
+      || source.account?.planType,
+  );
+  return {
+    planType: planType || null,
+    allowed: firstBoolean(
+      rateLimit?.allowed,
+      rateLimit?.is_allowed,
+      rateLimit?.isAllowed,
+      source.allowed,
+    ),
+    limitReached: firstBoolean(
+      rateLimit?.limit_reached,
+      rateLimit?.limitReached,
+      rateLimit?.is_quota_exceeded,
+      rateLimit?.isQuotaExceeded,
+      source.limit_reached,
+      source.limitReached,
+    ),
+    primary,
+    secondary,
+    credits: normalizeUsageCredits(creditsSource),
+  };
+}
 
 export async function listAccountSessions(job) {
   const result = await requestWithOAuth(job, "GET", "/accounts/sessions?include_trusted_devices=true");
@@ -113,10 +168,10 @@ async function requestWithOAuth(job, method, endpoint, jsonBody = undefined) {
   try {
     await configureTransport(transport, job, bundle.chatgptBase);
     let accessToken = await ensureAccessToken(bundle, transport);
-    let response = await sendRequest(transport, bundle.chatgptBase, accessToken, method, endpoint, jsonBody);
+    let response = await sendRequest(transport, bundle.chatgptBase, accessToken, method, endpoint, jsonBody, bundle.accountId);
     if (response.status === 401 && bundle.refreshToken) {
       accessToken = await refreshAccessToken(bundle, transport);
-      response = await sendRequest(transport, bundle.chatgptBase, accessToken, method, endpoint, jsonBody);
+      response = await sendRequest(transport, bundle.chatgptBase, accessToken, method, endpoint, jsonBody, bundle.accountId);
     }
     const data = await parseResponse(response);
     if (!response.ok) throw providerError(response.status, data);
@@ -136,7 +191,7 @@ async function configureTransport(transport, job, chatgptBase) {
   }
 }
 
-async function sendRequest(transport, chatgptBase, accessToken, method, endpoint, jsonBody) {
+async function sendRequest(transport, chatgptBase, accessToken, method, endpoint, jsonBody, accountId = "") {
   const identity = browserIdentityForTlsProfile(transport?.identityProfile || transport?.profile || DEFAULT_TLS_PROFILE);
   const deviceId = crypto.randomUUID();
   const sessionId = crypto.randomUUID();
@@ -155,6 +210,7 @@ async function sendRequest(transport, chatgptBase, accessToken, method, endpoint
     "sec-fetch-dest": "empty",
     priority: "u=1, i",
   };
+  if (accountId) headers["chatgpt-account-id"] = accountId;
   const options = {
     method,
     headers,
@@ -212,6 +268,14 @@ async function readOAuthBundle(job) {
     accessToken,
     refreshToken,
     clientId: String(account?.extra?.client_id || process.env.TOSUB2_CODEX_CLIENT_ID || DEFAULT_CODEX_CLIENT_ID).trim(),
+    accountId: normalizeIdentifier(
+      credentials.chatgpt_account_id
+        || credentials.account_id
+        || account?.chatgpt_account_id
+        || account?.account_id
+        || account?.extra?.chatgpt_account_id
+        || account?.extra?.account_id,
+    ),
     chatgptBase: String(process.env.CHATGPT_BASE || DEFAULT_CHATGPT_BASE).replace(/\/$/, ""),
     authBase: String(process.env.AUTH_BASE || DEFAULT_AUTH_BASE).replace(/\/$/, ""),
     outputPath: job.outputPath,
@@ -304,4 +368,114 @@ function publicText(value, fallback = "") {
 function normalizeTimestamp(value) {
   const number = Number(value);
   return Number.isFinite(number) && number > 0 ? number : null;
+}
+
+function normalizeUsageWindow(source) {
+  if (!isRecord(source)) return null;
+  const usedPercent = normalizeUsagePercent(
+    firstNumber(source.used_percent, source.usedPercent, source.percent, source.percentage),
+  );
+  const used = normalizeUsageNumber(firstNumber(source.used, source.used_count, source.usedCount));
+  const limit = normalizeUsageNumber(firstNumber(source.limit, source.max, source.total));
+  const remaining = normalizeUsageNumber(firstNumber(source.remaining, source.remaining_count, source.remainingCount));
+  const limitWindowSeconds = normalizeUsageSeconds(
+    firstNumber(source.limit_window_seconds, source.limitWindowSeconds, source.window_seconds, source.windowSeconds),
+  );
+  const resetAfterSeconds = normalizeUsageSeconds(
+    firstNumber(source.reset_after_seconds, source.resetAfterSeconds, source.reset_after, source.resetAfter),
+  );
+  const resetAt = normalizeUsageDate(source.reset_at ?? source.resetAt);
+  if ([usedPercent, used, limit, remaining, limitWindowSeconds, resetAfterSeconds, resetAt].every((value) => value === null)) {
+    return null;
+  }
+  return {
+    usedPercent,
+    used,
+    limit,
+    remaining,
+    limitWindowSeconds,
+    resetAfterSeconds,
+    resetAt,
+  };
+}
+
+function normalizeUsageCredits(source) {
+  if (!isRecord(source)) return null;
+  const balance = source.balance ?? source.remaining ?? source.amount;
+  const normalizedBalance = balance === null || balance === undefined
+    ? null
+    : normalizeUsageText(balance);
+  const hasCredits = firstBoolean(source.has_credits, source.hasCredits);
+  const unlimited = firstBoolean(source.unlimited, source.is_unlimited, source.isUnlimited);
+  const overageLimitReached = firstBoolean(source.overage_limit_reached, source.overageLimitReached);
+  if (normalizedBalance === null && hasCredits === null && unlimited === null && overageLimitReached === null) return null;
+  return { balance: normalizedBalance, hasCredits, unlimited, overageLimitReached };
+}
+
+function hasUsageWindowFields(source) {
+  if (!isRecord(source)) return false;
+  return [
+    "used_percent",
+    "usedPercent",
+    "percent",
+    "used",
+    "limit",
+    "remaining",
+    "reset_at",
+    "resetAt",
+    "reset_after_seconds",
+    "resetAfterSeconds",
+  ].some((key) => source[key] !== undefined && source[key] !== null);
+}
+
+function firstRecord(...values) {
+  return values.find((value) => isRecord(value)) || null;
+}
+
+function firstBoolean(...values) {
+  for (const value of values) {
+    if (typeof value === "boolean") return value;
+  }
+  return null;
+}
+
+function firstNumber(...values) {
+  for (const value of values) {
+    const number = Number(value);
+    if (value !== null && value !== undefined && value !== "" && Number.isFinite(number)) return number;
+  }
+  return null;
+}
+
+function normalizeUsageNumber(value) {
+  return value === null || value === undefined || !Number.isFinite(Number(value)) ? null : Number(value);
+}
+
+function normalizeUsagePercent(value) {
+  const number = normalizeUsageNumber(value);
+  return number === null ? null : Math.min(100, Math.max(0, number));
+}
+
+function normalizeUsageSeconds(value) {
+  const number = normalizeUsageNumber(value);
+  return number === null || number < 0 || number > MAX_USAGE_WINDOW_SECONDS ? null : number;
+}
+
+function normalizeUsageDate(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const number = Number(value);
+  if (Number.isFinite(number) && number <= 0) return null;
+  const date = Number.isFinite(number)
+    ? new Date(number > 1_000_000_000_000 ? number : number * 1000)
+    : new Date(String(value));
+  return Number.isNaN(date.getTime()) ? null : date.toISOString();
+}
+
+function normalizeUsageText(value) {
+  const text = String(value ?? "").trim();
+  return text && text.length <= MAX_USAGE_TEXT_LENGTH ? text : text.slice(0, MAX_USAGE_TEXT_LENGTH);
+}
+
+function isRecord(value) {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
 }
