@@ -818,7 +818,13 @@ try {
     status: "active",
     schedulable: false,
     priority: 9,
-    credentials: { email: "account-profile@example.com" },
+    credentials: {
+      email: "account-profile@example.com",
+      plan_type: "self_serve_business_usage_based",
+      id_token: `header.${Buffer.from(JSON.stringify({
+        "https://api.openai.com/auth": { chatgpt_plan_type: "self_serve_business_prolite" },
+      })).toString("base64url")}.signature`,
+    },
     group_ids: [7, 8],
     extra: {
       codex_usage_updated_at: new Date().toISOString(),
@@ -831,6 +837,7 @@ try {
       codex_7d_reset_at: new Date(Date.now() + 86_400_000).toISOString(),
       codex_7d_window_minutes: 10_080,
       codex_credits_snapshot: { credits: { has_credits: true, unlimited: false, balance: "12.5" } },
+      plan_type: "self_serve_business_prolite",
     },
   }, {
     id: 103,
@@ -873,12 +880,18 @@ try {
   assert.equal(accountStatus.accounts["account-profile@example.com"].inPool, true);
   assert.equal(accountStatus.accounts["account-profile@example.com"].enabled, false);
   assert.equal(accountStatus.accounts["account-profile@example.com"].priority, 9);
+  assert.equal(accountStatus.accounts["account-profile@example.com"].planType, "self_serve_business_usage_based");
   assert.equal(accountStatus.accounts["account-profile@example.com"].usage.source, "sub2api");
+  assert.equal(accountStatus.accounts["account-profile@example.com"].usage.planType, "self_serve_business_usage_based");
   assert.equal(accountStatus.accounts["account-profile@example.com"].usage.primary.usedPercent, 18);
   assert.equal(accountStatus.accounts["account-profile@example.com"].usage.primary.resetAfterSeconds, 3_600);
   assert.equal(accountStatus.accounts["account-profile@example.com"].usage.secondary.usedPercent, 42);
   assert.equal(accountStatus.accounts["account-profile@example.com"].usage.credits.balance, "12.5");
   assert.equal(accountStatus.accounts["legacy-usage@example.com"].usage.primary.usedPercent, 12);
+  const planTypePage = await (await fetch(`${baseUrl}/api/jobs`, { headers })).json();
+  assert.equal(planTypePage.jobs.find((item) => item.email === "account-profile@example.com").planType, "self_serve_business_usage_based");
+  const usageBasedFilter = await (await fetch(`${baseUrl}/api/jobs?planType=self_serve_business_usage_based`, { headers })).json();
+  assert.equal(usageBasedFilter.jobs.some((item) => item.email === "account-profile@example.com"), true);
   assert.equal(accountStatus.accounts["legacy-usage@example.com"].usage.secondary.usedPercent, 88);
   assert.equal(accountStatus.accounts["empty-usage@example.com"].usage, null);
   const syncedUsageResponse = await fetch(`${baseUrl}/api/jobs/${profileJob.id}/usage`, { headers });

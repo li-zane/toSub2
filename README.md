@@ -27,7 +27,7 @@ toSub2 是一个本地网页工具，通过协议请求完成 ChatGPT 登录和 
 - 支持手动邮箱验证码、邮箱收码 API（接口）自动取码。
 - 支持密码登录，以及密码或邮箱验证码登录后的 2FA（双重身份验证）。
 - 已完成 ChatGPT 登录的账号可以单个或批量创建新的 TOTP 2FA（基于时间的一次性密码），不要求先完成手机号绑定或 Codex 授权；程序会自动生成并提交激活验证码，密钥不会写入协议日志，设置完成后可继续原授权流程。
-- 账号列表显示 OAuth（授权登录）Token（授权令牌）中的 Plan type（订阅类型）；可在“PlanType 映射”中把原始值转换成自定义标签（例如 `self_serve_business_prolite` 显示为 `Business Premium`）。凭据弹窗可受控查看或更新密码、TOTP 密钥，滚动查看完整 Sub2API JSON，并支持轮换已启用的 2FA。
+- 账号列表显示 OAuth（授权登录）Token（授权令牌）中的 Plan type（订阅类型）；可在“PlanType 映射”中把原始值转换成自定义标签（例如 `self_serve_business_prolite` 显示为 `Business Premium`，`self_serve_business_usage_based` 显示为 `Business Usage Based`）。凭据弹窗可受控查看或更新密码、TOTP 密钥，滚动查看完整 Sub2API JSON，并支持轮换已启用的 2FA。
 - 无密码账号可以单个或批量添加随机强密码，已有密码的账号会自动跳过；支持邮箱 API 自动收码或手动输入验证码，成功后会更新本地账号原始信息。账号只要已保存邮箱登录检查点即可添加密码，不要求先完成手机号绑定或 Codex 授权；添加后可继续原授权流程。
 - 自动跳过已经完成手机号绑定的账号。
 - 未绑定账号支持手动手机号、手动短信验证码，以及 LubanSMS、SMSBower、自定义号码池自动取号收码。

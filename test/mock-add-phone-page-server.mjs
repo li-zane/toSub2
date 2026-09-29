@@ -5,13 +5,6 @@ const port = Number(process.argv[2] || 4492);
 const base = `http://127.0.0.1:${port}`;
 const publicBase = process.argv[3] || base;
 
-const idTokenPayload = Buffer.from(JSON.stringify({
-  email: "add-phone-page@example.com",
-  sid: "mock-account-id",
-  sub: "mock-user-id",
-  "https://api.openai.com/auth": { chatgpt_plan_type: "plus" },
-})).toString("base64url");
-
 let lastLoginHint = "";
 let addPasswordMode = false;
 
@@ -241,6 +234,18 @@ const server = http.createServer(async (req, res) => {
     return sendJson(res, 200, { continue_url: callback.toString() });
   }
   if (req.method === "POST" && url.pathname === "/oauth/token") {
+    const planClaims = lastLoginHint === "plan-type-conflict@example.com"
+      ? {
+          plan_type: "self_serve_business_usage_based",
+          "https://api.openai.com/auth": { chatgpt_plan_type: "self_serve_business_prolite" },
+        }
+      : { "https://api.openai.com/auth": { chatgpt_plan_type: "plus" } };
+    const idTokenPayload = Buffer.from(JSON.stringify({
+      email: lastLoginHint === "plan-type-conflict@example.com" ? lastLoginHint : "add-phone-page@example.com",
+      sid: "mock-account-id",
+      sub: "mock-user-id",
+      ...planClaims,
+    })).toString("base64url");
     return sendJson(res, 200, {
       access_token: "mock-access-token",
       refresh_token: "mock-refresh-token",

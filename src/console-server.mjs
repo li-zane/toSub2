@@ -795,8 +795,12 @@ async function handleApi(req, res, requestUrl) {
 
 async function sendJobsPage(res, requestedPage, emailFilter = null, filters = {}) {
   await syncCompletedOutputs();
-  if (filters.sub2apiPool || filters.sub2apiEnabled) {
-    await loadSub2ApiAccountStatus();
+  if (filters.planType || filters.sub2apiPool || filters.sub2apiEnabled) {
+    try {
+      await loadSub2ApiAccountStatus();
+    } catch (error) {
+      if (filters.sub2apiPool || filters.sub2apiEnabled) throw error;
+    }
   }
   const allJobs = listUniqueJobs();
   const emailSet = emailFilter?.length ? new Set(emailFilter) : null;
@@ -821,7 +825,7 @@ async function sendJobsPage(res, requestedPage, emailFilter = null, filters = {}
       sub2apiEnabled: filters.sub2apiEnabled || "",
     },
     filterOptions: {
-      planTypes: [...new Set(allJobs.map((job) => job.planType).filter(Boolean))].sort(),
+      planTypes: [...new Set(allJobs.map((job) => getJobPlanType(job)).filter(Boolean))].sort(),
     },
     stats: {
       active: allJobs.filter(occupiesActiveSlot).length,
@@ -847,7 +851,7 @@ function normalizeJobFilters(value) {
 
 function matchesJobFilters(job, filters) {
   if (filters.planType) {
-    const actualPlanType = job.planType || "__unknown__";
+    const actualPlanType = getJobPlanType(job) || "__unknown__";
     if (actualPlanType !== filters.planType) return false;
   }
   const sub2ApiStatus = getSub2ApiAccountStatusForJob(job);
@@ -3276,6 +3280,7 @@ async function loadSub2ApiAccountStatus({ forceRefresh = false } = {}) {
           groupIds,
           enabled,
           priority,
+          planType: extractPlanTypeFromAccount(remoteAccount, { preferJwt: false }) || null,
           remoteStatus: String(remoteAccount?.status || "").trim() || null,
           usage: mergeSub2ApiUsage(previous?.usage || null, usage),
           fetchedAt,
@@ -3286,6 +3291,7 @@ async function loadSub2ApiAccountStatus({ forceRefresh = false } = {}) {
       current.groupIds = [...new Set([...current.groupIds, ...groupIds])];
       current.enabled = mergeSub2ApiBoolean(current.enabled, enabled);
       current.priority = mergeSub2ApiPriority(current.priority, priority);
+      current.planType ||= extractPlanTypeFromAccount(remoteAccount, { preferJwt: false }) || null;
       current.remoteStatus ||= String(remoteAccount?.status || "").trim() || null;
       current.usage = mergeSub2ApiUsage(current.usage, usage);
     }
@@ -3319,6 +3325,7 @@ function publicSub2ApiAccountStatusEntry(entry) {
     inPool: true,
     enabled: entry.enabled ?? null,
     priority: entry.priority ?? null,
+    planType: entry.planType || null,
     groupIds: [...(entry.groupIds || [])],
     remoteStatus: entry.remoteStatus || null,
     usage: publicSub2ApiUsage(entry.usage),
@@ -3351,7 +3358,7 @@ function normalizeSub2ApiUsage(account, fallbackFetchedAt = null) {
     source: "sub2api",
     fetchedAt: updatedAt,
     snapshotTimestamp: remoteUpdatedAt,
-    planType: normalizePlanType(account?.credentials?.plan_type || account?.plan_type || account?.planType) || null,
+    planType: extractPlanTypeFromAccount(account, { preferJwt: false }) || null,
     allowed: limitReached === null ? null : !limitReached,
     limitReached,
     primary,
@@ -3498,10 +3505,10 @@ function getSub2ApiAccountStatusForJob(job, state = sub2ApiAccountStatusCache) {
   const config = sub2ApiSettingsConfig || sub2ApiMonitorConfig;
   const expectedBackend = config?.baseUrl ? monitorBackendIdentity(config) : null;
   if (!state?.fetchedAt || state.backend !== expectedBackend) {
-    return { inPool: null, enabled: null, priority: null, accountId: null, accountIds: [], groupIds: [], remoteStatus: null, usage: null };
+    return { inPool: null, enabled: null, priority: null, accountId: null, accountIds: [], groupIds: [], remoteStatus: null, planType: null, usage: null };
   }
   const entry = state.accounts.get(String(job.email || "").toLowerCase());
-  if (!entry) return { inPool: false, enabled: null, priority: null, accountId: null, accountIds: [], groupIds: [], remoteStatus: null, usage: null };
+  if (!entry) return { inPool: false, enabled: null, priority: null, accountId: null, accountIds: [], groupIds: [], remoteStatus: null, planType: null, usage: null };
   return {
     inPool: true,
     enabled: entry.enabled ?? null,
@@ -3510,8 +3517,13 @@ function getSub2ApiAccountStatusForJob(job, state = sub2ApiAccountStatusCache) {
     accountIds: [...(entry.accountIds || [])],
     groupIds: [...(entry.groupIds || [])],
     remoteStatus: entry.remoteStatus || null,
+    planType: entry.planType || null,
     usage: entry.usage || null,
   };
+}
+
+function getJobPlanType(job, state = sub2ApiAccountStatusCache) {
+  return getSub2ApiAccountStatusForJob(job, state).planType || job.planType || null;
 }
 
 function normalizeSub2ApiAccountId(value) {
@@ -3822,7 +3834,7 @@ function publicJob(job) {
     lastOperationAt: job.lastOperationAt || job.createdAt,
     lastOperationType: job.lastOperationType || "initial_authorization",
     completedAt: job.completedAt,
-    planType: job.planType || null,
+    planType: getJobPlanType(job),
     sub2apiInPool: sub2ApiStatus.inPool,
     sub2apiEnabled: sub2ApiStatus.enabled,
     sub2apiPriority: sub2ApiStatus.priority,
@@ -3900,7 +3912,7 @@ async function getAccountUsage(job, forceRefresh = false) {
   return usage || {
     source: "sub2api",
     fetchedAt: state.fetchedAt || null,
-    planType: job.planType || null,
+    planType: getJobPlanType(job, state),
     allowed: null,
     limitReached: null,
     primary: null,
@@ -4034,7 +4046,8 @@ function normalizePlanType(value) {
   return text.length > 0 && text.length <= 128 ? text : "";
 }
 
-function extractPlanTypeFromAccount(account) {
+function extractPlanTypeFromAccount(account, { preferJwt = true } = {}) {
+  const fromJwt = extractPlanTypeFromJwt(account?.credentials?.id_token);
   const direct = normalizePlanType(
     account?.plan_type
       || account?.planType
@@ -4043,8 +4056,7 @@ function extractPlanTypeFromAccount(account) {
       || account?.extra?.plan_type
       || account?.extra?.planType,
   );
-  if (direct) return direct;
-  return extractPlanTypeFromJwt(account?.credentials?.id_token);
+  return preferJwt ? (fromJwt || direct) : (direct || fromJwt);
 }
 
 function extractPlanTypeFromJwt(jwt) {
@@ -4055,11 +4067,11 @@ function extractPlanTypeFromJwt(jwt) {
     const claims = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
     const authClaims = claims?.["https://api.openai.com/auth"];
     return normalizePlanType(
-      authClaims?.chatgpt_plan_type
-        || authClaims?.plan_type
+      authClaims?.plan_type
+        || claims?.plan_type
+        || authClaims?.chatgpt_plan_type
         || claims?.["https://api.openai.com/auth.chatgpt_plan_type"]
-        || claims?.chatgpt_plan_type
-        || claims?.plan_type,
+        || claims?.chatgpt_plan_type,
     );
   } catch {
     return "";
@@ -4081,7 +4093,7 @@ function publicSelectionJob(job) {
     id: job.id,
     email: job.email,
     status: job.status,
-    planType: job.planType || null,
+    planType: getJobPlanType(job),
     sub2apiInPool: sub2ApiStatus.inPool,
     sub2apiEnabled: sub2ApiStatus.enabled,
     sub2apiPriority: sub2ApiStatus.priority,

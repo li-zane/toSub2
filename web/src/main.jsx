@@ -55,6 +55,7 @@ const DEFAULT_PLAN_TYPE_MAPPING = {
   enterprise: "Enterprise",
   self_serve_business: "Business",
   self_serve_business_prolite: "Business Premium",
+  self_serve_business_usage_based: "Business Usage Based",
   self_serve_pro: "Pro",
 };
 const SUB2API_WS_MODE_OPTIONS = [
@@ -3494,7 +3495,13 @@ function readPlanTypeMapping() {
   try {
     const stored = JSON.parse(window.localStorage.getItem(PLAN_TYPE_MAPPING_STORAGE_KEY) || "null");
     const normalized = normalizePlanTypeMapping(stored);
-    if (Object.keys(normalized).length) return { ...DEFAULT_PLAN_TYPE_MAPPING, ...normalized };
+    if (Object.keys(normalized).length) {
+      const usageBasedLabel = normalized.self_serve_business_usage_based;
+      if (usageBasedLabel && /business\s+pre(?:mium|nium)/i.test(usageBasedLabel)) {
+        delete normalized.self_serve_business_usage_based;
+      }
+      return { ...DEFAULT_PLAN_TYPE_MAPPING, ...normalized };
+    }
   } catch {}
   return { ...DEFAULT_PLAN_TYPE_MAPPING };
 }
@@ -3776,7 +3783,7 @@ function writeLocalTextSetting(key, value) {
 }
 
 function sub2ApiStatusJobFields(status) {
-  return {
+  const fields = {
     sub2apiInPool: status?.inPool ?? null,
     sub2apiEnabled: status?.enabled ?? null,
     sub2apiPriority: status?.priority ?? null,
@@ -3786,6 +3793,9 @@ function sub2ApiStatusJobFields(status) {
     sub2apiRemoteStatus: status?.remoteStatus || null,
     sub2apiUsage: status?.usage || null,
   };
+  const planType = String(status?.planType || "").trim();
+  if (planType) fields.planType = planType;
+  return fields;
 }
 
 function mergeSub2ApiStatusIntoJob(job, state) {

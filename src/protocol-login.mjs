@@ -2134,11 +2134,11 @@ function decodeJwtPayload(jwt) {
 function planTypeFromClaims(claims) {
   const authClaims = claims?.["https://api.openai.com/auth"];
   return normalizePlanType(
-    authClaims?.chatgpt_plan_type
-      || authClaims?.plan_type
+    authClaims?.plan_type
+      || claims?.plan_type
+      || authClaims?.chatgpt_plan_type
       || claims?.["https://api.openai.com/auth.chatgpt_plan_type"]
-      || claims?.chatgpt_plan_type
-      || claims?.plan_type,
+      || claims?.chatgpt_plan_type,
   );
 }
 

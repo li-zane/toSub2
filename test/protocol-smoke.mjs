@@ -63,6 +63,30 @@ try {
   assert.equal(firstExport.accounts?.[0]?.credentials?.plan_type, "plus");
   assert.equal(firstExport.accounts?.[0]?.extra?.plan_type, "plus");
 
+  const planConflictOutputPath = path.join(tempRoot, "plan-type-conflict-sub2api.json");
+  const planConflictLogin = await runNode([
+    path.join(projectRoot, "src", "protocol-login.mjs"),
+    "--email",
+    "plan-type-conflict@example.com",
+    "--chatgpt-base",
+    baseUrl,
+    "--auth-base",
+    baseUrl,
+    "--output-mode",
+    "sub2api",
+    "--sub2api-out",
+    planConflictOutputPath,
+    "--verbose",
+  ], [
+    { pattern: /Email OTP \(r=resend/, value: "123456" },
+    { pattern: /Phone number, E\.164 format/, value: "+60123456789" },
+    { pattern: /Phone OTP \(r=resend/, value: "654321" },
+  ]);
+  assert.equal(planConflictLogin.code, 0, processFailure("plan type conflict login", planConflictLogin));
+  const planConflictExport = JSON.parse(await fs.readFile(planConflictOutputPath, "utf8"));
+  assert.equal(planConflictExport.accounts?.[0]?.credentials?.plan_type, "self_serve_business_usage_based");
+  assert.equal(planConflictExport.accounts?.[0]?.extra?.plan_type, "self_serve_business_usage_based");
+
   const passwordAddResultPath = path.join(tempRoot, "password-add-result.json");
   const newPassword = "Added_Test_4826!";
   const passwordAdd = await runNode([
