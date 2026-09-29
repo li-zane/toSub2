@@ -150,7 +150,7 @@ function App() {
 
   const accountUsageJobKey = jobs
     .filter((job) => job.canDownload)
-    .map((job) => `${job.id}:${job.lastOperationAt || job.updatedAt || ""}`)
+    .map((job) => `${job.id}:${job.lastOperationAt || job.updatedAt || ""}:${JSON.stringify(job.sub2apiUsage || null)}`)
     .join("|");
 
   useEffect(() => writeLocalJson(SMS_PROVIDER_SETTINGS_KEY, smsSettings), [smsSettings]);
@@ -288,47 +288,19 @@ function App() {
     if (!token || !features.accountUsage) return undefined;
     const usageJobs = jobs.filter((job) => job.canDownload);
     const usageJobIds = usageJobs.map((job) => job.id);
-    let stopped = false;
     setAccountUsageByJobId((current) => {
       const next = { ...current };
       for (const jobId of Object.keys(next)) {
         if (!usageJobIds.includes(jobId)) delete next[jobId];
       }
       for (const jobId of usageJobIds) {
-        if (!next[jobId]) next[jobId] = { status: "loading" };
+        const job = usageJobs.find((item) => item.id === jobId);
+        next[jobId] = job?.sub2apiUsage
+          ? { status: "ready", ...job.sub2apiUsage }
+          : { status: "ready", source: "sub2api", primary: null, secondary: null, credits: null, allowed: null, limitReached: null };
       }
       return next;
     });
-
-    let loading = false;
-    const load = async () => {
-      if (stopped || loading) return;
-      loading = true;
-      try {
-        const results = await Promise.all(usageJobs.map(async (job) => {
-          try {
-            const data = await apiFetch(token, `/api/jobs/${encodeURIComponent(job.id)}/usage`);
-            return [job.id, { status: "ready", ...(data.usage || {}) }];
-          } catch (requestError) {
-            return [job.id, { status: "error", error: requestError.message }];
-          }
-        }));
-        if (!stopped) {
-          setAccountUsageByJobId((current) => ({
-            ...current,
-            ...Object.fromEntries(results),
-          }));
-        }
-      } finally {
-        loading = false;
-      }
-    };
-    void load();
-    const timer = window.setInterval(load, 60_000);
-    return () => {
-      stopped = true;
-      window.clearInterval(timer);
-    };
   }, [token, features.accountUsage, accountUsageJobKey]);
 
   const pageJobIds = useMemo(() => jobs.map((job) => job.id), [jobs]);
@@ -382,6 +354,8 @@ function App() {
     setAccountUsageByJobId((current) => ({ ...current, [jobId]: { status: "loading" } }));
     try {
       const data = await apiFetch(token, `/api/jobs/${encodeURIComponent(jobId)}/usage?refresh=1`);
+      setJobs((current) => current.map((job) => job.id === jobId ? { ...job, sub2apiUsage: data.usage || null } : job));
+      setJobSelectionIndex((current) => current.map((job) => job.id === jobId ? { ...job, sub2apiUsage: data.usage || null } : job));
       setAccountUsageByJobId((current) => ({
         ...current,
         [jobId]: { status: "ready", ...(data.usage || {}) },
@@ -1418,7 +1392,7 @@ function App() {
                     </select>
                   </div>
                 </th>
-                <th className="usage-heading">官方用量</th>
+                <th className="usage-heading">Sub2API 用量</th>
                 <th>
                   <div className="column-filter-heading">
                     <span>Sub2API 号池</span>
@@ -3069,7 +3043,7 @@ function StatusBadge({ status }) {
 
 function AccountUsageCell({ usage, available, enabled, onRefresh }) {
   if (!enabled) {
-    return <span className="usage-state muted" title="服务端尚未启用官方额度接口">未启用</span>;
+    return <span className="usage-state muted" title="服务端尚未启用 Sub2API 用量同步">未启用</span>;
   }
   if (!available) {
     return <span className="usage-state muted">待授权</span>;
@@ -3079,7 +3053,7 @@ function AccountUsageCell({ usage, available, enabled, onRefresh }) {
   }
   if (usage.status === "error") {
     return (
-      <button type="button" className="usage-retry" onClick={onRefresh} title={usage.error || "重新读取官方额度"}>
+      <button type="button" className="usage-retry" onClick={onRefresh} title={usage.error || "重新读取 Sub2API 用量"}>
         <RefreshCw size={13} />重试
       </button>
     );
@@ -3088,7 +3062,12 @@ function AccountUsageCell({ usage, available, enabled, onRefresh }) {
   const secondary = usage.secondary;
   const credits = usage.credits;
   if (!primary && !secondary && !credits && usage.allowed === null && usage.limitReached === null) {
-    return <span className="usage-state muted">暂无数据</span>;
+    return (
+      <span className="usage-empty">
+        <span className="usage-state muted">暂无数据</span>
+        {onRefresh && <button type="button" className="usage-refresh-icon" onClick={onRefresh} title="从 Sub2API 同步用量" aria-label="从 Sub2API 同步用量"><RefreshCw size={13} /></button>}
+      </span>
+    );
   }
   const restricted = usage.limitReached === true || usage.allowed === false || credits?.overageLimitReached === true;
   const windows = [
@@ -3096,8 +3075,11 @@ function AccountUsageCell({ usage, available, enabled, onRefresh }) {
     { key: "secondary", label: usageWindowLabel("7d", secondary), value: secondary },
   ].filter((item) => item.value);
   return (
-    <div className={`account-usage ${restricted ? "restricted" : ""}`} title={usage.fetchedAt ? `官方接口更新于 ${formatDateTime(usage.fetchedAt)}` : "官方接口额度"}>
-      <span className="usage-state">{restricted ? "受限" : usage.allowed === true ? "可用" : "已读取"}</span>
+    <div className={`account-usage ${restricted ? "restricted" : ""}`} title={usage.fetchedAt ? `Sub2API 同步于 ${formatDateTime(usage.fetchedAt)}` : "Sub2API 用量"}>
+      <div className="usage-state-row">
+        <span className="usage-state">{restricted ? "受限" : usage.allowed === true ? "可用" : "已读取"}</span>
+        {onRefresh && <button type="button" className="usage-refresh-icon" onClick={onRefresh} title="从 Sub2API 同步用量" aria-label="从 Sub2API 同步用量"><RefreshCw size={13} /></button>}
+      </div>
       {windows.map((item) => <UsageWindowProgress key={item.key} tone={item.key} label={item.label} window={item.value} />)}
       {credits && credits.unlimited === true && <span className="usage-window">无限额度</span>}
       {credits && credits.balance !== null && <span className="usage-window">额度 {credits.balance}</span>}
@@ -3153,10 +3135,10 @@ function usageWindowLabel(fallback, window) {
 }
 
 function formatUsageReset(window) {
+  if (window?.resetAt) return `${formatUsageResetAt(window.resetAt)}重置`;
   if (Number.isFinite(Number(window?.resetAfterSeconds))) {
     return `${formatUsageDuration(window.resetAfterSeconds)}后重置`;
   }
-  if (window?.resetAt) return `${formatUsageResetAt(window.resetAt)}重置`;
   return "";
 }
 
@@ -3172,6 +3154,7 @@ function formatUsageResetAt(value) {
   const timestamp = new Date(value).getTime();
   if (!Number.isFinite(timestamp)) return "待重置";
   const seconds = Math.max(0, Math.round((timestamp - Date.now()) / 1000));
+  if (seconds <= 0) return "现在";
   return seconds <= 86_400 ? `${formatUsageDuration(seconds)}后` : formatDateTime(value);
 }
 
@@ -3796,6 +3779,7 @@ function sub2ApiStatusJobFields(status) {
     sub2apiAccountIds: Array.isArray(status?.accountIds) ? status.accountIds : [],
     sub2apiGroupIds: Array.isArray(status?.groupIds) ? status.groupIds : [],
     sub2apiRemoteStatus: status?.remoteStatus || null,
+    sub2apiUsage: status?.usage || null,
   };
 }
 

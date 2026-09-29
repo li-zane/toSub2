@@ -410,6 +410,10 @@ tbody tr:last-child td { border-bottom: 0; }
 .usage-window-percent { min-width: 34px; color: var(--ink); font-size: 10px; font-variant-numeric: tabular-nums; text-align: right; }
 .usage-window-reset { min-width: 0; overflow: hidden; color: #8a9490; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
 .usage-window { min-width: 0; overflow: hidden; color: #68756f; text-overflow: ellipsis; white-space: nowrap; }
+.usage-state-row, .usage-empty { min-width: 0; display: inline-flex; align-items: center; gap: 4px; }
+.usage-refresh-icon { width: 20px; height: 20px; padding: 0; display: inline-grid; place-items: center; color: var(--blue); background: transparent; border: 0; border-radius: 3px; cursor: pointer; }
+.usage-refresh-icon:hover { color: var(--green); background: #edf5f0; }
+.usage-refresh-icon:focus-visible { outline: 2px solid var(--blue); outline-offset: 1px; }
 .usage-retry { min-height: 27px; padding: 0 5px; display: inline-flex; align-items: center; gap: 4px; color: var(--blue); background: transparent; border: 0; font-size: 10px; cursor: pointer; }
 .usage-retry:hover { color: var(--green); }
 

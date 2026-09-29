@@ -11,7 +11,6 @@ import react from "@vitejs/plugin-react";
 import { createServer as createViteServer } from "vite";
 import { createCredentialStore } from "./credential-store.mjs";
 import {
-  fetchAccountUsage,
   listAccountSessions,
   revokeAccountSession,
   revokeAllAccountSessions,
@@ -36,7 +35,6 @@ const PROXY_CONNECTION_RETRY_MAX_MS = 15_000;
 const PAGE_SIZE = 20;
 const MAX_LOG_CHARS = 80_000;
 const SUB2API_ACCOUNT_STATUS_CACHE_TTL_MS = readDurationEnv("SUB2API_ACCOUNT_STATUS_CACHE_TTL_MS", 15_000, 1_000);
-const ACCOUNT_USAGE_CACHE_TTL_MS = readDurationEnv("ACCOUNT_USAGE_CACHE_TTL_MS", 60_000, 1_000);
 const JOB_META_FILENAME = "job-meta.json";
 const LOGIN_CHECKPOINT_FILENAME = "login-checkpoint.json";
 const TOTP_SETUP_RESULT_FILENAME = "totp-setup-result.json";
@@ -103,7 +101,6 @@ let sub2ApiAccountStatusCache = {
   fetchedAt: null,
   accounts: new Map(),
 };
-const accountUsageCache = new Map();
 let mailRequestConfig = { method: "GET", url: null, headers: {} };
 const sub2ApiRequestControllers = new Set();
 const sub2ApiRequestPromises = new Set();
@@ -702,7 +699,7 @@ async function handleApi(req, res, requestUrl) {
     return;
   }
   if (req.method === "GET" && action === "usage") {
-    if (!job.resultSaved) throw httpError(409, "账号授权尚未完成，暂时没有可读取的官方额度");
+    if (!job.resultSaved) throw httpError(409, "账号授权尚未完成，暂时没有可读取的 Sub2API 用量");
     try {
       const usage = await getAccountUsage(job, requestUrl.searchParams.get("refresh") === "1");
       sendJson(res, 200, { usage });
@@ -787,7 +784,6 @@ async function handleApi(req, res, requestUrl) {
     await withEmailJobLock(job.email, async () => {
       persisted = await updateStoredCredentialFields(job, body);
     });
-    accountUsageCache.delete(job.id);
     sendJson(res, 200, { credentials: await publicCredentialDetails(job, persisted), job: publicJob(job) });
     return;
   }
@@ -3270,6 +3266,9 @@ async function loadSub2ApiAccountStatus({ forceRefresh = false } = {}) {
     const remoteAccounts = await listSub2ApiAccounts(config);
     const accounts = new Map();
     const fetchedAt = new Date().toISOString();
+    const previousAccounts = sub2ApiAccountStatusCache.backend === backend
+      ? sub2ApiAccountStatusCache.accounts
+      : new Map();
     for (const remoteAccount of remoteAccounts) {
       const email = sub2ApiAccountEmail(remoteAccount);
       const accountId = normalizeSub2ApiAccountId(remoteAccount?.id);
@@ -3277,7 +3276,9 @@ async function loadSub2ApiAccountStatus({ forceRefresh = false } = {}) {
       const groupIds = sub2ApiAccountGroupIds(remoteAccount);
       const enabled = sub2ApiAccountSchedulable(remoteAccount);
       const priority = sub2ApiAccountPriority(remoteAccount);
+      const usage = normalizeSub2ApiUsage(remoteAccount, fetchedAt);
       const current = accounts.get(email);
+      const previous = previousAccounts.get(email);
       if (!current) {
         accounts.set(email, {
           email,
@@ -3286,6 +3287,7 @@ async function loadSub2ApiAccountStatus({ forceRefresh = false } = {}) {
           enabled,
           priority,
           remoteStatus: String(remoteAccount?.status || "").trim() || null,
+          usage: mergeSub2ApiUsage(previous?.usage || null, usage),
           fetchedAt,
         });
         continue;
@@ -3295,6 +3297,7 @@ async function loadSub2ApiAccountStatus({ forceRefresh = false } = {}) {
       current.enabled = mergeSub2ApiBoolean(current.enabled, enabled);
       current.priority = mergeSub2ApiPriority(current.priority, priority);
       current.remoteStatus ||= String(remoteAccount?.status || "").trim() || null;
+      current.usage = mergeSub2ApiUsage(current.usage, usage);
     }
     sub2ApiAccountStatusCache = { backend, fetchedAt, accounts };
     return sub2ApiAccountStatusCache;
@@ -3328,18 +3331,187 @@ function publicSub2ApiAccountStatusEntry(entry) {
     priority: entry.priority ?? null,
     groupIds: [...(entry.groupIds || [])],
     remoteStatus: entry.remoteStatus || null,
+    usage: publicSub2ApiUsage(entry.usage),
     fetchedAt: entry.fetchedAt || null,
   };
 }
 
-function getSub2ApiAccountStatusForJob(job) {
+function normalizeSub2ApiUsage(account, fallbackFetchedAt = null) {
+  const extra = normalizeSub2ApiExtra(account?.extra);
+  const primary = normalizeSub2ApiUsageWindow(extra, "5h");
+  const secondary = normalizeSub2ApiUsageWindow(extra, "7d");
+  const remoteUpdatedAt = normalizeSub2ApiUsageDate(extra.codex_usage_updated_at)
+    || normalizeSub2ApiUsageDate(account?.usage_updated_at)
+    || normalizeSub2ApiUsageDate(account?.usageUpdatedAt);
+  const updatedAt = remoteUpdatedAt || fallbackFetchedAt;
+  const creditsRaw = extra.codex_credits_snapshot?.credits;
+  const credits = creditsRaw && typeof creditsRaw === "object"
+    ? {
+        hasCredits: typeof creditsRaw.has_credits === "boolean" ? creditsRaw.has_credits : null,
+        unlimited: typeof creditsRaw.unlimited === "boolean" ? creditsRaw.unlimited : null,
+        balance: creditsRaw.balance === null || creditsRaw.balance === undefined ? null : String(creditsRaw.balance),
+        overageLimitReached: typeof creditsRaw.overage_limit_reached === "boolean" ? creditsRaw.overage_limit_reached : null,
+      }
+    : null;
+  if (!primary && !secondary && !credits) return null;
+  const limitReached = [primary, secondary].some((window) => window?.usedPercent !== null && window.usedPercent >= 100)
+    ? true
+    : [primary, secondary].some(Boolean) ? false : null;
+  return {
+    source: "sub2api",
+    fetchedAt: updatedAt,
+    snapshotTimestamp: remoteUpdatedAt,
+    planType: normalizePlanType(account?.credentials?.plan_type || account?.plan_type || account?.planType) || null,
+    allowed: limitReached === null ? null : !limitReached,
+    limitReached,
+    primary,
+    secondary,
+    credits,
+  };
+}
+
+function normalizeSub2ApiExtra(value) {
+  if (value && typeof value === "object" && !Array.isArray(value)) return value;
+  if (typeof value !== "string" || value.length > 256_000) return {};
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function publicSub2ApiUsage(usage) {
+  if (!usage || typeof usage !== "object") return null;
+  return {
+    source: "sub2api",
+    fetchedAt: usage.fetchedAt || null,
+    planType: usage.planType || null,
+    allowed: usage.allowed ?? null,
+    limitReached: usage.limitReached ?? null,
+    primary: publicSub2ApiUsageWindow(usage.primary),
+    secondary: publicSub2ApiUsageWindow(usage.secondary),
+    credits: usage.credits ? { ...usage.credits } : null,
+  };
+}
+
+function publicSub2ApiUsageWindow(window) {
+  if (!window) return null;
+  return { ...window };
+}
+
+function mergeSub2ApiUsage(current, next) {
+  if (!current) return next || null;
+  if (!next) return current;
+  const currentTimestamp = Date.parse(current.snapshotTimestamp || current.fetchedAt || "") || 0;
+  const nextTimestamp = Date.parse(next.snapshotTimestamp || next.fetchedAt || "") || 0;
+  const currentHasRemoteTimestamp = Boolean(current.snapshotTimestamp);
+  const nextHasRemoteTimestamp = Boolean(next.snapshotTimestamp);
+  const preferNext = currentHasRemoteTimestamp !== nextHasRemoteTimestamp
+    ? nextHasRemoteTimestamp
+    : nextTimestamp >= currentTimestamp;
+  const primary = preferNext ? (next.primary || current.primary) : (current.primary || next.primary);
+  const secondary = preferNext ? (next.secondary || current.secondary) : (current.secondary || next.secondary);
+  const credits = preferNext ? (next.credits || current.credits) : (current.credits || next.credits);
+  return {
+    ...current,
+    ...next,
+    fetchedAt: preferNext ? next.fetchedAt : current.fetchedAt,
+    snapshotTimestamp: preferNext ? (next.snapshotTimestamp || current.snapshotTimestamp || null) : (current.snapshotTimestamp || next.snapshotTimestamp || null),
+    planType: preferNext ? (next.planType || current.planType || null) : (current.planType || next.planType || null),
+    allowed: preferNext ? (next.allowed ?? current.allowed ?? null) : (current.allowed ?? next.allowed ?? null),
+    limitReached: preferNext ? (next.limitReached ?? current.limitReached ?? null) : (current.limitReached ?? next.limitReached ?? null),
+    primary,
+    secondary,
+    credits,
+  };
+}
+
+function normalizeSub2ApiUsageWindow(extra, window) {
+  const prefix = window === "5h" ? "codex_5h" : "codex_7d";
+  const legacyPrefix = resolveSub2ApiLegacyWindowPrefix(extra, window);
+  const usedPercent = firstSub2ApiUsageValue(
+    [extra[`${prefix}_used_percent`], extra[`${legacyPrefix}_used_percent`]],
+    normalizeSub2ApiUsagePercent,
+  );
+  const resetAt = firstSub2ApiUsageValue(
+    [extra[`${prefix}_reset_at`], extra[`${legacyPrefix}_reset_at`]],
+    normalizeSub2ApiUsageDate,
+  );
+  const resetAfterSeconds = firstSub2ApiUsageValue(
+    [extra[`${prefix}_reset_after_seconds`], extra[`${legacyPrefix}_reset_after_seconds`]],
+    normalizeSub2ApiUsageSeconds,
+  );
+  const windowMinutes = firstSub2ApiUsageValue(
+    [extra[`${prefix}_window_minutes`], extra[`${legacyPrefix}_window_minutes`]],
+    normalizeSub2ApiUsageSeconds,
+  );
+  if (usedPercent === null && !resetAt && resetAfterSeconds === null && windowMinutes === null) return null;
+  return {
+    usedPercent: usagePercentAfterReset(usedPercent, resetAt),
+    resetAfterSeconds: resetAfterSeconds && resetAfterSeconds > 0 ? resetAfterSeconds : null,
+    resetAt,
+    limitWindowSeconds: windowMinutes && windowMinutes > 0 ? windowMinutes * 60 : null,
+  };
+}
+
+function firstSub2ApiUsageValue(values, normalize) {
+  for (const value of values) {
+    const normalized = normalize(value);
+    if (normalized !== null) return normalized;
+  }
+  return null;
+}
+
+function resolveSub2ApiLegacyWindowPrefix(extra, window) {
+  const primaryMinutes = normalizeSub2ApiUsageSeconds(extra.codex_primary_window_minutes);
+  const secondaryMinutes = normalizeSub2ApiUsageSeconds(extra.codex_secondary_window_minutes);
+  if (primaryMinutes !== null && secondaryMinutes !== null) {
+    if (primaryMinutes <= 360 && secondaryMinutes > 360) return window === "5h" ? "codex_primary" : "codex_secondary";
+    if (secondaryMinutes <= 360 && primaryMinutes > 360) return window === "5h" ? "codex_secondary" : "codex_primary";
+  }
+  if (primaryMinutes !== null) return primaryMinutes <= 360
+    ? (window === "5h" ? "codex_primary" : "codex_secondary")
+    : (window === "5h" ? "codex_secondary" : "codex_primary");
+  if (secondaryMinutes !== null) return secondaryMinutes <= 360
+    ? (window === "5h" ? "codex_secondary" : "codex_primary")
+    : (window === "5h" ? "codex_primary" : "codex_secondary");
+  // Sub2API's legacy fallback treats primary as 7d and secondary as 5h.
+  return window === "5h" ? "codex_secondary" : "codex_primary";
+}
+
+function normalizeSub2ApiUsagePercent(value) {
+  if (value === null || value === undefined || String(value).trim() === "") return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? Math.min(100, Math.max(0, number)) : null;
+}
+
+function normalizeSub2ApiUsageSeconds(value) {
+  if (value === null || value === undefined || String(value).trim() === "") return null;
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0 && number <= 31_536_000 ? Math.round(number) : null;
+}
+
+function normalizeSub2ApiUsageDate(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const numeric = Number(value);
+  if (Number.isFinite(numeric) && numeric <= 0) return null;
+  const timestamp = Number.isFinite(numeric)
+    ? (numeric < 10_000_000_000 ? numeric * 1_000 : numeric)
+    : Date.parse(String(value));
+  if (!Number.isFinite(timestamp)) return null;
+  const date = new Date(timestamp);
+  return Number.isFinite(date.getTime()) ? date.toISOString() : null;
+}
+
+function getSub2ApiAccountStatusForJob(job, state = sub2ApiAccountStatusCache) {
   const config = sub2ApiSettingsConfig || sub2ApiMonitorConfig;
   const expectedBackend = config?.baseUrl ? monitorBackendIdentity(config) : null;
-  if (!sub2ApiAccountStatusCache.fetchedAt || sub2ApiAccountStatusCache.backend !== expectedBackend) {
-    return { inPool: null, enabled: null, priority: null, accountId: null, accountIds: [], groupIds: [], remoteStatus: null };
+  if (!state?.fetchedAt || state.backend !== expectedBackend) {
+    return { inPool: null, enabled: null, priority: null, accountId: null, accountIds: [], groupIds: [], remoteStatus: null, usage: null };
   }
-  const entry = sub2ApiAccountStatusCache.accounts.get(String(job.email || "").toLowerCase());
-  if (!entry) return { inPool: false, enabled: null, priority: null, accountId: null, accountIds: [], groupIds: [], remoteStatus: null };
+  const entry = state.accounts.get(String(job.email || "").toLowerCase());
+  if (!entry) return { inPool: false, enabled: null, priority: null, accountId: null, accountIds: [], groupIds: [], remoteStatus: null, usage: null };
   return {
     inPool: true,
     enabled: entry.enabled ?? null,
@@ -3348,6 +3520,7 @@ function getSub2ApiAccountStatusForJob(job) {
     accountIds: [...(entry.accountIds || [])],
     groupIds: [...(entry.groupIds || [])],
     remoteStatus: entry.remoteStatus || null,
+    usage: entry.usage || null,
   };
 }
 
@@ -3632,6 +3805,7 @@ function publicJob(job) {
     sub2apiAccountIds: sub2ApiStatus.accountIds,
     sub2apiGroupIds: sub2ApiStatus.groupIds,
     sub2apiRemoteStatus: sub2ApiStatus.remoteStatus,
+    sub2apiUsage: publicSub2ApiUsage(sub2ApiStatus.usage),
     lastError: job.lastError,
     canDownload: Boolean(job.resultSaved),
     loginMode: job.loginMode || (job.mailApiUrl ? "email_otp" : "manual"),
@@ -3678,26 +3852,136 @@ function publicJob(job) {
 }
 
 async function getAccountUsage(job, forceRefresh = false) {
-  const key = String(job?.id || "");
-  if (!key) throw new Error("ACCOUNT_USAGE_CREDENTIALS_UNAVAILABLE: 账号标识无效");
-  const operationAt = String(job.lastOperationAt || job.updatedAt || "");
-  const cached = accountUsageCache.get(key);
-  if (cached?.promise) return cached.promise;
-  if (!forceRefresh && cached?.value && cached.operationAt === operationAt
-    && Date.now() - cached.cachedAt < ACCOUNT_USAGE_CACHE_TTL_MS) {
-    return cached.value;
+  // Normal reads use the low-cost snapshot synchronized with the Sub2API account list.
+  // An explicit refresh delegates the upstream probe to Sub2API for this account only.
+  if (!job?.email) throw new Error("ACCOUNT_USAGE_CREDENTIALS_UNAVAILABLE: 账号标识无效");
+  const state = await loadSub2ApiAccountStatus({ forceRefresh });
+  let status = getSub2ApiAccountStatusForJob(job, state);
+  if (forceRefresh && status.inPool === true && status.accountIds.length) {
+    const config = sub2ApiSettingsConfig || sub2ApiMonitorConfig;
+    const refreshed = await refreshSub2ApiAccountUsage(config, status.accountIds);
+    if (refreshed) {
+      const entry = state.accounts.get(String(job.email || "").toLowerCase());
+      const merged = mergeSub2ApiUsage(entry?.usage || status.usage || null, refreshed);
+      if (entry) {
+        entry.usage = merged;
+        entry.fetchedAt = new Date().toISOString();
+        state.fetchedAt = entry.fetchedAt;
+      }
+      status = { ...status, usage: merged };
+    }
   }
-  const promise = fetchAccountUsage(job)
-    .then((value) => {
-      accountUsageCache.set(key, { value, cachedAt: Date.now(), operationAt });
-      return value;
-    })
-    .catch((error) => {
-      accountUsageCache.delete(key);
-      throw error;
-    });
-  accountUsageCache.set(key, { promise, operationAt });
-  return promise;
+  const usage = publicSub2ApiUsage(status.usage);
+  return usage || {
+    source: "sub2api",
+    fetchedAt: state.fetchedAt || null,
+    planType: job.planType || null,
+    allowed: null,
+    limitReached: null,
+    primary: null,
+    secondary: null,
+    credits: null,
+  };
+}
+
+async function refreshSub2ApiAccountUsage(config, accountIds) {
+  if (!config?.baseUrl || !config?.adminApiKey) return null;
+  const ids = [...new Set(accountIds.map((value) => normalizeSub2ApiAccountId(value)).filter(Boolean))].slice(0, 8);
+  if (!ids.length) return null;
+  const responses = await Promise.allSettled(ids.map((accountId) => requestSub2Api(
+    config,
+    `/api/v1/admin/accounts/${encodeURIComponent(accountId)}/usage?source=active&force=true`,
+  )));
+  const usages = responses
+    .filter((result) => result.status === "fulfilled")
+    .map((result) => normalizeSub2ApiUsagePayload(result.value))
+    .filter(Boolean);
+  if (!usages.length) return null;
+  return usages.reduce((current, next) => mergeSub2ApiUsage(current, next), null);
+}
+
+function normalizeSub2ApiUsagePayload(payload) {
+  const data = payload?.data && typeof payload.data === "object" ? payload.data : payload;
+  if (!data || typeof data !== "object") return null;
+  const rateLimit = data.rate_limit && typeof data.rate_limit === "object" ? data.rate_limit : {};
+  const primary = normalizeSub2ApiResponseWindow(
+    data.five_hour ?? data.fiveHour ?? rateLimit.primary_window ?? rateLimit.primaryWindow,
+    "5h",
+  );
+  const secondary = normalizeSub2ApiResponseWindow(
+    data.seven_day ?? data.sevenDay ?? rateLimit.secondary_window ?? rateLimit.secondaryWindow,
+    "7d",
+  );
+  const snapshotTimestamp = normalizeSub2ApiUsageDate(data.updated_at ?? data.updatedAt ?? data.fetched_at ?? data.fetchedAt);
+  const fetchedAt = snapshotTimestamp || new Date().toISOString();
+  if (!primary && !secondary) return null;
+  const inferredLimitReached = [primary, secondary].some((window) => window?.usedPercent !== null && window.usedPercent >= 100);
+  const limitReached = typeof data.limit_reached === "boolean"
+    ? data.limit_reached
+    : typeof rateLimit.limit_reached === "boolean"
+      ? rateLimit.limit_reached
+      : inferredLimitReached;
+  const explicitAllowed = typeof data.allowed === "boolean"
+    ? data.allowed
+    : typeof data.limit_reached === "boolean"
+      ? !data.limit_reached
+      : typeof rateLimit.allowed === "boolean"
+        ? rateLimit.allowed
+        : typeof rateLimit.limit_reached === "boolean"
+          ? !rateLimit.limit_reached
+          : null;
+  return {
+    source: "sub2api",
+    fetchedAt,
+    snapshotTimestamp,
+    planType: null,
+    allowed: explicitAllowed ?? !limitReached,
+    limitReached,
+    primary,
+    secondary,
+    credits: normalizeSub2ApiCredits(data.credits),
+  };
+}
+
+function normalizeSub2ApiResponseWindow(value, fallbackWindow) {
+  if (!value || typeof value !== "object") return null;
+  const usedPercent = firstSub2ApiUsageValue(
+    [value.utilization, value.used_percent, value.usedPercent],
+    normalizeSub2ApiUsagePercent,
+  );
+  const resetAt = firstSub2ApiUsageValue(
+    [value.resets_at, value.reset_at, value.resetAt],
+    normalizeSub2ApiUsageDate,
+  );
+  const resetAfterSeconds = firstSub2ApiUsageValue(
+    [value.remaining_seconds, value.reset_after_seconds, value.resetAfterSeconds],
+    normalizeSub2ApiUsageSeconds,
+  );
+  if (usedPercent === null && !resetAt && resetAfterSeconds === null) return null;
+  return {
+    usedPercent: usagePercentAfterReset(usedPercent, resetAt),
+    resetAfterSeconds: resetAfterSeconds && resetAfterSeconds > 0 ? resetAfterSeconds : null,
+    resetAt,
+    limitWindowSeconds: firstSub2ApiUsageValue(
+      [value.limit_window_seconds, value.limitWindowSeconds],
+      normalizeSub2ApiUsageSeconds,
+    ) || (fallbackWindow === "5h" ? 18_000 : 604_800),
+  };
+}
+
+function usagePercentAfterReset(usedPercent, resetAt) {
+  if (usedPercent === null || !resetAt) return usedPercent;
+  return Date.parse(resetAt) <= Date.now() ? 0 : usedPercent;
+}
+
+function normalizeSub2ApiCredits(value) {
+  if (!value || typeof value !== "object") return null;
+  return {
+    hasCredits: typeof value.has_credits === "boolean" ? value.has_credits : typeof value.hasCredits === "boolean" ? value.hasCredits : null,
+    unlimited: typeof value.unlimited === "boolean" ? value.unlimited : null,
+    balance: value.balance === null || value.balance === undefined ? null : String(value.balance),
+    overageLimitReached: typeof value.overage_limit_reached === "boolean" ? value.overage_limit_reached : null,
+  };
 }
 
 async function publicCredentialDetails(job, persisted = null) {
@@ -3999,7 +4283,6 @@ async function deleteJobsByEmail(email) {
     job.child?.kill("SIGTERM");
     job.child = null;
     directories.add(path.dirname(job.outputPath));
-    accountUsageCache.delete(job.id);
     jobs.delete(job.id);
   });
   await Promise.allSettled(matching.map((job) => job.metadataWritePromise).filter(Boolean));
@@ -5459,7 +5742,7 @@ function sessionApiError(error) {
 
 function accountUsageApiError(error) {
   if (error?.status) return error;
-  const message = String(error?.message || "ACCOUNT_USAGE_PROVIDER_ERROR: 官方额度请求失败")
+  const message = String(error?.message || "ACCOUNT_USAGE_PROVIDER_ERROR: Sub2API 用量同步失败")
     .replace(/[\r\n]+/g, " ")
     .slice(0, 320);
   const status = /ACCOUNT_USAGE_CREDENTIALS_UNAVAILABLE|SESSION_CREDENTIALS_UNAVAILABLE|SESSION_TOKEN_EXPIRED/.test(message)

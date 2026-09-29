@@ -215,9 +215,7 @@ API Key 只会随取号请求临时发送给本地服务，不会写入任务元
 
 账号列表的 `Plan type`、`Sub2API 号池` 和 `号池启用` 表头提供下拉筛选，并显示可编辑的远端账号 `priority`。在号池中时，优先级单元格的数字输入和保存按钮会更新该邮箱对应的全部 Sub2API 账号记录（范围 `0-10000`）；服务会通过已保存的管理员配置读取 Sub2API 账号状态，并按账号邮箱合并到本地任务。前端约每 15 秒重新读取一次远端状态，因此在 Sub2API 管理端直接修改优先级后，列表会在下一次同步中回显；也可以通过 `GET /api/sub2api/account-status?refresh=1` 立即刷新。`号池启用` 列的开关会更新远端账号的 `schedulable` 状态。未配置或暂时无法读取后端时，状态显示为“未同步”，不会把管理员 API Key 写入浏览器。
 
-账号列表的“官方用量”列直接请求 ChatGPT 官方 `GET /backend-api/wham/usage` 接口，不查询 Sub2API；服务端按账号缓存 60 秒并只向前端返回计划、用量窗口百分比、重置时间和额度状态。前端按 Sub2API 的紧凑样式显示 `5h`/`7d` 窗口标签、已用百分比进度条和重置倒计时；官方响应没有百分比时，会用 `used/limit` 或 `remaining/limit` 推导。接口暂时不可用时显示“重试”，不会暴露 OAuth 令牌或原始响应。账号名可点击复制。
-
-额度缓存时长可通过 `ACCOUNT_USAGE_CACHE_TTL_MS` 调整（默认 `60000` 毫秒）；手动点击“重试”会绕过缓存重新读取官方接口。
+账号列表的“Sub2API 用量”列从已配置的 Sub2API 管理接口同步 OpenAI 账号用量，不再由 toSub2 直接请求 ChatGPT 官方 `GET /backend-api/wham/usage`。普通同步读取账号列表中的 `extra.codex_*` 快照；前端约每 15 秒刷新一次，服务端状态缓存 TTL 默认也是 15 秒。前端按 Sub2API 的紧凑样式显示 `5h`/`7d` 窗口标签、已用百分比进度条和重置倒计时，不会暴露 OAuth 令牌或原始响应。点击用量旁的同步按钮会对该账号调用 Sub2API 的 active usage 接口，并把最新结果写回当前同步状态；active 查询失败时保留最近一次快照。账号名可点击复制。
 
 生产部署建议让 x1 直接运行个人 GitHub 仓库的 `feature/account-credentials-plan-2fa` 分支。应用代码位于 `/opt/tosub2/app`，运行数据和敏感凭据位于独立的 `/var/lib/tosub2`，不会随 Git 提交、拉取或更新覆盖。更新时先在本地提交并推送，再在 x1 执行 `git pull --ff-only origin feature/account-credentials-plan-2fa`，确认 `node --check src/console-server.mjs` 后执行 `systemctl restart tosub2.service`；更新前应保留 `/var/lib/tosub2` 备份。
 

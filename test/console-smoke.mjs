@@ -18,6 +18,7 @@ const sub2apiUrl = `http://127.0.0.1:${sub2apiPort}`;
 let uploadedAccounts = [];
 let remoteErrorAccounts = [];
 const updatedRemoteAccounts = new Map();
+const activeUsageByAccountId = new Map();
 const clearedRemoteAccountIds = new Set();
 const scheduledRemoteAccounts = new Map();
 const clearRemoteCounts = new Map();
@@ -60,6 +61,18 @@ const sub2api = http.createServer(async (req, res) => {
       message: "success",
       data: { items, total: items.length, page: 1, page_size: 100, pages: 1 },
     }));
+    return;
+  }
+  const usageMatch = /^\/api\/v1\/admin\/accounts\/(\d+)\/usage\?/.exec(req.url || "");
+  if (req.method === "GET" && usageMatch) {
+    const usage = activeUsageByAccountId.get(Number(usageMatch[1]));
+    if (!usage) {
+      res.writeHead(404, { "content-type": "application/json" });
+      res.end(JSON.stringify({ message: "usage not found" }));
+      return;
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ code: 0, message: "success", data: usage }));
     return;
   }
   const detailMatch = /^\/api\/v1\/admin\/accounts\/(\d+)$/.exec(req.url || "");
@@ -277,19 +290,18 @@ try {
   const usageText = await usageResponse.text();
   assert.equal(usageResponse.status, 200, usageText);
   const usage = JSON.parse(usageText).usage;
-  assert.equal(usage.planType, "pro");
-  assert.equal(usage.primary.usedPercent, 18);
-  assert.equal(usage.primary.resetAfterSeconds, 3_600);
+  assert.equal(usage.source, "sub2api");
+  assert.equal(usage.primary, null);
+  assert.equal(usage.secondary, null);
   const cachedUsageResponse = await fetch(`${baseUrl}/api/jobs/${jobId}/usage`, { headers });
   const cachedUsageText = await cachedUsageResponse.text();
   assert.equal(cachedUsageResponse.status, 200, cachedUsageText);
   const officialUsageRequests = officialRequests.filter((request) => request.url === "/backend-api/wham/usage");
-  assert.equal(officialUsageRequests.length, 1);
-  assert.ok(officialUsageRequests[0].authorization?.startsWith("Bearer "));
+  assert.equal(officialUsageRequests.length, 0);
   const refreshedUsageResponse = await fetch(`${baseUrl}/api/jobs/${jobId}/usage?refresh=1`, { headers });
   const refreshedUsageText = await refreshedUsageResponse.text();
   assert.equal(refreshedUsageResponse.status, 200, refreshedUsageText);
-  assert.equal(officialRequests.filter((request) => request.url === "/backend-api/wham/usage").length, 2);
+  assert.equal(officialRequests.filter((request) => request.url === "/backend-api/wham/usage").length, 0);
 
   const downloadResponse = await fetch(`${baseUrl}/api/jobs/${jobId}/download`, { headers });
   assert.equal(downloadResponse.status, 200);
@@ -775,7 +787,52 @@ try {
     priority: 9,
     credentials: { email: "account-profile@example.com" },
     group_ids: [7, 8],
+    extra: {
+      codex_usage_updated_at: new Date().toISOString(),
+      codex_5h_used_percent: 18,
+      codex_5h_reset_after_seconds: 3_600,
+      codex_5h_reset_at: new Date(Date.now() + 3_600_000).toISOString(),
+      codex_5h_window_minutes: 300,
+      codex_7d_used_percent: 42,
+      codex_7d_reset_after_seconds: 86_400,
+      codex_7d_reset_at: new Date(Date.now() + 86_400_000).toISOString(),
+      codex_7d_window_minutes: 10_080,
+      codex_credits_snapshot: { credits: { has_credits: true, unlimited: false, balance: "12.5" } },
+    },
+  }, {
+    id: 103,
+    name: "legacy-usage@example.com",
+    platform: "openai",
+    type: "oauth",
+    status: "active",
+    schedulable: true,
+    credentials: { email: "legacy-usage@example.com" },
+    extra: {
+      codex_primary_used_percent: 88,
+      codex_primary_reset_after_seconds: 7_200,
+      codex_secondary_used_percent: 12,
+      codex_secondary_reset_after_seconds: 900,
+    },
+  }, {
+    id: 104,
+    name: "empty-usage@example.com",
+    platform: "openai",
+    type: "oauth",
+    status: "active",
+    schedulable: true,
+    credentials: { email: "empty-usage@example.com" },
+    extra: {
+      codex_5h_used_percent: null,
+      codex_5h_reset_after_seconds: null,
+      codex_7d_used_percent: "",
+      codex_7d_reset_after_seconds: "",
+    },
   }];
+  activeUsageByAccountId.set(101, {
+    updated_at: new Date().toISOString(),
+    five_hour: { utilization: 21, resets_at: new Date(Date.now() + 4_200_000).toISOString(), remaining_seconds: 4_200 },
+    seven_day: { utilization: 43, resets_at: new Date(Date.now() + 172_800_000).toISOString(), remaining_seconds: 172_800 },
+  });
   const accountStatusResponse = await fetch(`${baseUrl}/api/sub2api/account-status?refresh=1`, { headers });
   const accountStatusText = await accountStatusResponse.text();
   assert.equal(accountStatusResponse.status, 200, accountStatusText);
@@ -783,8 +840,32 @@ try {
   assert.equal(accountStatus.accounts["account-profile@example.com"].inPool, true);
   assert.equal(accountStatus.accounts["account-profile@example.com"].enabled, false);
   assert.equal(accountStatus.accounts["account-profile@example.com"].priority, 9);
+  assert.equal(accountStatus.accounts["account-profile@example.com"].usage.source, "sub2api");
+  assert.equal(accountStatus.accounts["account-profile@example.com"].usage.primary.usedPercent, 18);
+  assert.equal(accountStatus.accounts["account-profile@example.com"].usage.primary.resetAfterSeconds, 3_600);
+  assert.equal(accountStatus.accounts["account-profile@example.com"].usage.secondary.usedPercent, 42);
+  assert.equal(accountStatus.accounts["account-profile@example.com"].usage.credits.balance, "12.5");
+  assert.equal(accountStatus.accounts["legacy-usage@example.com"].usage.primary.usedPercent, 12);
+  assert.equal(accountStatus.accounts["legacy-usage@example.com"].usage.secondary.usedPercent, 88);
+  assert.equal(accountStatus.accounts["empty-usage@example.com"].usage, null);
+  const syncedUsageResponse = await fetch(`${baseUrl}/api/jobs/${profileJob.id}/usage`, { headers });
+  const syncedUsageText = await syncedUsageResponse.text();
+  assert.equal(syncedUsageResponse.status, 200, syncedUsageText);
+  const syncedUsage = JSON.parse(syncedUsageText).usage;
+  assert.equal(syncedUsage.source, "sub2api");
+  assert.equal(syncedUsage.primary.usedPercent, 18);
+  assert.equal(syncedUsage.secondary.usedPercent, 42);
+  const refreshedSyncedUsageResponse = await fetch(`${baseUrl}/api/jobs/${profileJob.id}/usage?refresh=1`, { headers });
+  const refreshedSyncedUsageText = await refreshedSyncedUsageResponse.text();
+  assert.equal(refreshedSyncedUsageResponse.status, 200, refreshedSyncedUsageText);
+  const refreshedSyncedUsage = JSON.parse(refreshedSyncedUsageText).usage;
+  assert.equal(refreshedSyncedUsage.primary.usedPercent, 21);
+  assert.equal(refreshedSyncedUsage.secondary.usedPercent, 43);
+  assert.equal(refreshedSyncedUsage.credits.balance, "12.5");
+  assert.equal(officialRequests.filter((request) => request.url === "/backend-api/wham/usage").length, 0);
   const statusPage = await (await fetch(`${baseUrl}/api/jobs`, { headers })).json();
   assert.equal(statusPage.jobs.find((item) => item.email === "account-profile@example.com").sub2apiPriority, 9);
+  assert.equal(statusPage.jobs.find((item) => item.email === "account-profile@example.com").sub2apiUsage.primary.usedPercent, 21);
   const addedFilter = await (await fetch(`${baseUrl}/api/jobs?sub2apiPool=added`, { headers })).json();
   assert.equal(addedFilter.pagination.total, 1);
   assert.equal(addedFilter.jobs[0].sub2apiInPool, true);
