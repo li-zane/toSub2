@@ -42,6 +42,7 @@ const PASSWORD_ADD_RESULT_FILENAME = "password-add-result.json";
 const SUB2API_SETTINGS_FILENAME = "sub2api-settings.json";
 const SUB2API_MONITOR_FILENAME = "sub2api-monitor.json";
 const SUB2API_WS_MODES = new Set(["off", "ctx_pool", "passthrough", "http_bridge"]);
+const SUB2API_TARGET_GROUP_PLATFORMS = ["openai", "composite"];
 const SUB2API_ACCOUNT_NAME_TEMPLATE_KEYS = new Set([
   "email",
   "planType",
@@ -434,16 +435,8 @@ async function handleApi(req, res, requestUrl) {
   if (req.method === "POST" && requestUrl.pathname === "/api/sub2api/groups") {
     const body = await readJson(req);
     const config = normalizeSub2ApiConfig(body.config);
-    const payload = await requestSub2Api(config, "/api/v1/admin/groups/all?platform=openai");
-    const groups = Array.isArray(payload) ? payload : Array.isArray(payload?.data) ? payload.data : [];
     sendJson(res, 200, {
-      groups: groups
-        .filter((group) => group && Number.isInteger(Number(group.id)))
-        .map((group) => ({
-          id: Number(group.id),
-          name: String(group.name || `号池 ${group.id}`),
-          status: String(group.status || "active"),
-        })),
+      groups: await listSub2ApiTargetGroups(config),
     });
     return;
   }
@@ -452,15 +445,12 @@ async function handleApi(req, res, requestUrl) {
     const body = await readJson(req);
     const config = normalizeSub2ApiConfig(body.config);
     const [groupPayload, proxyPayload] = await Promise.all([
-      requestSub2Api(config, "/api/v1/admin/groups/all?platform=openai"),
+      listSub2ApiTargetGroups(config),
       requestSub2Api(config, "/api/v1/admin/proxies/all"),
     ]);
-    const groups = Array.isArray(groupPayload) ? groupPayload : Array.isArray(groupPayload?.data) ? groupPayload.data : [];
     const proxies = Array.isArray(proxyPayload) ? proxyPayload : Array.isArray(proxyPayload?.data) ? proxyPayload.data : [];
     sendJson(res, 200, {
-      groups: groups
-        .filter((group) => group && Number.isInteger(Number(group.id)))
-        .map((group) => ({ id: Number(group.id), name: String(group.name || `号池 ${group.id}`), status: String(group.status || "active") })),
+      groups: groupPayload,
       proxies: proxies
         .filter((proxy) => proxy && Number.isInteger(Number(proxy.id)))
         .map((proxy) => ({
@@ -3608,6 +3598,41 @@ async function listSub2ApiAccounts(config) {
     page += 1;
   } while (page <= pages && page <= 1_000);
   return accounts;
+}
+
+async function listSub2ApiTargetGroups(config) {
+  const results = await Promise.allSettled(SUB2API_TARGET_GROUP_PLATFORMS.map(async (platform) => {
+    const payload = await requestSub2Api(config, `/api/v1/admin/groups/all?platform=${platform}`);
+    const groups = Array.isArray(payload)
+      ? payload
+      : Array.isArray(payload?.data)
+        ? payload.data
+        : [];
+    return groups
+      .filter((group) => group && Number.isInteger(Number(group.id)))
+      .map((group) => ({
+        id: Number(group.id),
+        name: String(group.name || `号池 ${group.id}`),
+        platform: String(group.platform || platform).trim().toLowerCase() || platform,
+        status: String(group.status || "active"),
+      }));
+  }));
+  const successfulResults = results.filter((result) => result.status === "fulfilled");
+  const successful = successfulResults.flatMap((result) => result.value);
+  if (!successfulResults.length) {
+    const failure = results.find((result) => result.status === "rejected");
+    if (failure) throw failure.reason;
+  }
+  const groups = new Map();
+  for (const group of successful) {
+    const key = String(group.id);
+    if (!groups.has(key)) groups.set(key, group);
+  }
+  return [...groups.values()].sort((left, right) => (
+    String(left.platform).localeCompare(String(right.platform))
+      || left.id - right.id
+      || String(left.name).localeCompare(String(right.name), "zh-CN")
+  ));
 }
 
 function isSub2ApiAccountInMonitoredGroups(account, groupIds) {

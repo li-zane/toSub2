@@ -1775,7 +1775,7 @@ function App() {
                           onChange={(event) => setSub2ApiGroupChecked(groupId, event.target.checked)}
                         />
                         <span>{group.name}</span>
-                        <small>ID: {group.id}</small>
+                        <small>{formatSub2ApiGroupPlatform(group.platform)} · ID: {group.id}</small>
                       </label>
                     );
                   }) : <div className="sub2api-group-empty">暂无可选号池</div>}
@@ -1889,7 +1889,7 @@ function App() {
                 />
               </label>
             </div>
-            <div className="dialog-hint">分组为空时，上传使用 Sub2API 默认号池，监控检查全部 OpenAI 账号；选择分组后只监控这些号池。Codex 指纹收敛和 WS mode 会写入每个上传或巡检更新的 OpenAI OAuth 账号。要让账号级 WS mode 生效，请确认 Sub2API 的 gateway.openai_ws.mode_router_v2_enabled 已开启。</div>
+            <div className="dialog-hint">分组为空时，上传使用 Sub2API 默认号池，监控检查全部 OpenAI 账号；选择 OpenAI 或 Composite 分组后只监控这些号池。Codex 指纹收敛和 WS mode 会写入每个上传或巡检更新的 OpenAI OAuth 账号。要让账号级 WS mode 生效，请确认 Sub2API 的 gateway.openai_ws.mode_router_v2_enabled 已开启。</div>
             {features.sub2apiMonitor && sub2apiMonitorStatus.configured && (
               <div className={`sub2api-monitor-status ${sub2apiMonitorStatus.lastError ? "error" : ""}`}>
                 <ShieldCheck size={15} />
@@ -3671,6 +3671,11 @@ function formatSub2ApiProxy(proxy) {
   const endpoint = host ? `${protocol}://${host}${port}` : "地址未知";
   const ip = String(proxy.ipAddress || "").trim();
   return `${proxy.name || `代理 ${proxy.id}`} | ${endpoint}${ip ? ` | 出口 IP：${ip}` : ""}`;
+}
+
+function formatSub2ApiGroupPlatform(platform) {
+  const value = String(platform || "").trim().toLowerCase();
+  return value === "composite" ? "Composite" : value === "openai" ? "OpenAI" : value || "未知平台";
 }
 
 function withSmsProviderDefaults(definitions, settings) {

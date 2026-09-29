@@ -17,6 +17,8 @@ const sub2apiPort = await findAvailablePort();
 const sub2apiUrl = `http://127.0.0.1:${sub2apiPort}`;
 let uploadedAccounts = [];
 let remoteErrorAccounts = [];
+let openaiGroupsMode = "normal";
+let compositeGroupsMode = "normal";
 const updatedRemoteAccounts = new Map();
 const activeUsageByAccountId = new Map();
 const clearedRemoteAccountIds = new Set();
@@ -30,10 +32,27 @@ const sub2api = http.createServer(async (req, res) => {
     return;
   }
   if (req.method === "GET" && req.url === "/api/v1/admin/groups/all?platform=openai") {
+    if (openaiGroupsMode === "empty") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify([]));
+      return;
+    }
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify([
       { id: 7, name: "测试号池", status: "active" },
       { id: 8, name: "备用号池", status: "active" },
+    ]));
+    return;
+  }
+  if (req.method === "GET" && req.url === "/api/v1/admin/groups/all?platform=composite") {
+    if (compositeGroupsMode === "fail") {
+      res.writeHead(503, { "content-type": "application/json" });
+      res.end(JSON.stringify({ message: "composite groups temporarily unavailable" }));
+      return;
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify([
+      { id: 71, name: "Composite 号池", platform: "composite", status: "active" },
     ]));
     return;
   }
@@ -677,11 +696,25 @@ try {
   assert.equal(groupsResponse.status, 200);
   assert.deepEqual(await groupsResponse.json(), {
     groups: [
-      { id: 7, name: "测试号池", status: "active" },
-      { id: 8, name: "备用号池", status: "active" },
+      { id: 71, name: "Composite 号池", platform: "composite", status: "active" },
+      { id: 7, name: "测试号池", platform: "openai", status: "active" },
+      { id: 8, name: "备用号池", platform: "openai", status: "active" },
     ],
     proxies: [{ id: 3, name: "测试代理", protocol: "http", host: "proxy.example", port: 8080, ipAddress: "203.0.113.10", status: "active" }],
   });
+
+  openaiGroupsMode = "empty";
+  compositeGroupsMode = "fail";
+  const partialGroupsResponse = await fetch(`${baseUrl}/api/sub2api/groups`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ config: { baseUrl: sub2apiUrl, adminApiKey: "test-admin-key" } }),
+  });
+  const partialGroupsText = await partialGroupsResponse.text();
+  assert.equal(partialGroupsResponse.status, 200, partialGroupsText);
+  assert.deepEqual(JSON.parse(partialGroupsText), { groups: [] });
+  openaiGroupsMode = "normal";
+  compositeGroupsMode = "normal";
 
   const settingsConfig = {
     baseUrl: sub2apiUrl,
@@ -745,7 +778,7 @@ try {
     headers,
     body: JSON.stringify({
       ids: [profileJob.id, "missing-job-is-filtered-by-selection-limit"],
-      config: { baseUrl: sub2apiUrl, adminApiKey: "test-admin-key", groupIds: ["7", "8"], proxyId: "3", concurrency: "10", loadFactor: "100", priority: "1", accountNameTemplate: "managed-{email}-{accountId}", modelWhitelist: "gpt-5\ngpt-5-mini", codexFingerprintMode: "full", wsMode: "http_bridge" },
+      config: { baseUrl: sub2apiUrl, adminApiKey: "test-admin-key", groupIds: ["7", "71"], proxyId: "3", concurrency: "10", loadFactor: "100", priority: "1", accountNameTemplate: "managed-{email}-{accountId}", modelWhitelist: "gpt-5\ngpt-5-mini", codexFingerprintMode: "full", wsMode: "http_bridge" },
     }),
   });
   assert.equal(uploadResponse.status, 404);
@@ -755,7 +788,7 @@ try {
     headers,
     body: JSON.stringify({
       ids: [profileJob.id],
-      config: { baseUrl: sub2apiUrl, adminApiKey: "test-admin-key", groupIds: ["7", "8"], proxyId: "3", concurrency: "10", loadFactor: "100", priority: "1", accountNameTemplate: "managed-{email}-{accountId}", modelWhitelist: "gpt-5\ngpt-5-mini", codexFingerprintMode: "full", wsMode: "http_bridge" },
+      config: { baseUrl: sub2apiUrl, adminApiKey: "test-admin-key", groupIds: ["7", "71"], proxyId: "3", concurrency: "10", loadFactor: "100", priority: "1", accountNameTemplate: "managed-{email}-{accountId}", modelWhitelist: "gpt-5\ngpt-5-mini", codexFingerprintMode: "full", wsMode: "http_bridge" },
     }),
   });
   const validUploadText = await validUploadResponse.text();
@@ -763,7 +796,7 @@ try {
   const uploadResult = JSON.parse(validUploadText);
   assert.equal(uploadResult.uploaded, 1);
   assert.equal(uploadResult.result.success, 1);
-  assert.deepEqual(uploadedAccounts[0].group_ids, [7, 8]);
+  assert.deepEqual(uploadedAccounts[0].group_ids, [7, 71]);
   assert.equal(uploadedAccounts[0].proxy_id, 3);
   assert.equal(uploadedAccounts[0].concurrency, 10);
   assert.equal(uploadedAccounts[0].load_factor, 100);
