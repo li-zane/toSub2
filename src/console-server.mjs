@@ -41,7 +41,19 @@ const TOTP_SETUP_RESULT_FILENAME = "totp-setup-result.json";
 const PASSWORD_ADD_RESULT_FILENAME = "password-add-result.json";
 const SUB2API_SETTINGS_FILENAME = "sub2api-settings.json";
 const SUB2API_MONITOR_FILENAME = "sub2api-monitor.json";
+const PLAN_TYPE_MAPPING_FILENAME = "plan-type-mapping.json";
 const SUB2API_WS_MODES = new Set(["off", "ctx_pool", "passthrough", "http_bridge"]);
+const SUB2API_PROFILE_FIELDS = [
+  "groupIds",
+  "proxyId",
+  "concurrency",
+  "loadFactor",
+  "priority",
+  "accountNameTemplate",
+  "modelWhitelist",
+  "codexFingerprintMode",
+  "wsMode",
+];
 const SUB2API_TARGET_GROUP_PLATFORMS = ["openai", "composite"];
 const SUB2API_ACCOUNT_NAME_TEMPLATE_KEYS = new Set([
   "email",
@@ -82,6 +94,7 @@ const OUTPUT_ROOT = path.resolve(
 );
 const SUB2API_MONITOR_PATH = path.join(OUTPUT_ROOT, SUB2API_MONITOR_FILENAME);
 const SUB2API_SETTINGS_PATH = path.join(OUTPUT_ROOT, SUB2API_SETTINGS_FILENAME);
+const PLAN_TYPE_MAPPING_PATH = path.join(OUTPUT_ROOT, PLAN_TYPE_MAPPING_FILENAME);
 const credentialStore = createCredentialStore();
 const consoleToken = crypto.randomBytes(24).toString("base64url");
 const jobs = new Map();
@@ -94,6 +107,13 @@ let queueSchedulingPaused = false;
 let shutdownPromise = null;
 let sub2ApiSettingsConfig = null;
 let sub2ApiMonitorConfig = null;
+// Upload profiles share the global Sub2API connection and monitor switch.
+// The selected profile only carries account-pool/upload behavior.
+let sub2ApiProfiles = new Map();
+let sub2ApiPlanTypeBindings = {};
+let sub2ApiActiveProfileId = "default";
+let planTypeLabelMapping = {};
+let planTypeLabelMappingConfigured = false;
 let sub2ApiMonitorTimer = null;
 let sub2ApiMonitorPromise = null;
 let sub2ApiAccountStatusPromise = null;
@@ -116,6 +136,8 @@ const sub2ApiMonitorState = {
   nextCheckAt: null,
   lastError: null,
   lastResult: null,
+  planTypes: Object.create(null),
+  planTypesBackend: null,
 };
 
 const hostArg = process.argv.find((item) => item.startsWith("--host="));
@@ -142,6 +164,7 @@ if (!Number.isInteger(requestedPort) || requestedPort < 1 || requestedPort > 655
 }
 
 await fs.mkdir(OUTPUT_ROOT, { recursive: true });
+await loadPlanTypeLabelMapping();
 await loadSub2ApiSettingsConfiguration();
 await loadSub2ApiMonitorConfiguration();
 await syncCompletedOutputs(true);
@@ -469,39 +492,50 @@ async function handleApi(req, res, requestUrl) {
   if (req.method === "POST" && requestUrl.pathname === "/api/sub2api/upload") {
     const body = await readJson(req);
     const config = normalizeSub2ApiConfig(body.config);
+    const requestProfileState = normalizeSub2ApiProfileState(body.config, config);
     const selected = resolveSelectedJobs(body.ids);
     const downloadable = selected.filter((job) => job.resultSaved);
     if (downloadable.length === 0) throw httpError(409, "选中的任务里没有已完成的导入文件");
     const payload = await buildSub2ApiUploadPayload(downloadable);
     const idempotencyKey = `tosub2-upload-${crypto.randomUUID()}`;
 
-    const accounts = payload.accounts.map((account) => {
+    const accountsByProfile = new Map();
+    for (const account of payload.accounts) {
+      const accountConfig = resolveSub2ApiConfigForAccount(config, account, requestProfileState);
       const { proxy_key: _proxyKey, ...accountData } = account;
       const credentials = { ...(account.credentials || {}) };
-      const extra = buildSub2ApiAccountExtra(account.extra, config);
-      const accountName = renderSub2ApiAccountName(config.accountNameTemplate, account);
-      if (config.modelWhitelist.length) {
-        credentials.model_mapping = Object.fromEntries(config.modelWhitelist.map((model) => [model, model]));
+      const extra = buildSub2ApiAccountExtra(account.extra, accountConfig);
+      const accountName = renderSub2ApiAccountName(accountConfig.accountNameTemplate, account);
+      if (accountConfig.modelWhitelist.length) {
+        credentials.model_mapping = Object.fromEntries(accountConfig.modelWhitelist.map((model) => [model, model]));
       }
-      return {
+      const prepared = {
         ...accountData,
         ...(accountName ? { name: accountName } : {}),
         credentials,
         extra,
         status: "active",
         schedulable: true,
-        group_ids: config.groupIds.length ? config.groupIds : (account.group_ids || []),
-        ...(config.proxyId ? { proxy_id: config.proxyId } : {}),
-        ...(config.concurrency !== null ? { concurrency: config.concurrency } : {}),
-        ...(config.loadFactor !== null ? { load_factor: config.loadFactor } : {}),
-        ...(config.priority !== null ? { priority: config.priority } : {}),
+        group_ids: accountConfig.groupIds.length ? accountConfig.groupIds : (account.group_ids || []),
+        ...(accountConfig.proxyId ? { proxy_id: accountConfig.proxyId } : {}),
+        ...(accountConfig.concurrency !== null ? { concurrency: accountConfig.concurrency } : {}),
+        ...(accountConfig.loadFactor !== null ? { load_factor: accountConfig.loadFactor } : {}),
+        ...(accountConfig.priority !== null ? { priority: accountConfig.priority } : {}),
       };
-    });
-    const result = await requestSub2Api(config, "/api/v1/admin/accounts/batch", {
-      method: "POST",
-      headers: { "Idempotency-Key": idempotencyKey },
-      body: JSON.stringify({ accounts }),
-    });
+      const profileId = accountConfig.profileId || "default";
+      if (!accountsByProfile.has(profileId)) accountsByProfile.set(profileId, { config: accountConfig, accounts: [] });
+      accountsByProfile.get(profileId).accounts.push(prepared);
+    }
+    const results = [];
+    let profileBatchIndex = 0;
+    for (const { config: accountConfig, accounts } of accountsByProfile.values()) {
+      results.push(await requestSub2Api(accountConfig, "/api/v1/admin/accounts/batch", {
+        method: "POST",
+        headers: { "Idempotency-Key": `${idempotencyKey}-${profileBatchIndex++}` },
+        body: JSON.stringify({ accounts }),
+      }));
+    }
+    const result = results.length === 1 ? results[0] : results;
     invalidateSub2ApiAccountStatusCache();
 
     sendJson(res, 200, {
@@ -603,10 +637,34 @@ async function handleApi(req, res, requestUrl) {
     return;
   }
 
+  if (req.method === "GET" && requestUrl.pathname === "/api/plan-type-mapping") {
+    sendJson(res, 200, {
+      configured: planTypeLabelMappingConfigured,
+      mapping: { ...planTypeLabelMapping },
+    });
+    return;
+  }
+
+  if (req.method === "POST" && requestUrl.pathname === "/api/plan-type-mapping") {
+    const body = await readJson(req);
+    const mapping = normalizePlanTypeLabelMapping(body.mapping);
+    await persistPlanTypeLabelMapping(mapping);
+    planTypeLabelMapping = mapping;
+    planTypeLabelMappingConfigured = true;
+    sendJson(res, 200, {
+      configured: true,
+      mapping: { ...planTypeLabelMapping },
+    });
+    return;
+  }
+
   if (req.method === "POST" && requestUrl.pathname === "/api/sub2api/settings") {
     const body = await readJson(req);
-    const config = normalizeSub2ApiConfig(body.config, { inheritStoredFields: true });
-    sub2ApiSettingsConfig = config;
+    const config = applySub2ApiSettingsBody(body);
+    if (sub2ApiMonitorConfig) {
+      sub2ApiMonitorConfig = { ...config, enabled: sub2ApiMonitorConfig.enabled === true };
+      await persistSub2ApiMonitorConfiguration();
+    }
     invalidateSub2ApiAccountStatusCache();
     await persistSub2ApiSettingsConfiguration();
     sendJson(res, 200, publicSub2ApiSettingsState());
@@ -620,8 +678,7 @@ async function handleApi(req, res, requestUrl) {
 
   if (req.method === "POST" && requestUrl.pathname === "/api/sub2api/monitor") {
     const body = await readJson(req);
-    const config = normalizeSub2ApiConfig(body.config, { inheritStoredFields: true });
-    sub2ApiSettingsConfig = config;
+    const config = applySub2ApiSettingsBody(body);
     invalidateSub2ApiAccountStatusCache();
     await persistSub2ApiSettingsConfiguration();
     sub2ApiMonitorConfig = { ...config, enabled: body.enabled === true };
@@ -2705,7 +2762,12 @@ function normalizeSub2ApiConfig(value, options = {}) {
     }
     return Number(value);
   });
-  const proxyText = String(Object.hasOwn(config, "proxyId") ? config.proxyId : (stored.proxyId || "")).trim();
+  const rawProxyId = Object.hasOwn(config, "proxyId") ? config.proxyId : stored.proxyId;
+  // Serialized legacy settings use 0 for "no proxy"; treat it as empty rather than
+  // rejecting a configuration during the next process start.
+  const proxyText = rawProxyId === 0 || String(rawProxyId ?? "").trim() === "0"
+    ? ""
+    : String(rawProxyId ?? "").trim();
   if (proxyText && (!/^\d+$/.test(proxyText) || Number(proxyText) <= 0 || Number(proxyText) > Number.MAX_SAFE_INTEGER)) {
     throw httpError(400, "代理 ID 无效");
   }
@@ -2734,7 +2796,9 @@ function normalizeSub2ApiConfig(value, options = {}) {
   const modelWhitelist = parseSub2ApiModelWhitelist(
     Object.hasOwn(config, "modelWhitelist") ? config.modelWhitelist : stored.modelWhitelist,
   );
-  const codexFingerprintMode = String(config.codexFingerprintMode || stored.codexFingerprintMode || "session").trim().toLowerCase();
+  const codexFingerprintMode = String(
+    Object.hasOwn(config, "codexFingerprintMode") ? config.codexFingerprintMode : (stored.codexFingerprintMode || "session"),
+  ).trim().toLowerCase() || "session";
   if (!["off", "device", "session", "full"].includes(codexFingerprintMode)) {
     throw httpError(400, "Codex 指纹收敛模式无效");
   }
@@ -2745,7 +2809,139 @@ function normalizeSub2ApiConfig(value, options = {}) {
       ?? stored.wsMode
       ?? "off",
   );
-  return { baseUrl, adminApiKey, groupIds, proxyId, concurrency, loadFactor, priority, accountNameTemplate, modelWhitelist, codexFingerprintMode, wsMode };
+  return { baseUrl, adminApiKey, groupIds, proxyId, concurrency, loadFactor, priority, accountNameTemplate, modelWhitelist, codexFingerprintMode, wsMode, profileId: String(config.profileId || stored.profileId || "default") };
+}
+
+function normalizeSub2ApiProfile(value, fallback = {}, id = "default") {
+  const source = value && typeof value === "object" ? value : {};
+  const merged = { ...fallback, ...source };
+  if (merged.proxyId === 0 || String(merged.proxyId ?? "").trim() === "0") merged.proxyId = "";
+  const normalized = normalizeSub2ApiConfig({
+    baseUrl: "http://127.0.0.1",
+    adminApiKey: "profile-placeholder-key",
+    ...merged,
+  });
+  const profileId = String(source.id ?? id).trim().slice(0, 128) || id;
+  const name = String(source.name ?? profileId).trim().slice(0, 128) || profileId;
+  return {
+    id: profileId,
+    name,
+    ...Object.fromEntries(SUB2API_PROFILE_FIELDS.map((field) => [field, normalized[field]])),
+  };
+}
+
+function profileConfig(profile, globalConfig) {
+  if (!profile) return { ...globalConfig, profileId: globalConfig?.profileId || "default" };
+  return {
+    ...globalConfig,
+    ...profile,
+    profileId: profile.id,
+    baseUrl: globalConfig.baseUrl,
+    adminApiKey: globalConfig.adminApiKey,
+  };
+}
+
+function normalizeSub2ApiPlanTypeBindings(value, profiles = sub2ApiProfiles) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const profileMap = profiles instanceof Map ? profiles : new Map();
+  const bindings = {};
+  for (const [rawPlanType, rawProfileId] of Object.entries(value)) {
+    const planType = normalizePlanType(rawPlanType);
+    const profileId = String(rawProfileId ?? "").trim();
+    if (!planType || !profileId || !profileMap.has(profileId)) continue;
+    const canonicalPlanType = planType.toLowerCase();
+    if (["__proto__", "constructor", "prototype"].includes(canonicalPlanType)) continue;
+    bindings[canonicalPlanType] = profileId;
+  }
+  return bindings;
+}
+
+function resolveSub2ApiProfileBinding(planType, bindings = sub2ApiPlanTypeBindings) {
+  const normalized = normalizePlanType(planType);
+  if (!normalized || !bindings || typeof bindings !== "object") return "";
+  if (Object.hasOwn(bindings, normalized) && bindings[normalized]) return String(bindings[normalized]);
+  const lower = normalized.toLowerCase();
+  const match = Object.entries(bindings).find(([key]) => String(key).toLowerCase() === lower);
+  return match ? String(match[1] || "") : "";
+}
+
+function normalizeSub2ApiProfileState(value, baseConfig) {
+  const source = value && typeof value === "object" ? value : {};
+  if (!Array.isArray(source.profiles)) return null;
+  const profiles = new Map();
+  for (const item of source.profiles) {
+    const id = String(item?.id || "").trim();
+    if (id) {
+      const normalized = normalizeSub2ApiProfile(item, {}, id);
+      profiles.set(normalized.id, normalized);
+    }
+  }
+  if (!profiles.size) return null;
+  if (!profiles.has("default")) {
+    profiles.set("default", normalizeSub2ApiProfile({ ...baseConfig, id: "default" }, {}, "default"));
+  }
+  const bindings = normalizeSub2ApiPlanTypeBindings(source.planTypeBindings, profiles);
+  return { profiles, bindings };
+}
+
+function resolveSub2ApiConfigForAccount(baseConfig, account, requestProfileState = null) {
+  const planType = normalizePlanType(extractPlanTypeFromAccount(account, { preferJwt: false }) || "");
+  const profileState = requestProfileState || { profiles: sub2ApiProfiles, bindings: sub2ApiPlanTypeBindings };
+  const binding = resolveSub2ApiProfileBinding(planType, profileState.bindings);
+  // Explicit upload config remains authoritative for legacy callers. A bound
+  // plan type is the only case where the persisted profile overrides it.
+  if (!binding) return { ...baseConfig, profileId: baseConfig?.profileId || "default" };
+  const profileId = String(binding);
+  const profile = profileState.profiles.get(profileId) || profileState.profiles.get("default");
+  return profile ? profileConfig(profile, baseConfig) : { ...baseConfig, profileId };
+}
+
+function applySub2ApiSettingsBody(body = {}) {
+  const rawConfig = body.config && typeof body.config === "object" ? body.config : body;
+  const config = normalizeSub2ApiConfig(rawConfig, { inheritStoredFields: true });
+  const rawProfiles = Array.isArray(body.profiles)
+    ? body.profiles
+    : Array.isArray(rawConfig.profiles) ? rawConfig.profiles : null;
+  const nextProfiles = new Map();
+  if (rawProfiles) {
+    for (const item of rawProfiles) {
+      const id = String(item?.id || "").trim();
+      if (!id || id.length > 128) throw httpError(400, "配置方案 ID 无效");
+      const previous = sub2ApiProfiles.get(id) || {};
+      const normalized = normalizeSub2ApiProfile(item, previous, id);
+      nextProfiles.set(normalized.id, normalized);
+    }
+  } else {
+    // Older clients only send the legacy top-level profile fields. Preserve
+    // every stored profile in that case and update only the active one.
+    for (const [id, profile] of sub2ApiProfiles.entries()) {
+      nextProfiles.set(profile.id || id, { ...profile });
+    }
+    const profileId = String(rawConfig.profileId || sub2ApiActiveProfileId || "default").trim() || "default";
+    const previous = nextProfiles.get(profileId) || {};
+    nextProfiles.set(profileId, normalizeSub2ApiProfile(rawConfig, previous, profileId));
+  }
+  if (!nextProfiles.size) {
+    const profileId = String(rawConfig.profileId || sub2ApiActiveProfileId || "default");
+    const normalized = normalizeSub2ApiProfile(rawConfig, sub2ApiProfiles.get(profileId) || {}, profileId);
+    nextProfiles.set(normalized.id, normalized);
+  }
+  if (!nextProfiles.has("default")) {
+    nextProfiles.set("default", normalizeSub2ApiProfile({ ...config, id: "default" }, {}, "default"));
+  }
+  sub2ApiProfiles = nextProfiles;
+  const bindings = body.planTypeBindings ?? rawConfig.planTypeBindings ?? sub2ApiPlanTypeBindings;
+  sub2ApiPlanTypeBindings = normalizeSub2ApiPlanTypeBindings(bindings, sub2ApiProfiles);
+  sub2ApiActiveProfileId = String(
+    body.activeProfileId
+      || rawConfig.activeProfileId
+      || rawConfig.profileId
+      || sub2ApiActiveProfileId
+      || "default",
+  );
+  if (!sub2ApiProfiles.has(sub2ApiActiveProfileId)) sub2ApiActiveProfileId = "default";
+  sub2ApiSettingsConfig = profileConfig(sub2ApiProfiles.get(sub2ApiActiveProfileId), config);
+  return sub2ApiSettingsConfig;
 }
 
 function normalizeSub2ApiAccountNameTemplate(value) {
@@ -2764,7 +2960,7 @@ function normalizeSub2ApiAccountNameTemplate(value) {
 function renderSub2ApiAccountName(template, account) {
   if (!template) return String(account?.name || "").trim().slice(0, 256);
   const email = sub2ApiAccountEmail(account) || "";
-  const planType = extractPlanTypeFromAccount(account) || "";
+  const planType = extractPlanTypeFromAccount(account, { preferJwt: false }) || "";
   const accountId = String(
     account?.id
       ?? account?.account_id
@@ -2900,6 +3096,7 @@ function serializeSub2ApiConfig(config) {
     modelWhitelist: config.modelWhitelist,
     codexFingerprintMode: config.codexFingerprintMode,
     wsMode: config.wsMode,
+    profileId: config.profileId || "default",
   };
 }
 
@@ -2911,18 +3108,52 @@ function publicSub2ApiConfig(config) {
 
 function publicSub2ApiSettingsState() {
   const config = sub2ApiSettingsConfig || sub2ApiMonitorConfig;
+  const publicProfiles = [...sub2ApiProfiles.values()].map((profile) => ({ ...profile }));
   return {
     configured: Boolean(config?.baseUrl && config?.adminApiKey),
     hasAdminApiKey: Boolean(config?.adminApiKey),
     monitorEnabled: Boolean(sub2ApiMonitorConfig?.enabled),
     config: publicSub2ApiConfig(config),
+    baseUrl: config?.baseUrl || null,
+    profiles: publicProfiles,
+    planTypeBindings: { ...sub2ApiPlanTypeBindings },
+    activeProfileId: sub2ApiActiveProfileId,
   };
 }
 
 async function loadSub2ApiSettingsConfiguration() {
   try {
     const saved = JSON.parse(await fs.readFile(SUB2API_SETTINGS_PATH, "utf8"));
-    sub2ApiSettingsConfig = normalizeSub2ApiConfig(saved.config);
+    let needsMigration = saved.version !== 2 || !Array.isArray(saved.profiles);
+    sub2ApiSettingsConfig = normalizeSub2ApiConfig(saved.config || saved);
+    sub2ApiProfiles = new Map();
+    const profiles = Array.isArray(saved.profiles) ? saved.profiles : [];
+    for (const item of profiles) {
+      const id = String(item?.id || "").trim();
+      if (id) {
+        const normalized = normalizeSub2ApiProfile(item, {}, id);
+        sub2ApiProfiles.set(normalized.id, normalized);
+      }
+    }
+    if (!sub2ApiProfiles.size) {
+      sub2ApiProfiles.set("default", normalizeSub2ApiProfile(saved.config || {}, {}, "default"));
+    } else if (!sub2ApiProfiles.has("default")) {
+      // Keep the settings invariant even for hand-edited or partially written
+      // v2 files. The first profile remains available under its original ID.
+      const firstProfile = sub2ApiProfiles.values().next().value;
+      sub2ApiProfiles.set("default", normalizeSub2ApiProfile({ ...firstProfile, id: "default" }, {}, "default"));
+      needsMigration = true;
+    }
+    sub2ApiActiveProfileId = String(saved.activeProfileId || sub2ApiSettingsConfig.profileId || "default");
+    if (!sub2ApiProfiles.has(sub2ApiActiveProfileId)) {
+      sub2ApiActiveProfileId = sub2ApiProfiles.has("default")
+        ? "default"
+        : sub2ApiProfiles.keys().next().value;
+      needsMigration = true;
+    }
+    sub2ApiPlanTypeBindings = normalizeSub2ApiPlanTypeBindings(saved.planTypeBindings, sub2ApiProfiles);
+    sub2ApiSettingsConfig = profileConfig(sub2ApiProfiles.get(sub2ApiActiveProfileId), sub2ApiSettingsConfig);
+    if (needsMigration) await persistSub2ApiSettingsConfiguration();
   } catch (error) {
     if (error?.code !== "ENOENT") {
       console.warn(`[warn] Sub2API 设置配置无法读取：${String(error?.message || error).slice(0, 180)}`);
@@ -2934,8 +3165,11 @@ async function loadSub2ApiSettingsConfiguration() {
 async function persistSub2ApiSettingsConfiguration() {
   if (!sub2ApiSettingsConfig) return;
   const payload = {
-    version: 1,
+    version: 2,
     config: serializeSub2ApiConfig(sub2ApiSettingsConfig),
+    profiles: [...sub2ApiProfiles.values()].map((profile) => ({ ...profile })),
+    planTypeBindings: { ...sub2ApiPlanTypeBindings },
+    activeProfileId: sub2ApiActiveProfileId,
     updatedAt: new Date().toISOString(),
   };
   const tempPath = `${SUB2API_SETTINGS_PATH}.${process.pid}.${crypto.randomUUID()}.tmp`;
@@ -2946,16 +3180,40 @@ async function persistSub2ApiSettingsConfiguration() {
 async function loadSub2ApiMonitorConfiguration() {
   try {
     const saved = JSON.parse(await fs.readFile(SUB2API_MONITOR_PATH, "utf8"));
-    const config = normalizeSub2ApiConfig(saved.config);
-    sub2ApiMonitorConfig = { ...config, enabled: saved.enabled === true };
     if (!sub2ApiSettingsConfig) {
-      sub2ApiSettingsConfig = config;
+      // Older deployments only persisted the monitor file. Migrate its
+      // connection/profile fields once, then use the canonical settings state.
+      const legacyConfig = normalizeSub2ApiConfig(saved.config || saved);
+      sub2ApiSettingsConfig = legacyConfig;
+      if (!sub2ApiProfiles.size) {
+        const savedProfiles = Array.isArray(saved.profiles) ? saved.profiles : [];
+        for (const item of savedProfiles) {
+          const id = String(item?.id || "").trim();
+          if (!id) continue;
+          const normalized = normalizeSub2ApiProfile(item, {}, id);
+          sub2ApiProfiles.set(normalized.id, normalized);
+        }
+      }
+      if (!sub2ApiProfiles.size) sub2ApiProfiles.set("default", normalizeSub2ApiProfile(legacyConfig, {}, "default"));
+      if (!sub2ApiProfiles.has("default")) {
+        const firstProfile = sub2ApiProfiles.values().next().value;
+        sub2ApiProfiles.set("default", normalizeSub2ApiProfile({ ...firstProfile, id: "default" }, {}, "default"));
+      }
+      sub2ApiPlanTypeBindings = normalizeSub2ApiPlanTypeBindings(saved.planTypeBindings, sub2ApiProfiles);
+      sub2ApiActiveProfileId = String(saved.activeProfileId || "default");
+      if (!sub2ApiProfiles.has(sub2ApiActiveProfileId)) sub2ApiActiveProfileId = "default";
+      sub2ApiSettingsConfig = profileConfig(sub2ApiProfiles.get(sub2ApiActiveProfileId), legacyConfig);
       await persistSub2ApiSettingsConfiguration();
     }
+    sub2ApiMonitorConfig = { ...sub2ApiSettingsConfig, enabled: saved.enabled === true };
     sub2ApiMonitorState.lastCheckAt = saved.state?.lastCheckAt || null;
     sub2ApiMonitorState.lastError = saved.state?.lastError || null;
     sub2ApiMonitorState.lastResult = saved.state?.lastResult && typeof saved.state.lastResult === "object"
       ? saved.state.lastResult
+      : null;
+    sub2ApiMonitorState.planTypes = normalizeSub2ApiPlanTypeState(saved.state?.planTypes);
+    sub2ApiMonitorState.planTypesBackend = typeof saved.state?.planTypesBackend === "string"
+      ? saved.state.planTypesBackend
       : null;
   } catch (error) {
     if (error?.code !== "ENOENT") {
@@ -2973,10 +3231,15 @@ async function persistSub2ApiMonitorConfiguration() {
     version: 1,
     enabled: Boolean(sub2ApiMonitorConfig.enabled),
     config: serializeSub2ApiConfig(sub2ApiMonitorConfig),
+    profiles: [...sub2ApiProfiles.values()].map((profile) => ({ ...profile })),
+    planTypeBindings: { ...sub2ApiPlanTypeBindings },
+    activeProfileId: sub2ApiActiveProfileId,
     state: {
       lastCheckAt: sub2ApiMonitorState.lastCheckAt,
       lastError: sub2ApiMonitorState.lastError,
       lastResult: sub2ApiMonitorState.lastResult,
+      planTypes: sub2ApiMonitorState.planTypes,
+      planTypesBackend: sub2ApiMonitorState.planTypesBackend,
     },
     updatedAt: new Date().toISOString(),
   };
@@ -2994,6 +3257,9 @@ function publicSub2ApiMonitorState() {
     baseUrl: config?.baseUrl || null,
     groupIds: config?.groupIds || [],
     config: publicSub2ApiConfig(config),
+    profiles: [...sub2ApiProfiles.values()].map((profile) => ({ ...profile })),
+    planTypeBindings: { ...sub2ApiPlanTypeBindings },
+    activeProfileId: sub2ApiActiveProfileId,
     intervalMinutes: Math.max(1, Math.round(SUB2API_MONITOR_INTERVAL_MS / 60_000)),
     cooldownMinutes: Math.max(1, Math.round(SUB2API_AUTO_REPAIR_COOLDOWN_MS / 60_000)),
     running: sub2ApiMonitorState.running,
@@ -3002,6 +3268,49 @@ function publicSub2ApiMonitorState() {
     lastError: sub2ApiMonitorState.lastError,
     lastResult: sub2ApiMonitorState.lastResult,
   };
+}
+
+function normalizePlanTypeLabelMapping(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw httpError(400, "PlanType 映射必须是对象");
+  }
+  const mapping = {};
+  for (const [rawKey, rawLabel] of Object.entries(value).slice(0, 100)) {
+    const key = String(rawKey || "").trim();
+    const label = String(rawLabel || "").trim();
+    if (!key && !label) continue;
+    if (!key || !label || key.length > 128 || label.length > 128 || /[\r\n]/.test(key) || /[\r\n]/.test(label)) {
+      throw httpError(400, "PlanType 映射项格式不正确");
+    }
+    if (["__proto__", "constructor", "prototype"].includes(key.toLowerCase())) continue;
+    mapping[key] = label;
+  }
+  return mapping;
+}
+
+async function loadPlanTypeLabelMapping() {
+  try {
+    const saved = JSON.parse(await fs.readFile(PLAN_TYPE_MAPPING_PATH, "utf8"));
+    planTypeLabelMapping = normalizePlanTypeLabelMapping(saved.mapping ?? saved);
+    planTypeLabelMappingConfigured = true;
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      console.warn(`[warn] PlanType 映射无法读取：${String(error?.message || error).slice(0, 180)}`);
+    }
+    planTypeLabelMapping = {};
+    planTypeLabelMappingConfigured = false;
+  }
+}
+
+async function persistPlanTypeLabelMapping(mapping) {
+  const payload = {
+    version: 1,
+    mapping: { ...mapping },
+    updatedAt: new Date().toISOString(),
+  };
+  const tempPath = `${PLAN_TYPE_MAPPING_PATH}.${process.pid}.${crypto.randomUUID()}.tmp`;
+  await fs.writeFile(tempPath, `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 });
+  await fs.rename(tempPath, PLAN_TYPE_MAPPING_PATH);
 }
 
 function scheduleSub2ApiMonitor() {
@@ -3028,6 +3337,9 @@ async function runSub2ApiMonitor(trigger = "scheduled") {
   if (!sub2ApiMonitorConfig?.enabled) throw httpError(409, "Sub2API 号池监控未启用");
   if (sub2ApiMonitorPromise) return sub2ApiMonitorPromise;
   const config = { ...sub2ApiMonitorConfig, groupIds: [...sub2ApiMonitorConfig.groupIds] };
+  const profileState = snapshotSub2ApiProfileState();
+  const monitorGroupIds = sub2ApiMonitorGroupIds(config, profileState);
+  const backend = monitorBackendIdentity(config);
   sub2ApiMonitorPromise = (async () => {
     sub2ApiMonitorState.running = true;
     sub2ApiMonitorState.lastError = null;
@@ -3044,16 +3356,72 @@ async function runSub2ApiMonitor(trigger = "scheduled") {
       cooldown: 0,
       outsideGroups: 0,
       missingEmail: 0,
+      planTypeChecked: 0,
+      planTypeChanged: 0,
+      planTypeChanges: 0,
+      planTypeUpdated: 0,
+      planTypeSkipped: 0,
+      planTypeUpdateFailed: 0,
+      planTypeScanIncomplete: false,
     };
     try {
       await syncCompletedOutputs(true);
-      await retryPendingSub2ApiUploads(config, summary);
+      await retryPendingSub2ApiUploads(config, summary, profileState);
       if (shuttingDown) throw httpError(503, "服务正在关闭，已停止号池巡检");
+      const accountListing = await listSub2ApiAccounts(config, { withMeta: true });
+      const allRemoteAccounts = accountListing.accounts;
+      if (accountListing.complete) {
+        const previousPlanTypes = sub2ApiMonitorState.planTypesBackend === backend
+          ? normalizeSub2ApiPlanTypeState(sub2ApiMonitorState.planTypes)
+          : Object.create(null);
+        const nextPlanTypes = Object.create(null);
+        for (const account of allRemoteAccounts) {
+          const accountId = normalizeSub2ApiAccountId(account?.id);
+          if (!accountId) continue;
+          summary.planTypeChecked += 1;
+          const planType = normalizePlanType(extractPlanTypeFromAccount(account, { preferJwt: false }) || "");
+          const previous = Object.hasOwn(previousPlanTypes, accountId)
+            ? normalizePlanType(previousPlanTypes[accountId] || "")
+            : "";
+          // A transiently missing PlanType must not erase a known baseline;
+          // otherwise the next restored value would look like a first sighting.
+          if (!planType && previous) {
+            nextPlanTypes[accountId] = previous;
+            continue;
+          }
+          nextPlanTypes[accountId] = planType || null;
+          if (!previous || !planType || previous === planType) continue;
+          const profileId = resolveSub2ApiProfileBinding(planType, profileState.bindings);
+          const profile = profileId ? profileState.profiles.get(profileId) : null;
+          if (!profile) {
+            summary.planTypeSkipped += 1;
+            continue;
+          }
+          summary.planTypeChanged += 1;
+          summary.planTypeChanges += 1;
+          try {
+            if (await updateSub2ApiAccountFromProfile(config, account, profile)) summary.planTypeUpdated += 1;
+          } catch (error) {
+            summary.planTypeUpdateFailed += 1;
+            // Keep the previous value so the next scheduled check retries the PUT.
+            nextPlanTypes[accountId] = previous || null;
+            console.warn(`[warn] Sub2API 账号 ${accountId} 配置方案更新失败：${String(error?.message || error).slice(0, 180)}`);
+          }
+        }
+        sub2ApiMonitorState.planTypes = nextPlanTypes;
+        sub2ApiMonitorState.planTypesBackend = backend;
+        if (summary.planTypeUpdated) invalidateSub2ApiAccountStatusCache();
+      } else {
+        summary.planTypeScanIncomplete = true;
+        // Keep the last complete baseline. Applying changes from a partial
+        // page could mistake a temporarily truncated response for a PlanType
+        // transition and update the wrong account.
+      }
       const remoteAccounts = await listSub2ApiErrorAccounts(config);
       summary.checked = remoteAccounts.length;
       const grouped = new Map();
       for (const account of remoteAccounts) {
-        if (!isSub2ApiAccountInMonitoredGroups(account, config.groupIds)) {
+        if (!isSub2ApiAccountInMonitoredGroups(account, monitorGroupIds)) {
           summary.outsideGroups += 1;
           continue;
         }
@@ -3093,7 +3461,7 @@ async function runSub2ApiMonitor(trigger = "scheduled") {
             return;
           }
 
-          const operation = createSub2ApiAutoRepairOperation(config, accounts);
+          const operation = createSub2ApiAutoRepairOperation(config, accounts, profileState);
           await forceReloginJob(job, {}, { autoRepair: operation });
           appendJobLog(job, `[monitor] Sub2API 号池发现 ${accounts.length} 条异常记录，已自动加入重新登录并授权队列。\n`);
           await saveJobMetadata(job);
@@ -3119,7 +3487,33 @@ async function runSub2ApiMonitor(trigger = "scheduled") {
   return sub2ApiMonitorPromise;
 }
 
-function createSub2ApiAutoRepairOperation(config, accounts) {
+async function updateSub2ApiAccountFromProfile(globalConfig, remoteAccount, profile) {
+  const accountId = normalizeSub2ApiAccountId(remoteAccount?.id);
+  if (!accountId) return false;
+  const accountConfig = profileConfig(profile, globalConfig);
+  const body = {};
+  if (Array.isArray(accountConfig.groupIds) && accountConfig.groupIds.length) body.group_ids = accountConfig.groupIds;
+  if (accountConfig.proxyId) body.proxy_id = accountConfig.proxyId;
+  if (accountConfig.concurrency !== null) body.concurrency = accountConfig.concurrency;
+  if (accountConfig.loadFactor !== null) body.load_factor = accountConfig.loadFactor;
+  if (accountConfig.priority !== null) body.priority = accountConfig.priority;
+  const accountName = renderSub2ApiAccountName(accountConfig.accountNameTemplate, remoteAccount);
+  if (accountName) body.name = accountName;
+  body.extra = buildSub2ApiAccountExtra(remoteAccount.extra, accountConfig);
+  if (accountConfig.modelWhitelist.length) {
+    body.credentials = {
+      ...(remoteAccount.credentials && typeof remoteAccount.credentials === "object" ? remoteAccount.credentials : {}),
+      model_mapping: Object.fromEntries(accountConfig.modelWhitelist.map((model) => [model, model])),
+    };
+  }
+  await requestSub2Api(globalConfig, `/api/v1/admin/accounts/${encodeURIComponent(accountId)}`, {
+    method: "PUT",
+    body: JSON.stringify(body),
+  });
+  return true;
+}
+
+function createSub2ApiAutoRepairOperation(config, accounts, profileState = snapshotSub2ApiProfileState()) {
   const validAccounts = accounts.filter((account) => {
     const id = Number(account?.id);
     return Number.isSafeInteger(id) && id > 0;
@@ -3129,12 +3523,14 @@ function createSub2ApiAutoRepairOperation(config, accounts) {
     accounts: validAccounts,
     backend: monitorBackendIdentity(config),
     config,
+    profileState,
     startedAt: new Date().toISOString(),
   };
 }
 
-async function retryPendingSub2ApiUploads(config, summary) {
+async function retryPendingSub2ApiUploads(config, summary, profileState = snapshotSub2ApiProfileState()) {
   const backend = monitorBackendIdentity(config);
+  const legacyBackend = legacyMonitorBackendIdentity(config);
   for (const candidate of listUniqueJobs()) {
     await withEmailJobLock(candidate.email, async () => {
       const job = findJobByEmail(candidate.email);
@@ -3144,7 +3540,7 @@ async function retryPendingSub2ApiUploads(config, summary) {
       if (
         !job
         || pendingIds.length === 0
-        || job.autoRepairPendingBackend !== backend
+        || ![backend, legacyBackend].includes(job.autoRepairPendingBackend)
         || !job.resultSaved
         || job.status !== "completed"
         || job.autoRepairOperation
@@ -3153,11 +3549,18 @@ async function retryPendingSub2ApiUploads(config, summary) {
 
       const accounts = [];
       const missingIds = [];
+      const expectedEmail = String(job.email || "").trim().toLowerCase();
       try {
         for (const accountId of pendingIds) {
           const account = await getSub2ApiAccount(config, accountId);
-          if (account) accounts.push(account);
-          else missingIds.push(accountId);
+          const remoteEmail = account && sub2ApiAccountEmail(account);
+          if (account && remoteEmail === expectedEmail) accounts.push(account);
+          else {
+            missingIds.push(accountId);
+            if (account) {
+              appendJobLog(job, `[monitor] 待重传账号 ${accountId} 的邮箱与任务不一致，已停止更新以避免覆盖错误账号。\n`);
+            }
+          }
         }
       } catch (error) {
         job.autoRepairLastAttemptAt = new Date().toISOString();
@@ -3181,7 +3584,7 @@ async function retryPendingSub2ApiUploads(config, summary) {
         return;
       }
 
-      job.autoRepairOperation = createSub2ApiAutoRepairOperation(config, accounts);
+      job.autoRepairOperation = createSub2ApiAutoRepairOperation(config, accounts, profileState);
       job.autoRepairLastAttemptAt = new Date().toISOString();
       appendJobLog(job, `[monitor] 正在重传 ${accounts.length} 条上次未完成的 Sub2API 更新，不重复登录。\n`);
       if (await finishSub2ApiAutoRepairSuccess(job)) summary.updated += accounts.length;
@@ -3193,7 +3596,7 @@ async function getSub2ApiAccount(config, accountId) {
   try {
     const payload = await requestSub2Api(config, `/api/v1/admin/accounts/${accountId}`);
     const account = payload?.data && typeof payload.data === "object" ? payload.data : payload;
-    if (!account || Number(account.id) !== Number(accountId)) {
+    if (!account || normalizeSub2ApiAccountId(account.id) !== normalizeSub2ApiAccountId(accountId)) {
       throw new Error(`Sub2API 账号 ${accountId} 返回数据不完整`);
     }
     return account;
@@ -3528,7 +3931,23 @@ function getJobPlanType(job, state = sub2ApiAccountStatusCache) {
 
 function normalizeSub2ApiAccountId(value) {
   const id = String(value ?? "").trim();
-  return id && id.length <= 128 && !/[/?#]/.test(id) ? id : null;
+  return id
+    && id.length <= 128
+    && !/[/?#]/.test(id)
+    && !["__proto__", "constructor", "prototype"].includes(id.toLowerCase())
+    ? id
+    : null;
+}
+
+function normalizeSub2ApiPlanTypeState(value) {
+  const normalized = Object.create(null);
+  if (!value || typeof value !== "object" || Array.isArray(value)) return normalized;
+  for (const [rawId, rawPlanType] of Object.entries(value)) {
+    const accountId = normalizeSub2ApiAccountId(rawId);
+    if (!accountId) continue;
+    normalized[accountId] = normalizePlanType(rawPlanType) || null;
+  }
+  return normalized;
 }
 
 function sub2ApiAccountGroupIds(account) {
@@ -3571,8 +3990,10 @@ function mergeSub2ApiBoolean(current, next) {
   return current === true && next === true;
 }
 
-async function listSub2ApiAccounts(config) {
+async function listSub2ApiAccounts(config, options = {}) {
   const accounts = [];
+  const withMeta = options?.withMeta === true;
+  let complete = true;
   const pageSize = 100;
   let page = 1;
   let pages = 1;
@@ -3598,18 +4019,21 @@ async function listSub2ApiAccounts(config) {
                 ? data.accounts
                 : Array.isArray(payload?.accounts)
                   ? payload.accounts
-                  : [];
-    accounts.push(...items.filter((account) => account && typeof account === "object"));
+                  : null;
+    if (!items) complete = false;
+    const pageItems = items || [];
+    accounts.push(...pageItems.filter((account) => account && typeof account === "object"));
     const reportedPages = Number(data?.pages ?? data?.total_pages ?? data?.totalPages);
     const reportedTotal = Number(data?.total ?? data?.total_count ?? data?.count);
     pages = Number.isSafeInteger(reportedPages) && reportedPages > 0
       ? reportedPages
       : Number.isSafeInteger(reportedTotal) && reportedTotal >= 0
         ? Math.max(page, Math.ceil(reportedTotal / pageSize))
-        : items.length >= pageSize ? page + 1 : page;
+        : pageItems.length >= pageSize ? page + 1 : page;
     page += 1;
   } while (page <= pages && page <= 1_000);
-  return accounts;
+  if (page <= pages) complete = false;
+  return withMeta ? { accounts, complete } : accounts;
 }
 
 async function listSub2ApiTargetGroups(config) {
@@ -3649,15 +4073,43 @@ async function listSub2ApiTargetGroups(config) {
 
 function isSub2ApiAccountInMonitoredGroups(account, groupIds) {
   if (!groupIds.length) return true;
-  const accountGroupIds = [
-    ...(Array.isArray(account?.group_ids) ? account.group_ids : []),
-    ...(Array.isArray(account?.account_groups) ? account.account_groups.map((item) => item?.group_id) : []),
-  ].map(Number).filter(Number.isSafeInteger);
+  const accountGroupIds = sub2ApiAccountGroupIds(account)
+    .map(Number)
+    .filter(Number.isSafeInteger);
   return groupIds.some((id) => accountGroupIds.includes(Number(id)));
 }
 
+function sub2ApiMonitorGroupIds(activeConfig, profileState = null) {
+  const profiles = [...(profileState?.profiles || sub2ApiProfiles).values()];
+  if (!profiles.length) return [...(activeConfig?.groupIds || [])];
+  // An empty group selection means "all OpenAI accounts". Keep that meaning
+  // when any profile is configured that way; otherwise monitor the union so a
+  // plan bound to a non-active profile is not skipped.
+  if (profiles.some((profile) => !Array.isArray(profile.groupIds) || profile.groupIds.length === 0)) return [];
+  return [...new Set(profiles.flatMap((profile) => profile.groupIds).map(Number).filter(Number.isSafeInteger))];
+}
+
+function snapshotSub2ApiProfileState() {
+  return {
+    profiles: new Map([...sub2ApiProfiles.entries()].map(([id, profile]) => [id, { ...profile }])),
+    bindings: { ...sub2ApiPlanTypeBindings },
+  };
+}
+
 function monitorBackendIdentity(config) {
-  return crypto.createHash("sha256").update(String(config?.baseUrl || "")).digest("hex").slice(0, 24);
+  // Include the key fingerprint so a tenant/key rotation cannot reuse an
+  // account-ID PlanType baseline from a different Sub2API installation.
+  return crypto.createHash("sha256")
+    .update(`${String(config?.baseUrl || "")}\0${String(config?.adminApiKey || "")}`)
+    .digest("hex")
+    .slice(0, 24);
+}
+
+function legacyMonitorBackendIdentity(config) {
+  return crypto.createHash("sha256")
+    .update(String(config?.baseUrl || ""))
+    .digest("hex")
+    .slice(0, 24);
 }
 
 function isAutoRepairCoolingDown(job) {
@@ -3702,19 +4154,54 @@ async function performSub2ApiAutoRepairSuccess(job) {
     for (const remoteAccount of operation.accounts) {
       const accountId = Number(remoteAccount.id);
       if (!Number.isSafeInteger(accountId) || accountId <= 0) continue;
+      // An error account can have a different PlanType from the monitor's active
+      // profile. Resolve the bound profile per remote account before writing the
+      // repaired credentials, otherwise auto-repair silently applies the active
+      // profile to every account in the operation.
+      const remotePlanType = extractPlanTypeFromAccount(remoteAccount, { preferJwt: false });
+      const localPlanType = extractPlanTypeFromAccount(localAccount, { preferJwt: false });
+      const profileAccount = {
+        ...localAccount,
+        ...remoteAccount,
+        id: remoteAccount.id,
+        name: remoteAccount.name,
+        credentials: {
+          ...(localAccount.credentials && typeof localAccount.credentials === "object" ? localAccount.credentials : {}),
+          ...(remoteAccount.credentials && typeof remoteAccount.credentials === "object" ? remoteAccount.credentials : {}),
+        },
+        extra: {
+          ...(localAccount.extra && typeof localAccount.extra === "object" ? localAccount.extra : {}),
+          ...(remoteAccount.extra && typeof remoteAccount.extra === "object" ? remoteAccount.extra : {}),
+        },
+      };
+      if (remotePlanType || localPlanType) profileAccount.plan_type = remotePlanType || localPlanType;
+      const accountConfig = resolveSub2ApiConfigForAccount(operation.config, profileAccount, operation.profileState);
       const credentials = {
         ...(remoteAccount.credentials && typeof remoteAccount.credentials === "object" ? remoteAccount.credentials : {}),
         ...localAccount.credentials,
       };
-      const extra = buildSub2ApiAccountExtra(remoteAccount.extra, operation.config);
-      const accountName = renderSub2ApiAccountName(operation.config.accountNameTemplate, {
+      if (accountConfig.modelWhitelist.length) {
+        credentials.model_mapping = Object.fromEntries(accountConfig.modelWhitelist.map((model) => [model, model]));
+      }
+      const extra = buildSub2ApiAccountExtra(remoteAccount.extra, accountConfig);
+      const accountName = renderSub2ApiAccountName(accountConfig.accountNameTemplate, {
         ...localAccount,
         id: remoteAccount.id,
         name: remoteAccount.name,
       });
+      const accountUpdate = {
+        credentials,
+        extra,
+        ...(accountName ? { name: accountName } : {}),
+        ...(accountConfig.groupIds.length ? { group_ids: accountConfig.groupIds } : {}),
+        ...(accountConfig.proxyId ? { proxy_id: accountConfig.proxyId } : {}),
+        ...(accountConfig.concurrency !== null ? { concurrency: accountConfig.concurrency } : {}),
+        ...(accountConfig.loadFactor !== null ? { load_factor: accountConfig.loadFactor } : {}),
+        ...(accountConfig.priority !== null ? { priority: accountConfig.priority } : {}),
+      };
       await requestSub2Api(operation.config, `/api/v1/admin/accounts/${accountId}`, {
         method: "PUT",
-        body: JSON.stringify({ credentials, extra, ...(accountName ? { name: accountName } : {}) }),
+        body: JSON.stringify(accountUpdate),
       });
       await requestSub2Api(operation.config, `/api/v1/admin/accounts/${accountId}/clear-error`, {
         method: "POST",

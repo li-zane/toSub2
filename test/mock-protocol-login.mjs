@@ -294,6 +294,8 @@ async function writeCompleted(outputPath, email, tokenPrefix = "test") {
     name: `oauth---${email}`,
     platform: "openai",
     type: "oauth",
+    ...(email === "account-profile@example.com" ? { plan_type: "free" } : {}),
+    ...(email === "password-mail@example.com" ? { plan_type: "self_serve_business_prolite" } : {}),
     credentials: {
       access_token: `${tokenPrefix}-access-${email}`,
       chatgpt_account_id: `test-account-${email}`,

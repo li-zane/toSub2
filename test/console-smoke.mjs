@@ -16,7 +16,10 @@ const officialUrl = `http://127.0.0.1:${officialPort}`;
 const sub2apiPort = await findAvailablePort();
 const sub2apiUrl = `http://127.0.0.1:${sub2apiPort}`;
 let uploadedAccounts = [];
+let batchUploadCount = 0;
+const uploadedBatches = [];
 let remoteErrorAccounts = [];
+const acceptedAdminKeys = new Set(["test-admin-key", "rotated-admin-key"]);
 let openaiGroupsMode = "normal";
 let compositeGroupsMode = "normal";
 const updatedRemoteAccounts = new Map();
@@ -26,7 +29,7 @@ const scheduledRemoteAccounts = new Map();
 const clearRemoteCounts = new Map();
 const failClearOnce = new Set();
 const sub2api = http.createServer(async (req, res) => {
-  if (req.headers["x-api-key"] !== "test-admin-key") {
+  if (!acceptedAdminKeys.has(req.headers["x-api-key"])) {
     res.writeHead(401, { "content-type": "application/json" });
     res.end(JSON.stringify({ message: "invalid admin key" }));
     return;
@@ -65,7 +68,9 @@ const sub2api = http.createServer(async (req, res) => {
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
     const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    batchUploadCount += 1;
     uploadedAccounts = body.accounts || [];
+    uploadedBatches.push(uploadedAccounts);
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ success: uploadedAccounts.length, failed: 0, results: [] }));
     return;
@@ -289,6 +294,31 @@ try {
     body: JSON.stringify({ config: { method: "GET", headers: {} } }),
   });
   assert.equal(resetMailRequestConfigResponse.status, 200, await resetMailRequestConfigResponse.text());
+
+  const initialPlanTypeMappingResponse = await fetch(`${baseUrl}/api/plan-type-mapping`, { headers });
+  const initialPlanTypeMapping = await initialPlanTypeMappingResponse.json();
+  assert.equal(initialPlanTypeMappingResponse.status, 200);
+  assert.equal(initialPlanTypeMapping.configured, false);
+  const planTypeMappingSaveResponse = await fetch(`${baseUrl}/api/plan-type-mapping`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      mapping: {
+        free: "Free Tier",
+        self_serve_business_prolite: "Business Premium Custom",
+        self_serve_business_usage_based: "Business Usage Based Custom",
+      },
+    }),
+  });
+  const planTypeMappingSaveText = await planTypeMappingSaveResponse.text();
+  assert.equal(planTypeMappingSaveResponse.status, 200, planTypeMappingSaveText);
+  const savedPlanTypeMapping = JSON.parse(planTypeMappingSaveText);
+  assert.equal(savedPlanTypeMapping.configured, true);
+  assert.equal(savedPlanTypeMapping.mapping.self_serve_business_prolite, "Business Premium Custom");
+  const persistedPlanTypeMapping = JSON.parse(await fs.readFile(path.join(outputRoot, "plan-type-mapping.json"), "utf8"));
+  assert.equal(persistedPlanTypeMapping.mapping.free, "Free Tier");
+  const rereadPlanTypeMapping = await fetch(`${baseUrl}/api/plan-type-mapping`, { headers }).then((response) => response.json());
+  assert.equal(rereadPlanTypeMapping.mapping.self_serve_business_usage_based, "Business Usage Based Custom");
 
   const createdResponse = await fetch(`${baseUrl}/api/jobs`, {
     method: "POST",
@@ -810,6 +840,118 @@ try {
   assert.deepEqual(uploadedAccounts[0].credentials.model_mapping, { "gpt-5": "gpt-5", "gpt-5-mini": "gpt-5-mini" });
   assert.equal(uploadedAccounts[0].credentials.email, "account-profile@example.com");
 
+  const profileSettingsResponse = await fetch(`${baseUrl}/api/sub2api/settings`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      config: {
+        ...settingsConfig,
+        profiles: [
+          { id: "default", name: "默认方案", groupIds: ["8"], codexFingerprintMode: "device", wsMode: "passthrough" },
+          { id: "free-plan", name: "Free 方案", groupIds: ["71"], codexFingerprintMode: "off", wsMode: "off" },
+        ],
+        activeProfileId: "default",
+        planTypeBindings: { free: "free-plan" },
+      },
+    }),
+  });
+  const profileSettingsText = await profileSettingsResponse.text();
+  assert.equal(profileSettingsResponse.status, 200, profileSettingsText);
+  const profileSettings = JSON.parse(profileSettingsText);
+  assert.equal(profileSettings.activeProfileId, "default");
+  assert.equal(profileSettings.profiles.length, 2);
+  assert.equal(profileSettings.planTypeBindings.free, "free-plan");
+  assert.equal(Object.hasOwn(profileSettings, "adminApiKey"), false);
+  profileSettings.profiles.forEach((profile) => assert.equal(Object.hasOwn(profile, "adminApiKey"), false));
+  const persistedProfileSettings = JSON.parse(await fs.readFile(path.join(outputRoot, "sub2api-settings.json"), "utf8"));
+  assert.equal(persistedProfileSettings.profiles.length, 2);
+  assert.equal(persistedProfileSettings.planTypeBindings.free, "free-plan");
+
+  // A legacy client may save only top-level fields. It must not erase newer
+  // profiles or their PlanType bindings.
+  const legacyClientSaveResponse = await fetch(`${baseUrl}/api/sub2api/settings`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      config: {
+        ...settingsConfig,
+        profileId: "default",
+        groupIds: ["9"],
+        codexFingerprintMode: "full",
+      },
+    }),
+  });
+  const legacyClientSaveText = await legacyClientSaveResponse.text();
+  assert.equal(legacyClientSaveResponse.status, 200, legacyClientSaveText);
+  const legacyClientSaved = JSON.parse(legacyClientSaveText);
+  assert.equal(legacyClientSaved.profiles.length, 2);
+  assert.equal(legacyClientSaved.planTypeBindings.free, "free-plan");
+  assert.deepEqual(legacyClientSaved.profiles.find((profile) => profile.id === "default").groupIds, [9]);
+
+  const invalidProfilesResponse = await fetch(`${baseUrl}/api/sub2api/settings`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ config: { ...settingsConfig, profiles: [{ name: "missing id" }] } }),
+  });
+  assert.equal(invalidProfilesResponse.status, 400, await invalidProfilesResponse.text());
+  const afterInvalidProfiles = await fetch(`${baseUrl}/api/sub2api/settings`, { headers }).then((response) => response.json());
+  assert.equal(afterInvalidProfiles.profiles.length, 2, "非法方案请求不能清空已保存方案");
+  assert.equal(afterInvalidProfiles.planTypeBindings.free, "free-plan");
+
+  const activeProfileSaveResponse = await fetch(`${baseUrl}/api/sub2api/settings`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      config: {
+        ...settingsConfig,
+        profiles: [
+          { id: "default", name: "默认方案", groupIds: ["8"], codexFingerprintMode: "device", wsMode: "passthrough" },
+          { id: "free-plan", name: "Free 方案", groupIds: ["71"], codexFingerprintMode: "off", wsMode: "off" },
+        ],
+        activeProfileId: "free-plan",
+        planTypeBindings: { free: "free-plan" },
+      },
+    }),
+  });
+  const activeProfileSaveText = await activeProfileSaveResponse.text();
+  assert.equal(activeProfileSaveResponse.status, 200, activeProfileSaveText);
+  const activeProfileSaved = JSON.parse(activeProfileSaveText);
+  assert.equal(activeProfileSaved.activeProfileId, "free-plan");
+  assert.deepEqual(activeProfileSaved.config.groupIds, [71]);
+  const profileUploadResponse = await fetch(`${baseUrl}/api/sub2api/upload`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      ids: [profileJob.id],
+      config: {
+        ...settingsConfig,
+        profiles: [
+          { id: "default", name: "默认方案", groupIds: ["8"], codexFingerprintMode: "device", wsMode: "passthrough" },
+          { id: "free-plan", name: "Free 方案", groupIds: ["71"], codexFingerprintMode: "off", wsMode: "off" },
+        ],
+        activeProfileId: "default",
+        planTypeBindings: { free: "free-plan" },
+      },
+    }),
+  });
+  assert.equal(profileUploadResponse.status, 200, await profileUploadResponse.text());
+  assert.deepEqual(uploadedAccounts[0].group_ids, [71], "绑定的订阅方案应覆盖默认方案号池");
+  assert.equal(uploadedAccounts[0].extra.codex_fingerprint_mode, "off");
+
+  const restoreSettingsResponse = await fetch(`${baseUrl}/api/sub2api/settings`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      config: {
+        ...settingsConfig,
+        profiles: [{ id: "default", name: "默认方案", groupIds: ["8"], codexFingerprintMode: "device", wsMode: "passthrough" }],
+        activeProfileId: "default",
+        planTypeBindings: {},
+      },
+    }),
+  });
+  assert.equal(restoreSettingsResponse.status, 200, await restoreSettingsResponse.text());
+
   remoteErrorAccounts = [{
     id: 101,
     name: "oauth---account-profile@example.com",
@@ -1123,6 +1265,37 @@ try {
   assert.equal(batch.jobs.find((item) => item.email === "dot-password@example.com").loginMode, "password");
   await Promise.all(batch.jobs.map((item) => waitForJob(headers, item.id, (value) => value.status === "completed")));
 
+  const mixedUploadStart = batchUploadCount;
+  const mixedUploadResponse = await fetch(`${baseUrl}/api/sub2api/upload`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      ids: [profileJob.id, batch.jobs.find((item) => item.email === "password-mail@example.com").id],
+      config: {
+        ...settingsConfig,
+        profiles: [
+          { id: "default", name: "默认方案", groupIds: ["8"], codexFingerprintMode: "device", wsMode: "passthrough" },
+          { id: "free-plan", name: "Free 方案", groupIds: ["71"], codexFingerprintMode: "off", wsMode: "off" },
+          { id: "business-plan", name: "Business 方案", groupIds: ["7"], codexFingerprintMode: "full", wsMode: "http_bridge" },
+        ],
+        activeProfileId: "default",
+        planTypeBindings: {
+          free: "free-plan",
+          self_serve_business_prolite: "business-plan",
+        },
+      },
+    }),
+  });
+  const mixedUploadText = await mixedUploadResponse.text();
+  assert.equal(mixedUploadResponse.status, 200, mixedUploadText);
+  const mixedUpload = JSON.parse(mixedUploadText);
+  assert.equal(mixedUpload.uploaded, 2);
+  assert.equal(Array.isArray(mixedUpload.result), true);
+  assert.equal(mixedUpload.result.length, 2);
+  assert.equal(batchUploadCount - mixedUploadStart, 2, "同一批不同 PlanType 应按方案各发一个 batch");
+  const mixedBatches = uploadedBatches.slice(-2);
+  assert.deepEqual(mixedBatches.map((batch) => batch[0].group_ids).sort((a, b) => a[0] - b[0]), [[7], [71]]);
+
   const sourceResponse = await fetch(`${baseUrl}/api/jobs/export-source`, {
     method: "POST",
     headers,
@@ -1219,6 +1392,12 @@ try {
     groupIds: ["7"],
     codexFingerprintMode: "device",
     wsMode: "passthrough",
+    profiles: [
+      { id: "default", name: "默认方案", groupIds: ["7"], codexFingerprintMode: "device", wsMode: "passthrough" },
+      { id: "business-plan", name: "Business 方案", groupIds: ["71"], proxyId: "3", concurrency: "4", loadFactor: "25", priority: "17", accountNameTemplate: "business-{email}", modelWhitelist: "gpt-5", codexFingerprintMode: "full", wsMode: "http_bridge" },
+    ],
+    activeProfileId: "default",
+    planTypeBindings: { self_serve_business_prolite: "business-plan" },
   };
   const monitorSaveResponse = await fetch(`${baseUrl}/api/sub2api/monitor`, {
     method: "POST",
@@ -1232,13 +1411,120 @@ try {
   assert.equal(monitorSaved.configured, true);
 
   remoteErrorAccounts = [{
+    id: 120,
+    name: "oauth---plan-change@example.com",
+    platform: "openai",
+    type: "oauth",
+    status: "active",
+    schedulable: true,
+    credentials: { email: "plan-change@example.com", plan_type: "free" },
+    group_ids: [7],
+    extra: { existing_setting: "keep" },
+  }];
+  const batchCountBeforePlanChange = batchUploadCount;
+  const baselinePlanCheckResponse = await fetch(`${baseUrl}/api/sub2api/monitor/check`, {
+    method: "POST",
+    headers,
+  });
+  const baselinePlanCheckText = await baselinePlanCheckResponse.text();
+  assert.equal(baselinePlanCheckResponse.status, 200, baselinePlanCheckText);
+  const baselinePlanCheck = JSON.parse(baselinePlanCheckText);
+  assert.equal(baselinePlanCheck.result.planTypeChanges, 0);
+  assert.equal(batchUploadCount, batchCountBeforePlanChange, "首次巡检只建立订阅类型基线，不应上传文件");
+
+  remoteErrorAccounts[0].credentials.plan_type = "self_serve_business_prolite";
+  const changedPlanCheckResponse = await fetch(`${baseUrl}/api/sub2api/monitor/check`, {
+    method: "POST",
+    headers,
+  });
+  const changedPlanCheckText = await changedPlanCheckResponse.text();
+  assert.equal(changedPlanCheckResponse.status, 200, changedPlanCheckText);
+  const changedPlanCheck = JSON.parse(changedPlanCheckText);
+  assert.equal(changedPlanCheck.result.planTypeChanged, 1);
+  assert.equal(changedPlanCheck.result.planTypeChanges, 1);
+  assert.equal(changedPlanCheck.result.planTypeUpdated, 1);
+  assert.equal(batchUploadCount, batchCountBeforePlanChange, "订阅变化应 PUT 更新已有账号，不应重新上传文件");
+  assert.deepEqual(updatedRemoteAccounts.get(120).group_ids, [71]);
+  assert.equal(updatedRemoteAccounts.get(120).proxy_id, 3);
+  assert.equal(updatedRemoteAccounts.get(120).concurrency, 4);
+  assert.equal(updatedRemoteAccounts.get(120).load_factor, 25);
+  assert.equal(updatedRemoteAccounts.get(120).priority, 17);
+  assert.equal(updatedRemoteAccounts.get(120).name, "business-plan-change@example.com");
+  assert.equal(updatedRemoteAccounts.get(120).extra.codex_fingerprint_mode, "full");
+  assert.equal(updatedRemoteAccounts.get(120).extra.openai_oauth_responses_websockets_v2_mode, "http_bridge");
+  assert.deepEqual(updatedRemoteAccounts.get(120).credentials.model_mapping, { "gpt-5": "gpt-5" });
+  const persistedPlanState = JSON.parse(await fs.readFile(path.join(outputRoot, "sub2api-monitor.json"), "utf8"));
+  assert.equal(persistedPlanState.state.planTypes["120"], "self_serve_business_prolite");
+
+  // Rotating the administrator key changes the backend identity. The first
+  // check against that identity must establish a fresh baseline, even when an
+  // account ID is reused by the other tenant/key.
+  const rotatedKeySaveResponse = await fetch(`${baseUrl}/api/sub2api/monitor`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      enabled: true,
+      config: { ...monitorConfig, adminApiKey: "rotated-admin-key" },
+    }),
+  });
+  assert.equal(rotatedKeySaveResponse.status, 200, await rotatedKeySaveResponse.text());
+  remoteErrorAccounts = [{
+    id: 120,
+    name: "oauth---other-tenant@example.com",
+    platform: "openai",
+    type: "oauth",
+    status: "active",
+    schedulable: true,
+    credentials: { email: "other-tenant@example.com", plan_type: "free" },
+    group_ids: [7],
+  }];
+  const rotatedBaselineResponse = await fetch(`${baseUrl}/api/sub2api/monitor/check`, {
+    method: "POST",
+    headers,
+  });
+  const rotatedBaselineText = await rotatedBaselineResponse.text();
+  assert.equal(rotatedBaselineResponse.status, 200, rotatedBaselineText);
+  const rotatedBaseline = JSON.parse(rotatedBaselineText);
+  assert.equal(rotatedBaseline.result.planTypeChanges, 0);
+  assert.deepEqual(updatedRemoteAccounts.get(120).group_ids, [71], "切换管理员 Key 后首轮不能复用旧后端基线");
+
+  // Error accounts in a non-active profile's group are still monitored.
+  const restoreKeyResponse = await fetch(`${baseUrl}/api/sub2api/monitor`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ enabled: true, config: monitorConfig }),
+  });
+  assert.equal(restoreKeyResponse.status, 200, await restoreKeyResponse.text());
+  remoteErrorAccounts = [{
+    id: 121,
+    name: "oauth---unbound-business@example.com",
+    platform: "openai",
+    type: "oauth",
+    status: "error",
+    error_message: "refresh token expired",
+    credentials: { email: "unbound-business@example.com", plan_type: "self_serve_business_prolite" },
+    group_ids: [71],
+  }];
+  const nonActiveGroupResponse = await fetch(`${baseUrl}/api/sub2api/monitor/check`, {
+    method: "POST",
+    headers,
+  });
+  const nonActiveGroupText = await nonActiveGroupResponse.text();
+  assert.equal(nonActiveGroupResponse.status, 200, nonActiveGroupText);
+  const nonActiveGroupResult = JSON.parse(nonActiveGroupText).result;
+  assert.equal(nonActiveGroupResult.missingTask, 1, "非活动方案号池中的异常账号也应被巡检");
+
+  remoteErrorAccounts = [{
     id: 91,
     name: "oauth---password-mail@example.com",
     platform: "openai",
     type: "oauth",
     status: "error",
     error_message: "refresh token expired",
-    credentials: { email: "password-mail@example.com", model_mapping: { "gpt-5": "gpt-5" } },
+    credentials: {
+      email: "password-mail@example.com",
+      model_mapping: { "gpt-5": "gpt-5" },
+    },
     extra: { existing_setting: "preserved", codex_fingerprint_mode: "off" },
     group_ids: [7],
   }];
@@ -1276,10 +1562,16 @@ try {
   assert.equal(scheduledRemoteAccounts.get(91), true);
   assert.match(updatedRemoteAccounts.get(91).credentials.access_token, /^test-access-password-mail@example\.com$/);
   assert.deepEqual(updatedRemoteAccounts.get(91).credentials.model_mapping, { "gpt-5": "gpt-5" });
+  assert.deepEqual(updatedRemoteAccounts.get(91).group_ids, [71], "auto-repair must use the account's bound PlanType profile");
+  assert.equal(updatedRemoteAccounts.get(91).proxy_id, 3);
+  assert.equal(updatedRemoteAccounts.get(91).concurrency, 4);
+  assert.equal(updatedRemoteAccounts.get(91).load_factor, 25);
+  assert.equal(updatedRemoteAccounts.get(91).priority, 17);
+  assert.equal(updatedRemoteAccounts.get(91).name, "business-password-mail@example.com");
   assert.deepEqual(updatedRemoteAccounts.get(91).extra, {
     existing_setting: "preserved",
-    codex_fingerprint_mode: "device",
-    openai_oauth_responses_websockets_v2_mode: "passthrough",
+    codex_fingerprint_mode: "full",
+    openai_oauth_responses_websockets_v2_mode: "http_bridge",
     openai_oauth_responses_websockets_v2_enabled: true,
   });
 

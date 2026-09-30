@@ -14,7 +14,7 @@ const legacyConfig = {
   baseUrl: "https://legacy.example.test",
   adminApiKey: "migration-test-key",
   groupIds: [12, 13],
-  proxyId: 4,
+  proxyId: 0,
   concurrency: null,
   loadFactor: null,
   priority: null,
@@ -26,6 +26,11 @@ const legacyConfig = {
 await fs.writeFile(
   path.join(outputRoot, "sub2api-monitor.json"),
   `${JSON.stringify({ version: 1, enabled: false, config: legacyConfig, state: {} }, null, 2)}\n`,
+  { mode: 0o600 },
+);
+await fs.writeFile(
+  path.join(outputRoot, "plan-type-mapping.json"),
+  `${JSON.stringify({ version: 1, mapping: { free: "Free Tier", self_serve_business_prolite: "Business Premium Custom" } }, null, 2)}\n`,
   { mode: 0o600 },
 );
 
@@ -57,10 +62,24 @@ try {
   assert.deepEqual(state.config.groupIds, legacyConfig.groupIds);
   assert.equal(state.config.wsMode, legacyConfig.wsMode);
   assert.equal(state.config.accountNameTemplate, legacyConfig.accountNameTemplate);
+  assert.equal(state.activeProfileId, "default");
+  assert.equal(state.profiles.length, 1);
+  assert.deepEqual(state.profiles[0].groupIds, legacyConfig.groupIds);
   assert.equal(Object.hasOwn(state.config, "adminApiKey"), false);
   assert.equal(persisted.config.adminApiKey, legacyConfig.adminApiKey);
   assert.equal(persisted.config.baseUrl, legacyConfig.baseUrl);
   assert.equal(persisted.config.wsMode, legacyConfig.wsMode);
+  assert.equal(persisted.profiles.length, 1);
+  assert.equal(persisted.profiles[0].proxyId, 0);
+  const mapping = await fetch(`${baseUrl}/api/plan-type-mapping`, {
+    headers: { "x-console-token": bootstrap.token },
+  }).then(async (response) => {
+    assert.equal(response.status, 200);
+    return response.json();
+  });
+  assert.equal(mapping.configured, true);
+  assert.equal(mapping.mapping.free, "Free Tier");
+  assert.equal(mapping.mapping.self_serve_business_prolite, "Business Premium Custom");
   console.log("Sub2API settings migration smoke passed");
 } finally {
   child.kill("SIGTERM");

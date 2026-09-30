@@ -125,6 +125,7 @@ function App() {
   const [sub2apiSettingsError, setSub2apiSettingsError] = useState("");
   const [sub2apiGroupsLoading, setSub2apiGroupsLoading] = useState(false);
   const [sub2apiSettingsSaving, setSub2apiSettingsSaving] = useState(false);
+  const [sub2apiPlanTypeDraft, setSub2apiPlanTypeDraft] = useState("");
   const [sub2apiMonitorChecking, setSub2apiMonitorChecking] = useState(false);
   const [sub2apiMonitorStatus, setSub2apiMonitorStatus] = useState({
     configured: false,
@@ -142,6 +143,7 @@ function App() {
   const [planTypeMappingOpen, setPlanTypeMappingOpen] = useState(false);
   const [planTypeMappingDraft, setPlanTypeMappingDraft] = useState(() => planTypeMappingRows(readPlanTypeMapping()));
   const [planTypeMappingError, setPlanTypeMappingError] = useState("");
+  const [planTypeMappingSaving, setPlanTypeMappingSaving] = useState(false);
   const [credentialJob, setCredentialJob] = useState(null);
   const [sessionJob, setSessionJob] = useState(null);
   const [sub2apiAccountStatus, setSub2apiAccountStatus] = useState({ configured: false, fetchedAt: null, accounts: {} });
@@ -179,6 +181,37 @@ function App() {
       stopped = true;
     };
   }, []);
+
+  useEffect(() => {
+    if (!token) return undefined;
+    let stopped = false;
+    const localMapping = readPlanTypeMapping();
+    apiFetch(token, "/api/plan-type-mapping")
+      .then((data) => {
+        if (stopped) return;
+        const serverMapping = normalizePlanTypeMapping(data?.mapping);
+        const shouldMigrate = data?.configured !== true && hasCustomPlanTypeMapping(localMapping);
+        const merged = {
+          ...DEFAULT_PLAN_TYPE_MAPPING,
+          ...(shouldMigrate ? localMapping : serverMapping),
+        };
+        setPlanTypeMapping(merged);
+        setPlanTypeMappingDraft(planTypeMappingRows(merged));
+        if (shouldMigrate) {
+          return apiFetch(token, "/api/plan-type-mapping", {
+            method: "POST",
+            body: JSON.stringify({ mapping: localMapping }),
+          });
+        }
+        return null;
+      })
+      .catch((requestError) => {
+        if (!stopped) setError(requestError.message);
+      });
+    return () => {
+      stopped = true;
+    };
+  }, [token]);
 
   useEffect(() => {
     if (!token) return;
@@ -408,9 +441,78 @@ function App() {
   }
 
   function openSub2ApiSettings() {
-    setSub2apiSettingsDraft({ ...sub2apiSettings, monitorEnabled: Boolean(sub2apiMonitorStatus.enabled) });
+    const normalized = normalizeSub2ApiSettings({ ...sub2apiSettings, monitorEnabled: Boolean(sub2apiMonitorStatus.enabled) });
+    setSub2apiSettingsDraft(normalized);
     setSub2apiSettingsError("");
     setSub2apiSettingsOpen(true);
+  }
+
+  function updateSub2ApiDraftProfile(patch) {
+    setSub2apiSettingsDraft((current) => {
+      const normalized = normalizeSub2ApiSettings(current);
+      const activeId = normalized.activeProfileId;
+      const resolvedPatch = typeof patch === "function" ? patch(normalized) : patch;
+      const profiles = normalized.profiles.map((profile) => profile.id === activeId
+        ? normalizeSub2ApiProfile({ ...profile, ...resolvedPatch }, 0, profile)
+        : profile);
+      const active = profiles.find((profile) => profile.id === activeId) || profiles[0];
+      return { ...normalized, ...active, profiles };
+    });
+  }
+
+  function selectSub2ApiProfile(profileId) {
+    setSub2apiSettingsDraft((current) => {
+      const normalized = normalizeSub2ApiSettings(current);
+      const active = normalized.profiles.find((profile) => profile.id === String(profileId)) || normalized.profiles[0];
+      return { ...normalized, ...active, activeProfileId: active.id };
+    });
+  }
+
+  function addSub2ApiProfile() {
+    setSub2apiSettingsDraft((current) => {
+      const normalized = normalizeSub2ApiSettings(current);
+      const id = `profile-${Date.now()}`;
+      const profile = normalizeSub2ApiProfile({ id, name: `方案 ${normalized.profiles.length + 1}` }, normalized.profiles.length);
+      return { ...normalized, ...profile, profiles: [...normalized.profiles, profile], activeProfileId: id };
+    });
+  }
+
+  function removeSub2ApiProfile() {
+    setSub2apiSettingsDraft((current) => {
+      const normalized = normalizeSub2ApiSettings(current);
+      if (normalized.profiles.length <= 1 || normalized.activeProfileId === "default") return current;
+      const remaining = normalized.profiles.filter((profile) => profile.id !== normalized.activeProfileId);
+      const active = remaining[0];
+      const planTypeBindings = Object.fromEntries(Object.entries(normalized.planTypeBindings)
+        .filter(([, profileId]) => profileId !== normalized.activeProfileId));
+      return { ...normalized, ...active, profiles: remaining, activeProfileId: active.id, planTypeBindings };
+    });
+  }
+
+  function updateSub2ApiPlanTypeBinding(planType, profileId) {
+    setSub2apiSettingsDraft((current) => {
+      const normalized = normalizeSub2ApiSettings(current);
+      const next = { ...normalized.planTypeBindings };
+      const key = String(planType || "").trim();
+      if (key) next[key] = String(profileId);
+      return { ...normalized, planTypeBindings: next };
+    });
+  }
+
+  function removeSub2ApiPlanTypeBinding(planType) {
+    setSub2apiSettingsDraft((current) => {
+      const normalized = normalizeSub2ApiSettings(current);
+      const next = { ...normalized.planTypeBindings };
+      delete next[planType];
+      return { ...normalized, planTypeBindings: next };
+    });
+  }
+
+  function addSub2ApiPlanTypeBinding() {
+    const planType = String(sub2apiPlanTypeDraft || "").trim();
+    if (!planType) return;
+    updateSub2ApiPlanTypeBinding(planType, sub2apiSettingsDraft.activeProfileId);
+    setSub2apiPlanTypeDraft("");
   }
 
   async function loadSub2ApiOptions(settings = sub2apiSettingsDraft) {
@@ -500,11 +602,11 @@ function App() {
   }
 
   function setSub2ApiGroupChecked(groupId, checked) {
-    setSub2apiSettingsDraft((current) => {
-      const selected = new Set(current.groupIds);
+    updateSub2ApiDraftProfile((normalized) => {
+      const selected = new Set(normalized.groupIds || []);
       if (checked) selected.add(String(groupId));
       else selected.delete(String(groupId));
-      return { ...current, groupIds: [...selected] };
+      return { groupIds: [...selected] };
     });
   }
 
@@ -594,9 +696,17 @@ function App() {
   }
 
   function formatSub2ApiUploadNotice(data) {
-    const result = data.result || {};
-    const created = result.account_created ?? result.success ?? data.uploaded;
-    const failed = result.account_failed ?? result.failed ?? 0;
+    const rawResults = Array.isArray(data.result) ? data.result : [data.result || {}];
+    const countField = (result, keys) => {
+      const value = Number(keys.map((key) => result?.[key]).find((candidate) => candidate !== undefined) ?? 0);
+      return Number.isFinite(value) && value >= 0 ? value : 0;
+    };
+    const createdKeys = ["account_created", "success"];
+    const hasCreatedCount = rawResults.some((result) => createdKeys.some((key) => result?.[key] !== undefined));
+    const created = hasCreatedCount
+      ? rawResults.reduce((total, result) => total + countField(result, createdKeys), 0)
+      : Number(data.uploaded || 0);
+    const failed = rawResults.reduce((total, result) => total + countField(result, ["account_failed", "failed"]), 0);
     return `已上传 ${created} 条${failed ? `，失败 ${failed} 条` : ""}${data.skipped ? `，跳过未完成任务 ${data.skipped} 条` : ""}`;
   }
 
@@ -839,8 +949,9 @@ function App() {
     setPlanTypeMappingError("");
   }
 
-  function savePlanTypeMapping(event) {
+  async function savePlanTypeMapping(event) {
     event.preventDefault();
+    if (planTypeMappingSaving) return;
     const next = {};
     for (const row of planTypeMappingDraft) {
       const raw = String(row.raw || "").trim();
@@ -856,9 +967,22 @@ function App() {
       }
       next[raw] = label;
     }
-    setPlanTypeMapping(next);
-    setPlanTypeMappingOpen(false);
+    setPlanTypeMappingSaving(true);
     setPlanTypeMappingError("");
+    try {
+      const saved = await apiFetch(token, "/api/plan-type-mapping", {
+        method: "POST",
+        body: JSON.stringify({ mapping: next }),
+      });
+      const normalized = { ...DEFAULT_PLAN_TYPE_MAPPING, ...normalizePlanTypeMapping(saved.mapping || next) };
+      setPlanTypeMapping(normalized);
+      setPlanTypeMappingDraft(planTypeMappingRows(normalized));
+      setPlanTypeMappingOpen(false);
+    } catch (requestError) {
+      setPlanTypeMappingError(requestError.message);
+    } finally {
+      setPlanTypeMappingSaving(false);
+    }
   }
 
   async function createJob(event) {
@@ -1763,6 +1887,70 @@ function App() {
                   autoComplete="off"
                 />
               </label>
+              <section className="sub2api-profile-manager wide-settings-field" aria-label="Sub2API 配置方案">
+                <div className="sub2api-profile-header">
+                  <div>
+                    <strong>配置方案</strong>
+                    <small>管理地址、管理员密钥和自动检测为全局设置；号池、代理、模型、并发等内容按方案独立保存。</small>
+                  </div>
+                  <button type="button" className="secondary-button" onClick={addSub2ApiProfile}><Plus size={15} />新增方案</button>
+                </div>
+                <div className="sub2api-profile-controls">
+                  <label className="settings-field">
+                    <span>当前方案</span>
+                    <select value={sub2apiSettingsDraft.activeProfileId} onChange={(event) => selectSub2ApiProfile(event.target.value)}>
+                      {sub2apiSettingsDraft.profiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.name}</option>)}
+                    </select>
+                  </label>
+                  <label className="settings-field sub2api-profile-name-field">
+                    <span>方案名称</span>
+                    <input
+                      value={sub2apiSettingsDraft.name || ""}
+                      maxLength="80"
+                      onChange={(event) => updateSub2ApiDraftProfile({ name: event.target.value })}
+                      placeholder="例如 Business Premium"
+                    />
+                  </label>
+                  <button type="button" className="icon-button danger" onClick={removeSub2ApiProfile} disabled={sub2apiSettingsDraft.profiles.length <= 1 || sub2apiSettingsDraft.activeProfileId === "default"} title={sub2apiSettingsDraft.activeProfileId === "default" ? "默认方案不可删除" : "删除当前方案"} aria-label="删除当前方案"><Trash2 size={16} /></button>
+                </div>
+                <div className="sub2api-binding-panel">
+                  <div className="sub2api-binding-heading"><span>PlanType 绑定</span><small>检测到账号订阅类型变化时，巡检会把该账号更新到绑定方案，不会新建文件。</small></div>
+                  <div className="sub2api-binding-list">
+                    {Object.entries(sub2apiSettingsDraft.planTypeBindings || {}).map(([planType, profileId]) => (
+                      <div className="sub2api-binding-row" key={planType}>
+                        <select value={planType} onChange={(event) => {
+                          const next = event.target.value;
+                          removeSub2ApiPlanTypeBinding(planType);
+                          if (next) updateSub2ApiPlanTypeBinding(next, profileId);
+                        }}>
+                          <option value={planType}>{formatPlanTypeLabel(planType, planTypeMapping)} ({planType})</option>
+                          {availablePlanTypes.filter((value) => value !== planType).map((value) => <option key={value} value={value}>{formatPlanTypeLabel(value, planTypeMapping)} ({value})</option>)}
+                        </select>
+                        <span aria-hidden="true">→</span>
+                        <select value={profileId} onChange={(event) => updateSub2ApiPlanTypeBinding(planType, event.target.value)}>
+                          {sub2apiSettingsDraft.profiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.name}</option>)}
+                        </select>
+                        <button type="button" className="icon-button danger" onClick={() => removeSub2ApiPlanTypeBinding(planType)} title="删除绑定" aria-label="删除绑定"><Trash2 size={15} /></button>
+                      </div>
+                    ))}
+                  </div>
+                  <div className="sub2api-binding-add">
+                    <input
+                      list="sub2api-plan-type-options"
+                      value={sub2apiPlanTypeDraft}
+                      maxLength="128"
+                      onChange={(event) => setSub2apiPlanTypeDraft(event.target.value)}
+                      onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); addSub2ApiPlanTypeBinding(); } }}
+                      placeholder="输入或选择 PlanType，例如 free"
+                      aria-label="添加 PlanType 绑定"
+                    />
+                    <datalist id="sub2api-plan-type-options">
+                      {availablePlanTypes.filter((value) => !Object.prototype.hasOwnProperty.call(sub2apiSettingsDraft.planTypeBindings || {}, value)).map((value) => <option key={value} value={value}>{formatPlanTypeLabel(value, planTypeMapping)}</option>)}
+                    </datalist>
+                    <button type="button" className="secondary-button" onClick={addSub2ApiPlanTypeBinding} disabled={!sub2apiPlanTypeDraft.trim()}><Plus size={14} />绑定</button>
+                  </div>
+                </div>
+              </section>
               <fieldset className="settings-field wide-settings-field sub2api-group-field">
                 <legend>目标号池（可多选）</legend>
                 <section className="sub2api-group-picker" aria-label="目标号池">
@@ -1772,7 +1960,7 @@ function App() {
                       <label key={group.id} className="sub2api-group-option">
                         <input
                           type="checkbox"
-                          checked={sub2apiSettingsDraft.groupIds.includes(groupId)}
+                          checked={(sub2apiSettingsDraft.groupIds || []).includes(groupId)}
                           onChange={(event) => setSub2ApiGroupChecked(groupId, event.target.checked)}
                         />
                         <span>{group.name}</span>
@@ -1782,18 +1970,18 @@ function App() {
                   }) : <div className="sub2api-group-empty">暂无可选号池</div>}
                 </section>
                 <section className="sub2api-group-selection" aria-label="号池选择操作">
-                  <span>已选 {sub2apiSettingsDraft.groupIds.length} 个</span>
+                  <span>已选 {(sub2apiSettingsDraft.groupIds || []).length} 个</span>
                   <button
                     type="button"
-                    onClick={() => setSub2apiSettingsDraft((current) => ({ ...current, groupIds: sub2apiGroups.map((group) => String(group.id)) }))}
-                    disabled={!sub2apiGroups.length || sub2apiGroups.every((group) => sub2apiSettingsDraft.groupIds.includes(String(group.id)))}
+                    onClick={() => updateSub2ApiDraftProfile({ groupIds: sub2apiGroups.map((group) => String(group.id)) })}
+                    disabled={!sub2apiGroups.length || sub2apiGroups.every((group) => (sub2apiSettingsDraft.groupIds || []).includes(String(group.id)))}
                   >
                     全选
                   </button>
                   <button
                     type="button"
-                    onClick={() => setSub2apiSettingsDraft((current) => ({ ...current, groupIds: [] }))}
-                    disabled={!sub2apiSettingsDraft.groupIds.length}
+                    onClick={() => updateSub2ApiDraftProfile({ groupIds: [] })}
+                    disabled={!sub2apiSettingsDraft.groupIds?.length}
                   >
                     清空
                   </button>
@@ -1803,7 +1991,7 @@ function App() {
                 <span>代理 IP</span>
                 <select
                   value={sub2apiSettingsDraft.proxyId}
-                  onChange={(event) => setSub2apiSettingsDraft((current) => ({ ...current, proxyId: event.target.value }))}
+                  onChange={(event) => updateSub2ApiDraftProfile({ proxyId: event.target.value })}
                 >
                   <option value="">使用账号原配置</option>
                   {sub2apiProxies.map((proxy) => <option key={proxy.id} value={String(proxy.id)}>{formatSub2ApiProxy(proxy)}</option>)}
@@ -1813,7 +2001,7 @@ function App() {
                 <span>Codex 指纹收敛</span>
                 <select
                   value={sub2apiSettingsDraft.codexFingerprintMode}
-                  onChange={(event) => setSub2apiSettingsDraft((current) => ({ ...current, codexFingerprintMode: event.target.value }))}
+                  onChange={(event) => updateSub2ApiDraftProfile({ codexFingerprintMode: event.target.value })}
                 >
                   <option value="off">关闭（透传）</option>
                   <option value="device">仅设备</option>
@@ -1825,7 +2013,7 @@ function App() {
                 <span>WS mode</span>
                 <select
                   value={sub2apiSettingsDraft.wsMode}
-                  onChange={(event) => setSub2apiSettingsDraft((current) => ({ ...current, wsMode: event.target.value }))}
+                  onChange={(event) => updateSub2ApiDraftProfile({ wsMode: event.target.value })}
                 >
                   {SUB2API_WS_MODE_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
                 </select>
@@ -1838,7 +2026,7 @@ function App() {
                   max="10000"
                   step="1"
                   value={sub2apiSettingsDraft.concurrency}
-                  onChange={(event) => setSub2apiSettingsDraft((current) => ({ ...current, concurrency: event.target.value }))}
+                  onChange={(event) => updateSub2ApiDraftProfile({ concurrency: event.target.value })}
                   placeholder="留空使用账号原值"
                 />
               </label>
@@ -1850,7 +2038,7 @@ function App() {
                   max="10000"
                   step="1"
                   value={sub2apiSettingsDraft.loadFactor}
-                  onChange={(event) => setSub2apiSettingsDraft((current) => ({ ...current, loadFactor: event.target.value }))}
+                  onChange={(event) => updateSub2ApiDraftProfile({ loadFactor: event.target.value })}
                   placeholder="留空使用账号原值"
                 />
               </label>
@@ -1862,7 +2050,7 @@ function App() {
                   max="10000"
                   step="1"
                   value={sub2apiSettingsDraft.priority}
-                  onChange={(event) => setSub2apiSettingsDraft((current) => ({ ...current, priority: event.target.value }))}
+                  onChange={(event) => updateSub2ApiDraftProfile({ priority: event.target.value })}
                   placeholder="留空使用账号原值"
                 />
               </label>
@@ -1872,7 +2060,7 @@ function App() {
                   type="text"
                   maxLength="256"
                   value={sub2apiSettingsDraft.accountNameTemplate}
-                  onChange={(event) => setSub2apiSettingsDraft((current) => ({ ...current, accountNameTemplate: event.target.value }))}
+                  onChange={(event) => updateSub2ApiDraftProfile({ accountNameTemplate: event.target.value })}
                   placeholder="例如：chatgpt-{email}"
                   spellCheck="false"
                 />
@@ -1883,7 +2071,7 @@ function App() {
                 <textarea
                   className="sub2api-model-textarea"
                   value={sub2apiSettingsDraft.modelWhitelist}
-                  onChange={(event) => setSub2apiSettingsDraft((current) => ({ ...current, modelWhitelist: event.target.value }))}
+                  onChange={(event) => updateSub2ApiDraftProfile({ modelWhitelist: event.target.value })}
                   placeholder={"每行一个模型，也支持逗号分隔，例如：\ngpt-5\ngpt-5-mini\ngpt-4.1"}
                   rows="5"
                   spellCheck="false"
@@ -1979,7 +2167,9 @@ function App() {
               <button type="button" className="selection-text-button" onClick={resetPlanTypeMapping}>恢复默认</button>
               <span className="dialog-actions-spacer" />
               <button type="button" className="cancel-button" onClick={() => setPlanTypeMappingOpen(false)}>取消</button>
-              <button type="submit" className="primary-button"><Check size={16} />保存映射</button>
+              <button type="submit" className="primary-button" disabled={planTypeMappingSaving || !token}>
+                {planTypeMappingSaving ? <LoaderCircle className="spin" size={16} /> : <Check size={16} />}保存映射
+              </button>
             </div>
           </form>
         </div>
@@ -3291,6 +3481,10 @@ function formatMonitorResult(result) {
   const parts = [`检查 ${Number(result.checked || 0)} 条异常记录`];
   if (result.started) parts.push(`已启动自动修复 ${result.started} 条`);
   if (result.updated) parts.push(`已更新 ${result.updated} 条`);
+  if (result.planTypeUpdated) parts.push(`已按订阅方案更新 ${result.planTypeUpdated} 条`);
+  if (result.planTypeSkipped) parts.push(`订阅方案未绑定 ${result.planTypeSkipped} 条`);
+  if (result.planTypeUpdateFailed) parts.push(`订阅方案更新失败 ${result.planTypeUpdateFailed} 条`);
+  if (result.planTypeScanIncomplete) parts.push("订阅扫描不完整，已保留上次基线");
   if (result.blocked) parts.push(`永久跳过 ${result.blocked} 条`);
   if (result.ineligible) parts.push(`需人工 ${result.ineligible} 条`);
   if (result.missingTask) parts.push(`本地无任务 ${result.missingTask} 条`);
@@ -3491,6 +3685,11 @@ function normalizePlanTypeMapping(value) {
   return result;
 }
 
+function hasCustomPlanTypeMapping(value) {
+  const mapping = normalizePlanTypeMapping(value);
+  return Object.entries(mapping).some(([raw, label]) => DEFAULT_PLAN_TYPE_MAPPING[raw] !== label);
+}
+
 function readPlanTypeMapping() {
   try {
     const stored = JSON.parse(window.localStorage.getItem(PLAN_TYPE_MAPPING_STORAGE_KEY) || "null");
@@ -3616,9 +3815,9 @@ function normalizeSub2ApiSettings(value) {
       : [];
   const rawWsMode = stored.wsMode ?? stored.openaiWsMode ?? stored.openaiOAuthResponsesWebsocketsV2Mode;
   const wsMode = String(rawWsMode ?? "off").trim().toLowerCase();
-  return {
-    baseUrl: String(stored.baseUrl || ""),
-    adminApiKey: String(stored.adminApiKey || ""),
+  const legacyProfile = {
+    id: "default",
+    name: "默认方案",
     groupIds: [...new Set(rawGroupIds.map((id) => String(id).trim()).filter(Boolean))],
     proxyId: String(stored.proxyId || ""),
     concurrency: String(stored.concurrency ?? ""),
@@ -3629,11 +3828,53 @@ function normalizeSub2ApiSettings(value) {
     codexFingerprintMode: ["off", "device", "session", "full"].includes(stored.codexFingerprintMode)
       ? stored.codexFingerprintMode
       : "session",
-    wsMode: SUB2API_WS_MODES.has(wsMode)
-      ? wsMode
-      : "off",
+    wsMode: SUB2API_WS_MODES.has(wsMode) ? wsMode : "off",
+  };
+  const rawProfiles = Array.isArray(stored.profiles) ? stored.profiles : [];
+  const profiles = rawProfiles.length
+    ? rawProfiles.map((profile, index) => normalizeSub2ApiProfile(profile, index, legacyProfile))
+    : [legacyProfile];
+  const activeProfileId = profiles.some((profile) => profile.id === String(stored.activeProfileId || ""))
+    ? String(stored.activeProfileId)
+    : profiles[0].id;
+  const activeProfile = profiles.find((profile) => profile.id === activeProfileId) || profiles[0];
+  const planTypeBindings = stored.planTypeBindings && typeof stored.planTypeBindings === "object"
+    ? Object.fromEntries(Object.entries(stored.planTypeBindings)
+      .map(([planType, profileId]) => [String(planType).trim(), String(profileId).trim()])
+      .filter(([planType, profileId]) => planType && profiles.some((profile) => profile.id === profileId)))
+    : {};
+  return {
+    baseUrl: String(stored.baseUrl || ""),
+    adminApiKey: String(stored.adminApiKey || ""),
+    ...activeProfile,
+    profiles,
+    activeProfileId,
+    planTypeBindings,
     hasStoredAdminApiKey: stored.hasStoredAdminApiKey === true,
     monitorEnabled: stored.monitorEnabled === true,
+  };
+}
+
+function normalizeSub2ApiProfile(value, index = 0, fallback = {}) {
+  const stored = value && typeof value === "object" ? value : {};
+  const fallbackProfile = fallback && typeof fallback === "object" ? fallback : {};
+  const rawGroupIds = Array.isArray(stored.groupIds) ? stored.groupIds : fallbackProfile.groupIds || [];
+  const rawProxyId = stored.proxyId ?? fallbackProfile.proxyId ?? "";
+  const wsMode = String(stored.wsMode ?? fallbackProfile.wsMode ?? "off").trim().toLowerCase();
+  return {
+    id: String(stored.id || `profile-${index + 1}`).trim() || `profile-${index + 1}`,
+    name: String(stored.name || `方案 ${index + 1}`),
+    groupIds: [...new Set(rawGroupIds.map((id) => String(id).trim()).filter(Boolean))],
+    proxyId: rawProxyId === 0 || String(rawProxyId).trim() === "0" ? "" : String(rawProxyId),
+    concurrency: String(stored.concurrency ?? fallbackProfile.concurrency ?? ""),
+    loadFactor: String(stored.loadFactor ?? fallbackProfile.loadFactor ?? ""),
+    priority: String(stored.priority ?? fallbackProfile.priority ?? ""),
+    accountNameTemplate: String(stored.accountNameTemplate ?? fallbackProfile.accountNameTemplate ?? ""),
+    modelWhitelist: String(stored.modelWhitelist ?? fallbackProfile.modelWhitelist ?? ""),
+    codexFingerprintMode: ["off", "device", "session", "full"].includes(stored.codexFingerprintMode)
+      ? stored.codexFingerprintMode
+      : fallbackProfile.codexFingerprintMode || "session",
+    wsMode: SUB2API_WS_MODES.has(wsMode) ? wsMode : "off",
   };
 }
 
@@ -3650,9 +3891,21 @@ function mergeServerSub2ApiSettings(current, serverState) {
   const hasStoredAdminApiKey = serverHasSettingsState
     ? serverState?.hasAdminApiKey === true
     : current.hasStoredAdminApiKey === true;
+  const serverProfiles = Array.isArray(serverState?.profiles)
+    ? serverState.profiles
+    : undefined;
+  const serverPlanTypeBindings = serverState?.planTypeBindings
+    && typeof serverState.planTypeBindings === "object"
+    && !Array.isArray(serverState.planTypeBindings)
+    ? serverState.planTypeBindings
+    : undefined;
   return normalizeSub2ApiSettings({
     ...current,
     ...serverConfig,
+    ...(typeof serverState?.baseUrl === "string" ? { baseUrl: serverState.baseUrl } : {}),
+    ...(serverProfiles ? { profiles: serverProfiles } : {}),
+    ...(serverPlanTypeBindings ? { planTypeBindings: serverPlanTypeBindings } : {}),
+    ...(typeof serverState?.activeProfileId === "string" ? { activeProfileId: serverState.activeProfileId } : {}),
     adminApiKey: serverHasSettingsState ? "" : (hasStoredAdminApiKey ? "" : current.adminApiKey),
     hasStoredAdminApiKey,
     monitorEnabled: serverState?.monitorEnabled !== undefined
