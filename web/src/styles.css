@@ -892,6 +892,28 @@ tbody tr:last-child td { border-bottom: 0; }
   tab-size: 2;
 }
 .credential-json-empty { margin-top: 8px; padding: 12px; color: var(--muted); background: #f7faf8; border: 1px solid #dbe4df; border-radius: 5px; font-size: 12px; }
+.workspace-dialog { width: min(680px, 100%); }
+.workspace-dialog .dialog-header > div:first-child { min-width: 0; flex: 1 1 auto; }
+.workspace-dialog .dialog-header h2 { flex: 0 0 auto; white-space: nowrap; }
+.workspace-dialog .dialog-header span { min-width: 0; overflow-wrap: anywhere; }
+.workspace-list { margin-top: 18px; display: grid; gap: 8px; }
+.workspace-item { width: 100%; min-height: 64px; padding: 10px 12px; display: flex; align-items: center; gap: 10px; text-align: left; color: var(--ink); background: #fbfcfb; border: 1px solid #d3ded8; border-radius: 5px; cursor: pointer; }
+.workspace-item:hover:not(:disabled) { background: #f1f7f4; border-color: #8fb6a8; }
+.workspace-item.selected { background: #eef7f2; border-color: var(--green); }
+.workspace-item:disabled { cursor: default; opacity: .72; }
+.workspace-item-icon { width: 32px; height: 32px; display: inline-flex; align-items: center; justify-content: center; color: var(--green-strong); background: #e4f1eb; border-radius: 5px; flex: 0 0 auto; }
+.workspace-item-main { min-width: 0; flex: 1 1 auto; display: grid; gap: 6px; }
+.workspace-item-heading, .workspace-item-meta { display: flex; align-items: center; gap: 7px; min-width: 0; }
+.workspace-item-heading strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+.workspace-item-meta { color: var(--muted); font-size: 11px; }
+.workspace-item-meta code { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 10px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+.workspace-badge { padding: 2px 5px; border-radius: 3px; font-size: 10px; font-weight: 700; white-space: nowrap; }
+.workspace-badge.personal { color: #4a5e8b; background: #edf1fb; }
+.workspace-badge.current { color: #176b53; background: #d9eee4; }
+.workspace-badge.disabled { color: #9b4439; background: #f9e6e2; }
+.workspace-item-action { min-width: 34px; color: var(--green-strong); font-size: 11px; font-weight: 700; text-align: right; }
+.workspace-empty { margin-top: 18px; padding: 26px 12px; display: grid; justify-items: center; gap: 8px; color: var(--muted); border: 1px dashed #cdd9d3; border-radius: 5px; font-size: 12px; }
+.workspace-empty strong { color: var(--ink); }
 .sub2api-config-grid { margin-top: 18px; }
 .sub2api-profile-manager {
   padding: 12px;
@@ -1265,4 +1287,5 @@ tbody tr:last-child td { border-bottom: 0; }
 
 @media (max-width: 430px) {
   .bulk-actions { grid-template-columns: 1fr; }
+  .workspace-dialog .dialog-header > div:first-child { align-items: flex-start; flex-direction: column; gap: 2px; }
 }

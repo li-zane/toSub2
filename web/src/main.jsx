@@ -15,6 +15,7 @@ import {
   ExternalLink,
   FileText,
   Filter,
+  BriefcaseBusiness,
   Globe2,
   KeyRound,
   ListPlus,
@@ -146,6 +147,7 @@ function App() {
   const [planTypeMappingSaving, setPlanTypeMappingSaving] = useState(false);
   const [credentialJob, setCredentialJob] = useState(null);
   const [sessionJob, setSessionJob] = useState(null);
+  const [workspaceJob, setWorkspaceJob] = useState(null);
   const [sub2apiAccountStatus, setSub2apiAccountStatus] = useState({ configured: false, fetchedAt: null, accounts: {} });
   const [sub2apiToggleBusy, setSub2apiToggleBusy] = useState(() => new Set());
   const [sub2apiPriorityBusy, setSub2apiPriorityBusy] = useState(() => new Set());
@@ -356,6 +358,9 @@ function App() {
     : null;
   const activeSessionJob = sessionJob
     ? jobs.find((job) => job.id === sessionJob.id) || sessionJob
+    : null;
+  const activeWorkspaceJob = workspaceJob
+    ? jobs.find((job) => job.id === workspaceJob.id) || workspaceJob
     : null;
   const downloadableSelectedCount = selectedJobs.filter((job) => job.canDownload).length;
   const allPageSelected = pageJobIds.length > 0 && pageJobIds.every((id) => selectedJobIds.has(id));
@@ -1591,6 +1596,8 @@ function App() {
                     onOpenCredentials={() => setCredentialJob(job)}
                     sessionsAvailable={Boolean(features.accountSessions)}
                     onOpenSessions={() => setSessionJob(job)}
+                    workspacesAvailable={Boolean(features.accountWorkspaces)}
+                    onOpenWorkspaces={() => setWorkspaceJob(job)}
                   />
                   {expandedJobId === job.id && (
                     <tr className="log-row">
@@ -1632,6 +1639,20 @@ function App() {
           job={activeSessionJob}
           onClose={() => setSessionJob(null)}
           onError={setError}
+        />
+      )}
+      {activeWorkspaceJob && (
+        <WorkspaceDialog
+          key={activeWorkspaceJob.id}
+          token={token}
+          job={activeWorkspaceJob}
+          planTypeMapping={planTypeMapping}
+          onClose={() => setWorkspaceJob(null)}
+          onError={setError}
+          onJobUpdate={(nextJob) => {
+            setJobs((current) => current.map((item) => item.id === nextJob.id ? nextJob : item));
+            setJobSelectionIndex((current) => current.map((item) => item.id === nextJob.id ? nextJob : item));
+          }}
         />
       )}
       {smsSettingsOpen && (
@@ -2265,7 +2286,7 @@ function EmptyState({ filtered = false }) {
   );
 }
 
-function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggleSelected, selectionSupported, smsProviderAvailable, smsProvider, onUpload, sub2apiUploadAvailable, sub2apiToggleAvailable, sub2apiToggleBusy, onToggleSub2Api, sub2apiPriorityAvailable, sub2apiPriorityBusy, onUpdateSub2ApiPriority, totpSetupAvailable, passwordAddAvailable, forceReloginAvailable, accountProxyUrl, planTypeMapping, accountUsage, accountUsageAvailable, onRefreshUsage, credentialsAvailable, onOpenCredentials, sessionsAvailable, onOpenSessions }) {
+function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggleSelected, selectionSupported, smsProviderAvailable, smsProvider, onUpload, sub2apiUploadAvailable, sub2apiToggleAvailable, sub2apiToggleBusy, onToggleSub2Api, sub2apiPriorityAvailable, sub2apiPriorityBusy, onUpdateSub2ApiPriority, totpSetupAvailable, passwordAddAvailable, forceReloginAvailable, accountProxyUrl, planTypeMapping, accountUsage, accountUsageAvailable, onRefreshUsage, credentialsAvailable, onOpenCredentials, sessionsAvailable, onOpenSessions, workspacesAvailable, onOpenWorkspaces }) {
   const [value, setValue] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [priorityValue, setPriorityValue] = useState(() => job.sub2apiPriority === null || job.sub2apiPriority === undefined ? "" : String(job.sub2apiPriority));
@@ -2615,6 +2636,11 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
           {sessionsAvailable && job.canDownload && (
             <button type="button" className="icon-button" onClick={onOpenSessions} disabled={submitting} title="查看已登录设备和会话">
               <MonitorSmartphone size={17} />
+            </button>
+          )}
+          {workspacesAvailable && job.canDownload && (
+            <button type="button" className="icon-button" onClick={onOpenWorkspaces} disabled={submitting} title="查看并切换工作空间">
+              <BriefcaseBusiness size={17} />
             </button>
           )}
           {job.canDownload && (
@@ -3206,6 +3232,142 @@ function formatSessionLocation(device) {
     .map((value) => String(value || "").trim())
     .filter(Boolean);
   return [...new Set(parts)].join(" · ");
+}
+
+function WorkspaceDialog({ token, job, planTypeMapping, onClose, onError, onJobUpdate }) {
+  const [workspaces, setWorkspaces] = useState([]);
+  const [currentWorkspaceId, setCurrentWorkspaceId] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+  const [action, setAction] = useState("");
+  const [dialogError, setDialogError] = useState("");
+  const [notice, setNotice] = useState("");
+
+  async function loadWorkspaces({ initial = false } = {}) {
+    if (initial) setLoading(true);
+    else setRefreshing(true);
+    setDialogError("");
+    try {
+      const data = await apiFetch(token, `/api/jobs/${job.id}/workspaces`);
+      setWorkspaces(data.workspaces?.workspaces || []);
+      setCurrentWorkspaceId(data.workspaces?.currentWorkspaceId || null);
+    } catch (error) {
+      setDialogError(error.message);
+    } finally {
+      if (initial) setLoading(false);
+      else setRefreshing(false);
+    }
+  }
+
+  useEffect(() => {
+    let stopped = false;
+    setLoading(true);
+    apiFetch(token, `/api/jobs/${job.id}/workspaces`)
+      .then((data) => {
+        if (stopped) return;
+        setWorkspaces(data.workspaces?.workspaces || []);
+        setCurrentWorkspaceId(data.workspaces?.currentWorkspaceId || null);
+      })
+      .catch((error) => {
+        if (!stopped) setDialogError(error.message);
+      })
+      .finally(() => {
+        if (!stopped) setLoading(false);
+      });
+    return () => { stopped = true; };
+  }, [job.id, token]);
+
+  useEffect(() => {
+    if (job.lastOperationType !== "workspace_switch" || job.status !== "completed") return;
+    void loadWorkspaces();
+  }, [job.lastOperationAt, job.lastOperationType, job.status]);
+
+  async function switchWorkspace(workspace) {
+    if (!workspace?.id || workspace.id === currentWorkspaceId || action) return;
+    setAction(workspace.id);
+    setDialogError("");
+    setNotice("");
+    try {
+      const data = await apiFetch(token, `/api/jobs/${job.id}/workspaces/switch`, {
+        method: "POST",
+        body: JSON.stringify({ workspaceId: workspace.id }),
+      });
+      if (data.job) onJobUpdate(data.job);
+      setCurrentWorkspaceId(workspace.id);
+      setWorkspaces((current) => current.map((item) => ({ ...item, current: item.id === workspace.id })));
+      setNotice(`已切换到“${workspace.name || workspace.id}”，PlanType 已同步更新。`);
+      onError("");
+    } catch (error) {
+      setDialogError(error.message);
+    } finally {
+      setAction("");
+    }
+  }
+
+  return (
+    <div className="modal-backdrop" role="presentation" onMouseDown={(event) => {
+      if (event.target === event.currentTarget && !action) onClose();
+    }}>
+      <section className="batch-dialog workspace-dialog" role="dialog" aria-modal="true" aria-labelledby="workspace-dialog-title">
+        <div className="dialog-header">
+          <div>
+            <h2 id="workspace-dialog-title">工作空间</h2>
+            <span>{job.email}</span>
+          </div>
+          <div className="dialog-header-actions">
+            <button type="button" className="icon-button" onClick={() => loadWorkspaces()} disabled={loading || refreshing || Boolean(action)} title="刷新工作空间" aria-label="刷新工作空间">
+              <RefreshCw className={refreshing ? "spin" : ""} size={17} />
+            </button>
+            <button type="button" className="icon-button" onClick={onClose} disabled={Boolean(action)} title="关闭">
+              <X size={18} />
+            </button>
+          </div>
+        </div>
+        {loading ? (
+          <div className="credential-loading"><LoaderCircle className="spin" size={18} />正在读取工作空间</div>
+        ) : workspaces.length ? (
+          <div className="workspace-list" aria-live="polite">
+            {workspaces.map((workspace) => {
+              const selected = workspace.id === currentWorkspaceId;
+              const disabled = workspace.canAccess === false || workspace.deactivated;
+              return (
+                <button
+                  type="button"
+                  className={`workspace-item ${selected ? "selected" : ""}`}
+                  key={workspace.id}
+                  onClick={() => switchWorkspace(workspace)}
+                  disabled={disabled || selected || Boolean(action)}
+                >
+                  <span className="workspace-item-icon" aria-hidden="true"><BriefcaseBusiness size={18} /></span>
+                  <span className="workspace-item-main">
+                    <span className="workspace-item-heading">
+                      <strong>{workspace.name || workspace.id}</strong>
+                      {workspace.structure === "personal" && <span className="workspace-badge personal">个人</span>}
+                      {selected && <span className="workspace-badge current">当前</span>}
+                      {disabled && <span className="workspace-badge disabled">不可用</span>}
+                    </span>
+                    <span className="workspace-item-meta">
+                      <span>{formatPlanTypeLabel(workspace.planType, planTypeMapping)}</span>
+                      <code>{workspace.id}</code>
+                    </span>
+                  </span>
+                  <span className="workspace-item-action">{action === workspace.id ? <LoaderCircle className="spin" size={16} /> : selected ? "当前" : "切换"}</span>
+                </button>
+              );
+            })}
+          </div>
+        ) : (
+          <div className="workspace-empty"><BriefcaseBusiness size={24} /><strong>没有可用的工作空间</strong><span>该账号当前没有返回可切换的个人或组织空间。</span></div>
+        )}
+        {dialogError && <div className="dialog-error" role="alert"><CircleAlert size={15} />{dialogError}</div>}
+        {notice && <div className="credential-notice" role="status"><Check size={15} />{notice}</div>}
+        <div className="dialog-actions workspace-dialog-actions">
+          <span className="dialog-actions-spacer" />
+          <button type="button" className="cancel-button" onClick={onClose} disabled={Boolean(action)}>关闭</button>
+        </div>
+      </section>
+    </div>
+  );
 }
 
 function StatusBadge({ status }) {

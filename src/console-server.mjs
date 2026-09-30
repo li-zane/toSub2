@@ -14,6 +14,8 @@ import {
   listAccountSessions,
   revokeAccountSession,
   revokeAllAccountSessions,
+  listAccountWorkspaces,
+  switchAccountWorkspace,
 } from "./account-sessions.mjs";
 import {
   fetchMailboxOtpCandidates,
@@ -271,6 +273,7 @@ async function handleApi(req, res, requestUrl) {
         passwordAdd: true,
         forceRelogin: true,
         accountSessions: true,
+        accountWorkspaces: true,
         accountUsage: true,
         sub2apiAccountStatus: true,
         sub2apiAccountToggle: true,
@@ -715,7 +718,7 @@ async function handleApi(req, res, requestUrl) {
     return;
   }
 
-  const match = /^\/api\/jobs\/([a-f0-9-]+)(?:\/(input|cancel|retry|regenerate|relogin|setup-2fa|replace-2fa|add-password|credentials|usage|logs|download|sms-number|luban-number|sessions(?:\/(?:logout|logout-all))?))?$/.exec(requestUrl.pathname);
+  const match = /^\/api\/jobs\/([a-f0-9-]+)(?:\/(input|cancel|retry|regenerate|relogin|setup-2fa|replace-2fa|add-password|credentials|usage|logs|download|sms-number|luban-number|sessions(?:\/(?:logout|logout-all))?|workspaces(?:\/switch)?))?$/.exec(requestUrl.pathname);
   if (!match) {
     sendJson(res, 404, { error: "Not found" });
     return;
@@ -743,6 +746,39 @@ async function handleApi(req, res, requestUrl) {
     } catch (error) {
       throw sessionApiError(error);
     }
+    return;
+  }
+  if (req.method === "GET" && action === "workspaces") {
+    if (!job.resultSaved) throw httpError(409, "账号授权尚未完成，暂时无法读取工作空间");
+    try {
+      sendJson(res, 200, { workspaces: await listAccountWorkspaces(job) });
+    } catch (error) {
+      throw sessionApiError(error);
+    }
+    return;
+  }
+  if (req.method === "POST" && action === "workspaces/switch") {
+    const body = await readJson(req);
+    const workspaceId = normalizeSub2ApiAccountId(body?.workspaceId);
+    if (!workspaceId) throw httpError(400, "工作空间 ID 无效");
+    await withEmailJobLock(job.email, async () => {
+      if (!job.resultSaved || !canForceRelogin(job)) {
+        throw httpError(409, "当前账号不能切换工作空间，请等待当前操作完成");
+      }
+      const available = await listAccountWorkspaces(job);
+      const target = available.workspaces.find((workspace) => workspace.id === workspaceId);
+      if (!target || target.canAccess === false || target.deactivated) {
+        throw httpError(409, "该工作空间当前不可用或已失去授权");
+      }
+      const result = await switchAccountWorkspace(job, workspaceId);
+      job.workspacePlanType = result.planType || target.planType || null;
+      recordJobOperation(job, "workspace_switch");
+      job.prompt = `已切换到 ${target.name || target.id}`;
+      touch(job);
+      await saveJobMetadata(job);
+      sendJson(res, 200, { job: publicJob(job), workspaces: result });
+      return;
+    });
     return;
   }
   if (req.method === "GET" && action === "usage") {
@@ -4321,7 +4357,7 @@ function publicJob(job) {
     lastOperationAt: job.lastOperationAt || job.createdAt,
     lastOperationType: job.lastOperationType || "initial_authorization",
     completedAt: job.completedAt,
-    planType: getJobPlanType(job),
+    planType: job.workspacePlanType || getJobPlanType(job),
     sub2apiInPool: sub2ApiStatus.inPool,
     sub2apiEnabled: sub2ApiStatus.enabled,
     sub2apiPriority: sub2ApiStatus.priority,
@@ -4888,6 +4924,7 @@ async function syncCompletedOutputs(force = false) {
           parserTail: "",
           resultSaved: true,
           planType: extractPlanTypeFromAccount(account) || normalizePlanType(metadata.plan_type),
+          workspacePlanType: normalizePlanType(metadata.workspace_plan_type),
           loginMode: metadata.login_mode === "password" || storedCredentials.password ? "password" : (mailApiUrl ? "email_otp" : metadata.login_mode || "manual"),
           password: storedCredentials.password,
           totpSecret: storedCredentials.totpSecret,
@@ -4982,6 +5019,7 @@ async function syncCompletedOutputs(force = false) {
           parserTail: "",
           resultSaved: false,
           planType: normalizePlanType(metadata.plan_type),
+          workspacePlanType: normalizePlanType(metadata.workspace_plan_type),
           loginMode: metadata.login_mode === "password" || storedCredentials.password ? "password" : (mailApiUrl ? "email_otp" : metadata.login_mode || "manual"),
           password: storedCredentials.password,
           totpSecret: storedCredentials.totpSecret,
@@ -5073,6 +5111,7 @@ async function syncCompletedOutputs(force = false) {
           parserTail: "",
           resultSaved: false,
           planType: normalizePlanType(metadata.plan_type),
+          workspacePlanType: normalizePlanType(metadata.workspace_plan_type),
           loginMode: metadata.login_mode === "password" || storedCredentials.password ? "password" : (mailApiUrl ? "email_otp" : metadata.login_mode || "manual"),
           password: storedCredentials.password,
           totpSecret: storedCredentials.totpSecret,
@@ -5956,6 +5995,7 @@ async function saveJobMetadata(job) {
         last_error: job.lastError || null,
         result_saved: Boolean(job.resultSaved),
         plan_type: job.planType || null,
+        workspace_plan_type: job.workspacePlanType || null,
         completed_at: job.completedAt || null,
         attempt: Number(job.attempt || 1),
         security_check_required: Boolean(job.securityCheckRequired),

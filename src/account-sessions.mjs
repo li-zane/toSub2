@@ -18,6 +18,7 @@ const MAX_IDENTIFIER_LENGTH = 256;
 const MAX_DEVICES = 500;
 const MAX_USAGE_TEXT_LENGTH = 128;
 const MAX_USAGE_WINDOW_SECONDS = 31_536_000;
+const MAX_WORKSPACES = 100;
 
 /**
  * Read the official ChatGPT usage endpoint through the same OAuth transport
@@ -28,6 +29,92 @@ export async function fetchAccountUsage(job) {
   return {
     ...normalizeAccountUsage(result.data),
     fetchedAt: new Date().toISOString(),
+  };
+}
+
+/**
+ * List every ChatGPT account/workspace authorized by the saved OAuth token.
+ * The response intentionally omits access/refresh tokens and other credentials.
+ */
+export async function listAccountWorkspaces(job) {
+  const result = await requestWithOAuth(job, "GET", "/wham/accounts/check");
+  const bundle = await readOAuthBundle(job);
+  return normalizeAccountWorkspaces(result.data, bundle.accountId);
+}
+
+export async function switchAccountWorkspace(job, workspaceId) {
+  const targetId = normalizeIdentifier(workspaceId);
+  if (!targetId) throw new Error("WORKSPACE_TARGET_INVALID: 工作空间 ID 无效");
+  const listingResponse = await requestWithOAuth(job, "GET", "/wham/accounts/check");
+  const bundle = await readOAuthBundle(job);
+  const listing = normalizeAccountWorkspaces(listingResponse.data, bundle.accountId);
+  const target = listing.workspaces.find((workspace) => workspace.id === targetId);
+  if (!target || target.canAccess === false || target.deactivated) {
+    throw new Error("WORKSPACE_TARGET_UNAVAILABLE: 该工作空间当前不可用或已失去授权");
+  }
+
+  const account = Array.isArray(bundle.data?.accounts) ? bundle.data.accounts[0] : null;
+  if (!account || typeof account !== "object") throw new Error("SESSION_CREDENTIALS_UNAVAILABLE: 授权文件缺少账号数据");
+  const credentials = account.credentials && typeof account.credentials === "object" ? account.credentials : {};
+  const extra = account.extra && typeof account.extra === "object" ? account.extra : {};
+  credentials.chatgpt_account_id = target.id;
+  credentials.account_id = target.id;
+  credentials.plan_type = target.planType || null;
+  account.credentials = credentials;
+  account.account_id = target.id;
+  account.extra = {
+    ...extra,
+    account_id: target.id,
+    chatgpt_account_id: target.id,
+    workspace_id: target.id,
+    workspace_name: target.name,
+    workspace_structure: target.structure,
+    plan_type: target.planType || null,
+  };
+  account.plan_type = target.planType || null;
+  await writeOAuthBundle(bundle);
+  return {
+    currentWorkspaceId: target.id,
+    workspace: target,
+    workspaces: listing.workspaces.map((workspace) => ({
+      ...workspace,
+      current: workspace.id === target.id,
+    })),
+    planType: target.planType || null,
+  };
+}
+
+export function normalizeAccountWorkspaces(payload, currentAccountId = "") {
+  const source = isRecord(payload) ? payload : {};
+  const defaultAccountId = normalizeIdentifier(source.default_account_id ?? source.defaultAccountId);
+  const selectedAccountId = normalizeIdentifier(currentAccountId) || defaultAccountId;
+  const accounts = Array.isArray(source.accounts) ? source.accounts : [];
+  const workspaces = accounts
+    .slice(0, MAX_WORKSPACES)
+    .map((account) => normalizeAccountWorkspace(account, selectedAccountId))
+    .filter(Boolean);
+  return {
+    currentWorkspaceId: workspaces.find((workspace) => workspace.current)?.id || selectedAccountId || null,
+    workspaces,
+    fetchedAt: new Date().toISOString(),
+  };
+}
+
+function normalizeAccountWorkspace(account, defaultAccountId) {
+  if (!isRecord(account)) return null;
+  const id = normalizeIdentifier(account.id ?? account.account_id ?? account.accountId);
+  if (!id) return null;
+  const structure = normalizeUsageText(account.structure || account.kind || "workspace").toLowerCase();
+  const name = publicText(account.name, structure === "personal" ? "个人账户" : "未命名工作空间");
+  return {
+    id,
+    name,
+    structure: structure || "workspace",
+    planType: normalizeUsageText(account.plan_type ?? account.planType) || null,
+    role: normalizeUsageText(account.account_user_role ?? account.role) || null,
+    current: id === defaultAccountId,
+    canAccess: account.can_access_with_session !== false,
+    deactivated: account.is_deactivated === true,
   };
 }
 
@@ -168,10 +255,26 @@ async function requestWithOAuth(job, method, endpoint, jsonBody = undefined) {
   try {
     await configureTransport(transport, job, bundle.chatgptBase);
     let accessToken = await ensureAccessToken(bundle, transport);
-    let response = await sendRequest(transport, bundle.chatgptBase, accessToken, method, endpoint, jsonBody, bundle.accountId);
+    let response = await sendRequest(
+      transport,
+      bundle.chatgptBase,
+      accessToken,
+      method,
+      endpoint,
+      jsonBody,
+      bundle.accountId,
+    );
     if (response.status === 401 && bundle.refreshToken) {
       accessToken = await refreshAccessToken(bundle, transport);
-      response = await sendRequest(transport, bundle.chatgptBase, accessToken, method, endpoint, jsonBody, bundle.accountId);
+      response = await sendRequest(
+        transport,
+        bundle.chatgptBase,
+        accessToken,
+        method,
+        endpoint,
+        jsonBody,
+        bundle.accountId,
+      );
     }
     const data = await parseResponse(response);
     if (!response.ok) throw providerError(response.status, data);
