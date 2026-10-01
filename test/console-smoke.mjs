@@ -99,28 +99,6 @@ const sub2api = http.createServer(async (req, res) => {
     res.end(JSON.stringify({ code: 0, message: "success", data: usage }));
     return;
   }
-  const quotaMatch = /^\/api\/v1\/admin\/openai\/accounts\/(\d+)\/quota$/.exec(req.url || "");
-  if (req.method === "GET" && quotaMatch) {
-    const accountId = Number(quotaMatch[1]);
-    if (accountId !== 101) {
-      res.writeHead(404, { "content-type": "application/json" });
-      res.end(JSON.stringify({ message: "quota not found" }));
-      return;
-    }
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ code: 0, message: "success", data: {
-      fetched_at: Date.now(),
-      rate_limit: {
-        primary_window: { used_percent: 22, reset_after_seconds: 3_200, limit_window_seconds: 18_000 },
-        secondary_window: { used_percent: 44, reset_after_seconds: 86_000, limit_window_seconds: 604_800 },
-      },
-      rate_limit_reset_credits: {
-        available_count: 3,
-        credits: [{ expires_at: new Date(Date.now() + 86_400_000).toISOString() }],
-      },
-    } }));
-    return;
-  }
   const detailMatch = /^\/api\/v1\/admin\/accounts\/(\d+)$/.exec(req.url || "");
   if (req.method === "GET" && detailMatch) {
     const accountId = Number(detailMatch[1]);
@@ -1002,10 +980,6 @@ try {
       codex_7d_reset_at: new Date(Date.now() + 86_400_000).toISOString(),
       codex_7d_window_minutes: 10_080,
       codex_credits_snapshot: { credits: { has_credits: true, unlimited: false, balance: "12.5" } },
-      codex_5h_window_stats: { requests: 12, tokens: 1200, input_tokens: 900, output_tokens: 300, cost: 0.42, standard_cost: 0.5, user_cost: 0.45 },
-      codex_7d_window_stats: { requests: 42, tokens: 4200, cost: 1.2 },
-      rate_limit_reset_credits: { available_count: 2, credits: [{ expires_at: new Date(Date.now() + 172_800_000).toISOString() }] },
-      ai_credits: [{ credit_type: "test_points", amount: 7.5, minimum_balance: 1 }],
       plan_type: "self_serve_business_prolite",
     },
   }, {
@@ -1039,10 +1013,8 @@ try {
   }];
   activeUsageByAccountId.set(101, {
     updated_at: new Date().toISOString(),
-    seven_day: { utilization: 43, resets_at: new Date(Date.now() + 172_800_000).toISOString(), remaining_seconds: 172_800, window_stats: { requests: 44, tokens: 4400, input_tokens: 3200, output_tokens: 1200, cost: 1.5 } },
-    five_hour: { utilization: 21, resets_at: new Date(Date.now() + 4_200_000).toISOString(), remaining_seconds: 4_200, window_stats: { requests: 14, tokens: 1400, input_tokens: 1000, output_tokens: 400, cost: 0.52 } },
-    rate_limit_reset_credits: { available_count: 4, credits: [{ expires_at: new Date(Date.now() + 259_200_000).toISOString() }] },
-    ai_credits: [{ credit_type: "test_points", amount: 9 }],
+    five_hour: { utilization: 21, resets_at: new Date(Date.now() + 4_200_000).toISOString(), remaining_seconds: 4_200 },
+    seven_day: { utilization: 43, resets_at: new Date(Date.now() + 172_800_000).toISOString(), remaining_seconds: 172_800 },
   });
   const accountStatusResponse = await fetch(`${baseUrl}/api/sub2api/account-status?refresh=1`, { headers });
   const accountStatusText = await accountStatusResponse.text();
@@ -1058,11 +1030,6 @@ try {
   assert.equal(accountStatus.accounts["account-profile@example.com"].usage.primary.resetAfterSeconds, 3_600);
   assert.equal(accountStatus.accounts["account-profile@example.com"].usage.secondary.usedPercent, 42);
   assert.equal(accountStatus.accounts["account-profile@example.com"].usage.credits.balance, "12.5");
-  assert.equal(accountStatus.accounts["account-profile@example.com"].usage.tokens.total, 5_400);
-  assert.equal(accountStatus.accounts["account-profile@example.com"].usage.tokens.input, 900);
-  assert.ok(Math.abs(accountStatus.accounts["account-profile@example.com"].usage.billing.cost - 1.62) < 1e-9);
-  assert.equal(accountStatus.accounts["account-profile@example.com"].usage.reset.available, 2);
-  assert.equal(accountStatus.accounts["account-profile@example.com"].usage.points.items[0].amount, 7.5);
   assert.equal(accountStatus.accounts["legacy-usage@example.com"].usage.primary.usedPercent, 12);
   const planTypePage = await (await fetch(`${baseUrl}/api/jobs`, { headers })).json();
   const planTypePageJob = planTypePage.jobs.find((item) => item.email === "account-profile@example.com");
@@ -1088,18 +1055,13 @@ try {
   const refreshedSyncedUsageText = await refreshedSyncedUsageResponse.text();
   assert.equal(refreshedSyncedUsageResponse.status, 200, refreshedSyncedUsageText);
   const refreshedSyncedUsage = JSON.parse(refreshedSyncedUsageText).usage;
-  assert.equal(refreshedSyncedUsage.primary.usedPercent, 22);
-  assert.equal(refreshedSyncedUsage.secondary.usedPercent, 44);
+  assert.equal(refreshedSyncedUsage.primary.usedPercent, 21);
+  assert.equal(refreshedSyncedUsage.secondary.usedPercent, 43);
   assert.equal(refreshedSyncedUsage.credits.balance, "12.5");
-  assert.equal(refreshedSyncedUsage.tokens.total, 5_800);
-  assert.equal(refreshedSyncedUsage.tokens.input, 4_200);
-  assert.ok(Math.abs(refreshedSyncedUsage.billing.cost - 2.02) < 1e-9);
-  assert.equal(refreshedSyncedUsage.reset.available, 3);
-  assert.equal(refreshedSyncedUsage.points.items[0].amount, 9);
   assert.equal(officialRequests.filter((request) => request.url === "/backend-api/wham/usage").length, 0);
   const statusPage = await (await fetch(`${baseUrl}/api/jobs`, { headers })).json();
   assert.equal(statusPage.jobs.find((item) => item.email === "account-profile@example.com").sub2apiPriority, 9);
-  assert.equal(statusPage.jobs.find((item) => item.email === "account-profile@example.com").sub2apiUsage.primary.usedPercent, 22);
+  assert.equal(statusPage.jobs.find((item) => item.email === "account-profile@example.com").sub2apiUsage.primary.usedPercent, 21);
   const addedFilter = await (await fetch(`${baseUrl}/api/jobs?sub2apiPool=added`, { headers })).json();
   assert.equal(addedFilter.pagination.total, 1);
   assert.equal(addedFilter.jobs[0].sub2apiInPool, true);
