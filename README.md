@@ -212,6 +212,7 @@ API Key 只会随取号请求临时发送给本地服务，不会写入任务元
 - 可以填写允许使用的模型，每行一个，也支持逗号分隔，例如 `gpt-5`、`gpt-5-mini`。
 - 可以设置账号级 `WS mode`：`off`、`ctx_pool`、`passthrough` 或 `http_bridge`。该设置会写入 OpenAI OAuth 账号的 `extra.openai_oauth_responses_websockets_v2_mode` 及对应启用开关，并在上传和号池自动修复时保持一致。使用非 `off` 模式前，需要在 Sub2API 的 `gateway.openai_ws.mode_router_v2_enabled` 中启用新版路由。
 - 可以新增多个配置方案。管理地址、管理员 API Key 和自动检测开关是全局设置；号池、代理、并发、负载因子、优先级、账号命名模板、模型白名单、Codex 指纹模式和 WS mode 由每个方案独立保存。可把任意原始 `PlanType` 绑定到方案，例如 `self_serve_business_prolite` -> Business Premium、`free` -> Free。上传时同一批账号会按绑定方案分组调用 Sub2API。
+- 配置方案中的 PlanType 绑定编辑器只显示当前选中的方案；切换方案后会切换到该方案自己的检测类型。底层仍保存为唯一的 `PlanType -> 方案` 映射；把同一个 PlanType 重新绑定到当前方案会覆盖原方案绑定。
 - 方案中的空字段表示沿用导入文件或远端账号当前值，不会主动清空 Sub2API 已有配置；需要覆盖某个字段时填写明确值。
 - PlanType 映射表保存在运行数据目录的 `plan-type-mapping.json`（权限 `0600`），前端启动时从服务端恢复；浏览器 localStorage 仅作为首次迁移来源。
 - Sub2API 后端地址、号池、代理、WS mode、账号命名模板和管理员 API Key 会由本机服务保存到输出目录的 `sub2api-settings.json`（权限 `0600`）；浏览器只保留非敏感的界面缓存。更换浏览器或域名入口后，服务会自动恢复这份配置，管理员 Key 不会通过 API 返回到前端。
