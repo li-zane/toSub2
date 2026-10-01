@@ -387,6 +387,12 @@ function App() {
     ...jobs.map((job) => job.planType).filter(Boolean),
     ...(planTypeFilter && planTypeFilter !== "__unknown__" ? [planTypeFilter] : []),
   ])].sort();
+  // PlanType bindings are persisted as a global reverse index (PlanType ->
+  // profile), but the editor is scoped to the selected profile. Keeping the
+  // view scoped prevents a binding from appearing to follow the user when they
+  // switch profiles, while preserving the backend format and migration path.
+  const activeProfileBindings = Object.entries(sub2apiSettingsDraft.planTypeBindings || {})
+    .filter(([, profileId]) => String(profileId) === String(sub2apiSettingsDraft.activeProfileId));
 
   async function refreshAccountUsage(jobId) {
     if (!token || !features.accountUsage) return;
@@ -830,7 +836,9 @@ function App() {
       if (logoutError) throw new Error(`登出所有设备失败：${logoutError.reason?.message || "请求失败"}`);
 
       setUploadNotice("正在重新授权 0/" + count);
-      const reauthorize = await apiFetch(token, "/api/jobs/reauthorize-batch", {
+      // logout-all invalidates the saved session/refresh token. Start a full
+      // credential-backed login instead of the refresh-token regeneration path.
+      const reauthorize = await apiFetch(token, "/api/jobs/relogin-batch", {
         method: "POST",
         body: JSON.stringify({ ids, proxyUrl: accountProxyUrl.trim() }),
       });
@@ -842,7 +850,7 @@ function App() {
         emailById,
         "正在重新授权",
         (job) => job.status === "completed"
-          && job.lastOperationType === "reauthorize"
+          && job.lastOperationType === "relogin"
           && job.canDownload,
       );
 
@@ -1935,9 +1943,9 @@ function App() {
                   <button type="button" className="icon-button danger" onClick={removeSub2ApiProfile} disabled={sub2apiSettingsDraft.profiles.length <= 1 || sub2apiSettingsDraft.activeProfileId === "default"} title={sub2apiSettingsDraft.activeProfileId === "default" ? "默认方案不可删除" : "删除当前方案"} aria-label="删除当前方案"><Trash2 size={16} /></button>
                 </div>
                 <div className="sub2api-binding-panel">
-                  <div className="sub2api-binding-heading"><span>PlanType 绑定</span><small>检测到账号订阅类型变化时，巡检会把该账号更新到绑定方案，不会新建文件。</small></div>
+                  <div className="sub2api-binding-heading"><span>PlanType 绑定（当前方案）</span><small>仅显示绑定到“{sub2apiSettingsDraft.name || "当前方案"}”的检测类型；切换方案后列表会随之切换。巡检发现订阅类型变化时，会更新已有账号，不会新建文件。</small></div>
                   <div className="sub2api-binding-list">
-                    {Object.entries(sub2apiSettingsDraft.planTypeBindings || {}).map(([planType, profileId]) => (
+                    {activeProfileBindings.map(([planType, profileId]) => (
                       <div className="sub2api-binding-row" key={planType}>
                         <select value={planType} onChange={(event) => {
                           const next = event.target.value;
@@ -1966,7 +1974,7 @@ function App() {
                       aria-label="添加 PlanType 绑定"
                     />
                     <datalist id="sub2api-plan-type-options">
-                      {availablePlanTypes.filter((value) => !Object.prototype.hasOwnProperty.call(sub2apiSettingsDraft.planTypeBindings || {}, value)).map((value) => <option key={value} value={value}>{formatPlanTypeLabel(value, planTypeMapping)}</option>)}
+                      {availablePlanTypes.map((value) => <option key={value} value={value}>{formatPlanTypeLabel(value, planTypeMapping)}</option>)}
                     </datalist>
                     <button type="button" className="secondary-button" onClick={addSub2ApiPlanTypeBinding} disabled={!sub2apiPlanTypeDraft.trim()}><Plus size={14} />绑定</button>
                   </div>
