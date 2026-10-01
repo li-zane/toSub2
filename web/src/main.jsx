@@ -1264,9 +1264,9 @@ function App() {
           </div>
         </div>
         <div className="summary" aria-label="任务统计">
-          <span><i className="status-dot active" />进行中 <strong>{stats.active}</strong></span>
-          <span><i className="status-dot queued" />排队中 <strong>{stats.queued || 0}</strong></span>
-          <span><i className="status-dot complete" />已完成 <strong>{stats.completed}</strong></span>
+          <span className="summary-pill"><i className="status-dot active" />进行中 <strong>{stats.active}</strong></span>
+          <span className="summary-pill"><i className="status-dot queued" />排队中 <strong>{stats.queued || 0}</strong></span>
+          <span className="summary-pill"><i className="status-dot complete" />已完成 <strong>{stats.completed}</strong></span>
         </div>
       </header>
 
@@ -1320,96 +1320,115 @@ function App() {
           </form>
         </div>
 
-        <div className="provider-toolbar sms-provider-toolbar" aria-label="接码平台配置">
-          <div className="provider-heading"><PhoneIncoming size={17} /><strong>接码平台</strong></div>
-          <span className="provider-name">{activeSmsProvider.name || "未选择"}</span>
-          <span className={`provider-ready ${activeSmsProvider.ready ? "" : "incomplete"}`}>
-            {activeSmsProvider.ready ? <Check size={14} /> : <CircleAlert size={14} />}
-            {activeSmsProvider.ready
-              ? (activeSmsProvider.summary ? `已配置 · ${activeSmsProvider.summary}` : "已配置")
-              : "未完成配置"}
-          </span>
-          <button type="button" className="secondary-button provider-settings-button" onClick={openSmsSettings} disabled={!smsProviderDefinitions.length}>
-            <Settings2 size={16} />配置
-          </button>
-        </div>
+        <div className="provider-grid">
+          <section className="provider-card sms-provider-card" aria-label="接码平台配置">
+            <div className="provider-card-header">
+              <div className="provider-heading"><span className="provider-icon"><PhoneIncoming size={16} /></span><strong>接码平台</strong></div>
+              <button type="button" className="secondary-button provider-settings-button" onClick={openSmsSettings} disabled={!smsProviderDefinitions.length}>
+                <Settings2 size={15} />配置
+              </button>
+            </div>
+            <div className="provider-card-body">
+              <span className="provider-name">{activeSmsProvider.name || "未选择"}</span>
+              <span className={`provider-ready ${activeSmsProvider.ready ? "" : "incomplete"}`}>
+                {activeSmsProvider.ready ? <Check size={14} /> : <CircleAlert size={14} />}
+                {activeSmsProvider.ready
+                  ? (activeSmsProvider.summary ? `已配置 · ${activeSmsProvider.summary}` : "已配置")
+                  : "未完成配置"}
+              </span>
+            </div>
+          </section>
 
-        <div className="provider-toolbar mail-request-toolbar" aria-label="邮件接码请求配置">
-          <div className="provider-heading"><MailCheck size={17} /><strong>邮件 API</strong></div>
-          <span className="provider-name">{mailRequestSettings.method}</span>
-          <span className="provider-ready">
-            <Check size={14} />
-            {formatMailRequestSummary(mailRequestSettings)}
-          </span>
-          <button type="button" className="secondary-button provider-settings-button" onClick={openMailRequestSettings} disabled={!token}>
-            <Settings2 size={16} />配置
-          </button>
-        </div>
+          <section className="provider-card mail-request-card" aria-label="邮件接码请求配置">
+            <div className="provider-card-header">
+              <div className="provider-heading"><span className="provider-icon"><MailCheck size={16} /></span><strong>邮件 API</strong></div>
+              <button type="button" className="secondary-button provider-settings-button" onClick={openMailRequestSettings} disabled={!token}>
+                <Settings2 size={15} />配置
+              </button>
+            </div>
+            <div className="provider-card-body">
+              <span className="provider-name">{mailRequestSettings.method}</span>
+              <span className="provider-ready">
+                <Check size={14} />
+                {formatMailRequestSummary(mailRequestSettings)}
+              </span>
+            </div>
+          </section>
 
-        <div className="provider-toolbar sub2api-toolbar" aria-label="Sub2API 配置与号池监控">
-          <div className="provider-heading"><Send size={17} /><strong>Sub2API</strong></div>
-          <span className="provider-name">{sub2apiSettings.baseUrl || "未配置后端"}</span>
-          <span className={`provider-ready ${hasUsableSub2ApiSettings(sub2apiSettings) ? "" : "incomplete"}`}>
-            {hasUsableSub2ApiSettings(sub2apiSettings) ? <Check size={14} /> : <CircleAlert size={14} />}
-            {hasUsableSub2ApiSettings(sub2apiSettings)
-              ? `${sub2apiSettings.groupIds.length ? `已配置 · ${sub2apiSettings.groupIds.length} 个号池` : "已配置 · 默认号池"}${sub2apiSettings.proxyId ? " · 已指定代理" : ""} · WS ${SUB2API_WS_MODE_LABELS[sub2apiSettings.wsMode] || sub2apiSettings.wsMode}`
-              : "未完成配置"}
-          </span>
-          {features.sub2apiMonitor && (
-            <span className={`provider-ready monitor-ready ${sub2apiMonitorStatus.enabled ? "" : "incomplete"}`}>
-              {sub2apiMonitorStatus.running
-                ? <LoaderCircle className="spin" size={14} />
-                : sub2apiMonitorStatus.enabled ? <ShieldCheck size={14} /> : <CircleAlert size={14} />}
-              {sub2apiMonitorStatus.running
-                ? "正在巡检"
-                : sub2apiMonitorStatus.enabled
-                  ? `号池监控已启用${sub2apiMonitorStatus.lastCheckAt ? ` · ${formatRelativeMonitorTime(sub2apiMonitorStatus.lastCheckAt)}` : ""}`
-                  : "号池监控未启用"}
-            </span>
-          )}
-          {features.sub2apiMonitor && sub2apiMonitorStatus.enabled && (
-            <button
-              type="button"
-              className="icon-button monitor-check-button"
-              onClick={checkSub2ApiMonitorNow}
-              disabled={sub2apiMonitorChecking || sub2apiMonitorStatus.running}
-              title="立即检查 Sub2API 异常账号"
-            >
-              <RefreshCw className={sub2apiMonitorChecking || sub2apiMonitorStatus.running ? "spin" : ""} size={16} />
-            </button>
-          )}
-          <button type="button" className="secondary-button provider-settings-button" onClick={openSub2ApiSettings} disabled={!token}>
-            <Settings2 size={16} />配置
-          </button>
-        </div>
+          <section className="provider-card sub2api-card" aria-label="Sub2API 配置与号池监控">
+            <div className="provider-card-header">
+              <div className="provider-heading"><span className="provider-icon"><Send size={16} /></span><strong>Sub2API</strong></div>
+              <div className="provider-card-actions">
+                {features.sub2apiMonitor && sub2apiMonitorStatus.enabled && (
+                  <button
+                    type="button"
+                    className="icon-button monitor-check-button"
+                    onClick={checkSub2ApiMonitorNow}
+                    disabled={sub2apiMonitorChecking || sub2apiMonitorStatus.running}
+                    title="立即检查 Sub2API 异常账号"
+                    aria-label="立即检查 Sub2API 异常账号"
+                  >
+                    <RefreshCw className={sub2apiMonitorChecking || sub2apiMonitorStatus.running ? "spin" : ""} size={15} />
+                  </button>
+                )}
+                <button type="button" className="secondary-button provider-settings-button" onClick={openSub2ApiSettings} disabled={!token}>
+                  <Settings2 size={15} />配置
+                </button>
+              </div>
+            </div>
+            <div className="provider-card-body">
+              <span className="provider-name" title={sub2apiSettings.baseUrl || undefined}>{sub2apiSettings.baseUrl || "未配置后端"}</span>
+              <span className={`provider-ready ${hasUsableSub2ApiSettings(sub2apiSettings) ? "" : "incomplete"}`}>
+                {hasUsableSub2ApiSettings(sub2apiSettings) ? <Check size={14} /> : <CircleAlert size={14} />}
+                {hasUsableSub2ApiSettings(sub2apiSettings)
+                  ? `${sub2apiSettings.groupIds.length ? `已配置 · ${sub2apiSettings.groupIds.length} 个号池` : "已配置 · 默认号池"}${sub2apiSettings.proxyId ? " · 已指定代理" : ""} · WS ${SUB2API_WS_MODE_LABELS[sub2apiSettings.wsMode] || sub2apiSettings.wsMode}`
+                  : "未完成配置"}
+              </span>
+              {features.sub2apiMonitor && (
+                <span className={`provider-ready monitor-ready ${sub2apiMonitorStatus.enabled ? "" : "incomplete"}`}>
+                  {sub2apiMonitorStatus.running
+                    ? <LoaderCircle className="spin" size={14} />
+                    : sub2apiMonitorStatus.enabled ? <ShieldCheck size={14} /> : <CircleAlert size={14} />}
+                  {sub2apiMonitorStatus.running
+                    ? "正在巡检"
+                    : sub2apiMonitorStatus.enabled
+                      ? `号池监控已启用${sub2apiMonitorStatus.lastCheckAt ? ` · ${formatRelativeMonitorTime(sub2apiMonitorStatus.lastCheckAt)}` : ""}`
+                      : "号池监控未启用"}
+                </span>
+              )}
+            </div>
+          </section>
 
-        <div className="provider-toolbar account-proxy-toolbar" aria-label="代理 IP 配置">
-          <div className="provider-heading"><Globe2 size={17} /><strong>代理 IP</strong></div>
-          <div className="account-proxy-input">
-            <label className="provider-field account-proxy-field" title="支持 http://、https://、socks5:// 和 socks5h://；用户名中包含 -sid- 时会自动轮换会话编号">
-              <Globe2 size={15} aria-hidden="true" />
-              <input
-                value={accountProxyUrl}
-                onChange={(event) => setAccountProxyUrl(event.target.value)}
-                placeholder="socks5h://用户名:密码@主机:端口"
-                spellCheck="false"
-                aria-label="代理 IP 地址"
-              />
-            </label>
-          </div>
-          <span className={`provider-ready ${accountProxyUrl.trim() ? "" : "incomplete"}`}>
-            {accountProxyUrl.trim() ? <Check size={14} /> : <CircleAlert size={14} />}
-            {accountProxyUrl.trim() ? "已配置，按账号检测出口" : "未配置，使用本地 IP"}
-          </span>
-          <a
-            className="provider-external-link"
-            href="https://invite.zooproxy.com/share/ez2v2jdb7"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <ExternalLink size={13} aria-hidden="true" />
-            点击获取代理 IP
-          </a>
+          <section className="provider-card account-proxy-card" aria-label="代理 IP 配置">
+            <div className="provider-card-header">
+              <div className="provider-heading"><span className="provider-icon"><Globe2 size={16} /></span><strong>代理 IP</strong></div>
+              <a
+                className="provider-external-link"
+                href="https://invite.zooproxy.com/share/ez2v2jdb7"
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                <ExternalLink size={13} aria-hidden="true" />
+                获取代理 IP
+              </a>
+            </div>
+            <div className="provider-card-body">
+              <label className="provider-field account-proxy-field" title="支持 http://、https://、socks5:// 和 socks5h://；用户名中包含 -sid- 时会自动轮换会话编号">
+                <Globe2 size={15} aria-hidden="true" />
+                <input
+                  value={accountProxyUrl}
+                  onChange={(event) => setAccountProxyUrl(event.target.value)}
+                  placeholder="socks5h://用户名:密码@主机:端口"
+                  spellCheck="false"
+                  aria-label="代理 IP 地址"
+                />
+              </label>
+              <span className={`provider-ready ${accountProxyUrl.trim() ? "" : "incomplete"}`}>
+                {accountProxyUrl.trim() ? <Check size={14} /> : <CircleAlert size={14} />}
+                {accountProxyUrl.trim() ? "已配置，按账号检测出口" : "未配置，使用本地 IP"}
+              </span>
+            </div>
+          </section>
         </div>
 
         {error && (
@@ -1428,15 +1447,17 @@ function App() {
         )}
 
         {features.bulkActions && jobs.length > 0 && (
-          <div className="selection-toolbar">
+          <div className={`selection-toolbar ${selectedJobIds.size ? "has-selection" : ""}`}>
             <div className="selection-summary">
-              <span>当前页 {jobs.length} 条，跨页已选 {selectedJobIds.size} 条，可下载 {downloadableSelectedCount} 条</span>
+              <span className="selection-count"><strong>{selectedJobIds.size}</strong> 已选</span>
+              <span className="selection-detail">当前页 {jobs.length} 条 · 可下载 {downloadableSelectedCount} 条</span>
               <button type="button" className="selection-text-button" onClick={toggleAllOnPage} disabled={allPageSelected || !pageJobIds.length || Boolean(batchAction)}>
                 本页全选
               </button>
               <button type="button" className="selection-text-button" onClick={() => setSelectedJobIds(new Set())} disabled={!selectedJobIds.size || Boolean(batchAction)}>
                 清除选择
               </button>
+              {!selectedJobIds.size && <span className="selection-hint">勾选账号后可使用批量操作</span>}
             </div>
             <div className="bulk-actions">
               {features.cancelAll && (
@@ -1450,12 +1471,13 @@ function App() {
                   停止全部
                 </button>
               )}
+              {features.cancelAll && <span className="bulk-divider" aria-hidden="true" />}
               <button type="button" className="download-button" onClick={downloadSelected} disabled={!canDownloadSelected || Boolean(batchAction)}>
                 {batchAction === "download" ? <LoaderCircle className="spin" size={16} /> : <Download size={16} />}
                 批量下载
               </button>
               {features.sub2apiUpload && (
-                <button type="button" className="secondary-button bulk-button" onClick={() => uploadSelected([...selectedJobIds])} disabled={!canUploadSelected || Boolean(batchAction)}>
+                <button type="button" className="secondary-button bulk-button bulk-primary" onClick={() => uploadSelected([...selectedJobIds])} disabled={!canUploadSelected || Boolean(batchAction)}>
                   {batchAction === "upload" ? <LoaderCircle className="spin" size={16} /> : <Send size={16} />}
                   上传到 Sub2API
                 </button>
@@ -1472,6 +1494,7 @@ function App() {
                   一键轮换并上传
                 </button>
               )}
+              <span className="bulk-divider" aria-hidden="true" />
               {features.sourceExport && (
                 <button type="button" className="secondary-button bulk-button" onClick={exportSelectedSource} disabled={!selectedJobIds.size || Boolean(batchAction)}>
                   {batchAction === "source" ? <LoaderCircle className="spin" size={16} /> : <FileText size={16} />}
@@ -1500,6 +1523,7 @@ function App() {
                   批量添加密码
                 </button>
               )}
+              <span className="bulk-divider" aria-hidden="true" />
               <button type="button" className="delete-button" onClick={deleteSelected} disabled={!selectedJobIds.size || Boolean(batchAction)}>
                 {batchAction === "delete" ? <LoaderCircle className="spin" size={16} /> : <Trash2 size={16} />}
                 批量删除
@@ -2305,7 +2329,7 @@ function EmptyState({ filtered = false }) {
     <tr>
       <td colSpan="12">
         <div className="empty-state">
-          <div><Mail size={24} /></div>
+          <div className="empty-state-icon"><Mail size={24} /></div>
           <h3>{filtered ? "没有匹配账号" : "暂无授权任务"}</h3>
           <p>{filtered ? "当前筛选邮箱不在任务列表中。" : "在右上方输入邮箱地址开始登录。"}</p>
         </div>
@@ -2502,9 +2526,11 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
               <strong>{job.email}</strong>
               {accountNameCopied ? <Check size={13} aria-hidden="true" /> : <Copy size={13} aria-hidden="true" />}
             </button>
-            <span>{shortId(job.id)}</span>
+            <div className="account-meta">
+              <span className="account-id">{shortId(job.id)}</span>
+              <LoginMethodBadge job={job} />
+            </div>
           </div>
-          <LoginMethodBadge job={job} />
         </div>
       </td>
       <td className={`plan-cell ${job.planType ? "" : "unknown"}`} title={job.planType || "未知"}>
