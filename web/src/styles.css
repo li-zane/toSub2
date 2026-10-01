@@ -390,6 +390,22 @@ tbody tr:last-child td { border-bottom: 0; }
   overflow-wrap: anywhere;
 }
 .plan-cell.unknown .plan-tag { color: #8a9490; background: #f4f6f5; border-color: #e0e5e2; font-weight: 600; }
+.plan-sync-note {
+  max-width: 100%;
+  margin-top: 4px;
+  padding: 2px 5px;
+  display: block;
+  overflow: hidden;
+  color: #8b6418;
+  background: var(--amber-soft);
+  border: 1px solid #ead7a7;
+  border-radius: 3px;
+  font-size: 9px;
+  font-weight: 650;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 
 .usage-heading { white-space: nowrap; }
 .usage-cell-column { overflow: hidden; }

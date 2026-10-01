@@ -1031,9 +1031,16 @@ try {
   assert.equal(accountStatus.accounts["account-profile@example.com"].usage.credits.balance, "12.5");
   assert.equal(accountStatus.accounts["legacy-usage@example.com"].usage.primary.usedPercent, 12);
   const planTypePage = await (await fetch(`${baseUrl}/api/jobs`, { headers })).json();
-  assert.equal(planTypePage.jobs.find((item) => item.email === "account-profile@example.com").planType, "self_serve_business_usage_based");
+  const planTypePageJob = planTypePage.jobs.find((item) => item.email === "account-profile@example.com");
+  // The local OAuth workspace remains authoritative while the remote pool
+  // snapshot may lag behind a workspace switch. Keep the two values visible
+  // separately instead of letting the account list oscillate between them.
+  assert.equal(planTypePageJob.planType, "free");
+  assert.equal(planTypePageJob.sub2apiPlanType, "self_serve_business_usage_based");
   const usageBasedFilter = await (await fetch(`${baseUrl}/api/jobs?planType=self_serve_business_usage_based`, { headers })).json();
-  assert.equal(usageBasedFilter.jobs.some((item) => item.email === "account-profile@example.com"), true);
+  assert.equal(usageBasedFilter.jobs.some((item) => item.email === "account-profile@example.com"), false);
+  const freeFilter = await (await fetch(`${baseUrl}/api/jobs?planType=free`, { headers })).json();
+  assert.equal(freeFilter.jobs.some((item) => item.email === "account-profile@example.com"), true);
   assert.equal(accountStatus.accounts["legacy-usage@example.com"].usage.secondary.usedPercent, 88);
   assert.equal(accountStatus.accounts["empty-usage@example.com"].usage, null);
   const syncedUsageResponse = await fetch(`${baseUrl}/api/jobs/${profileJob.id}/usage`, { headers });

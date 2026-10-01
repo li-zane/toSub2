@@ -776,7 +776,37 @@ async function handleApi(req, res, requestUrl) {
       job.prompt = `已切换到 ${target.name || target.id}`;
       touch(job);
       await saveJobMetadata(job);
-      sendJson(res, 200, { job: publicJob(job), workspaces: result });
+      // A workspace switch changes the OAuth account identity and PlanType in
+      // the local import file. If this account already exists in Sub2API,
+      // update those existing records in place so a later upload cannot create
+      // a second account for the same email and leave the pool out of sync.
+      let sub2api = null;
+      try {
+        sub2api = await synchronizeSub2ApiWorkspaceAccount(job);
+        if (sub2api?.updated) {
+          appendJobLog(job, `[workspace] 已同步更新 Sub2API 号池中的 ${sub2api.updated} 条账号记录。\n`);
+          touch(job);
+          await saveJobMetadata(job);
+        }
+        // Refresh the status snapshot before returning the job so the UI
+        // immediately shows the preserved remote id and new PlanType. This is
+        // also needed when no matching remote row exists, otherwise an older
+        // cached pool entry could survive the workspace switch response.
+        if (sub2api?.configured) {
+          try {
+            await loadSub2ApiAccountStatus({ forceRefresh: true });
+          } catch (error) {
+            sub2api.statusRefreshError = String(error?.message || error).slice(0, 500);
+          }
+        }
+      } catch (error) {
+        const message = String(error?.message || error).slice(0, 500);
+        sub2api = { configured: true, matched: 0, updated: 0, accountIds: [], error: message };
+        appendJobLog(job, `[workspace] 工作空间已切换，但同步 Sub2API 号池失败：${message}\n`);
+        touch(job);
+        await saveJobMetadata(job);
+      }
+      sendJson(res, 200, { job: publicJob(job), workspaces: result, sub2api });
       return;
     });
     return;
@@ -3549,6 +3579,103 @@ async function updateSub2ApiAccountFromProfile(globalConfig, remoteAccount, prof
   return true;
 }
 
+function buildSub2ApiAccountUpdate(localAccount, accountConfig, remoteAccount = {}) {
+  const remoteCredentials = remoteAccount?.credentials && typeof remoteAccount.credentials === "object"
+    ? remoteAccount.credentials
+    : {};
+  const localCredentials = localAccount?.credentials && typeof localAccount.credentials === "object"
+    ? localAccount.credentials
+    : {};
+  const credentials = {
+    // Keep fields managed by Sub2API (usage snapshots, error metadata, or
+    // provider-specific values) while letting the freshly selected workspace
+    // OAuth bundle replace the credential values.
+    ...remoteCredentials,
+    ...localCredentials,
+  };
+  const targetPlanType = normalizePlanType(
+    localAccount?.plan_type
+      || localCredentials.plan_type
+      || localAccount?.extra?.plan_type
+      || extractPlanTypeFromAccount(localAccount, { preferJwt: false })
+      || "",
+  );
+  if (targetPlanType) credentials.plan_type = targetPlanType;
+  if (accountConfig.modelWhitelist.length) {
+    credentials.model_mapping = Object.fromEntries(accountConfig.modelWhitelist.map((model) => [model, model]));
+  }
+  // Sub2API deployments may serialize `extra` as a JSON string. Normalize
+  // both sides before merging so usage snapshots and provider metadata do
+  // not disappear when a workspace switch updates the credentials.
+  const remoteExtra = normalizeSub2ApiExtra(remoteAccount?.extra);
+  const localExtra = normalizeSub2ApiExtra(localAccount?.extra);
+  const mergedExtra = { ...remoteExtra, ...localExtra };
+  if (targetPlanType) mergedExtra.plan_type = targetPlanType;
+  const extra = buildSub2ApiAccountExtra(mergedExtra, accountConfig);
+  const accountId = normalizeSub2ApiAccountId(remoteAccount?.id || localAccount?.id);
+  const accountName = renderSub2ApiAccountName(accountConfig.accountNameTemplate, {
+    ...localAccount,
+    id: accountId || localAccount?.id,
+  });
+  return {
+    credentials,
+    extra,
+    ...(targetPlanType ? { plan_type: targetPlanType } : {}),
+    ...(accountName ? { name: accountName } : {}),
+    ...(accountConfig.groupIds.length
+      ? { group_ids: accountConfig.groupIds }
+      : { group_ids: sub2ApiAccountGroupIds(remoteAccount) }),
+    ...(accountConfig.proxyId ? { proxy_id: accountConfig.proxyId } : {}),
+    ...(accountConfig.concurrency !== null ? { concurrency: accountConfig.concurrency } : {}),
+    ...(accountConfig.loadFactor !== null ? { load_factor: accountConfig.loadFactor } : {}),
+    ...(accountConfig.priority !== null ? { priority: accountConfig.priority } : {}),
+  };
+}
+
+/**
+ * Update the existing Sub2API account records after a ChatGPT workspace
+ * switch. The remote account id is deliberately retained; matching by email
+ * prevents the normal batch-import endpoint from creating a duplicate record
+ * every time the account changes between a personal and an organization
+ * workspace. When a historical duplicate already exists, update every record
+ * with the same email so their credentials and PlanType converge.
+ */
+async function synchronizeSub2ApiWorkspaceAccount(job) {
+  const config = sub2ApiSettingsConfig || sub2ApiMonitorConfig;
+  if (!config?.baseUrl || !config?.adminApiKey) {
+    return { configured: false, matched: 0, updated: 0, accountIds: [] };
+  }
+  const payload = await buildSub2ApiUploadPayload([job]);
+  const localAccount = payload.accounts.find((account) => sub2ApiAccountEmail(account) === String(job.email || "").trim().toLowerCase())
+    || payload.accounts[0];
+  if (!localAccount?.credentials) throw new Error("授权文件中没有可同步的账号凭据");
+
+  const listing = await listSub2ApiAccounts(config, { withMeta: true });
+  if (!listing.complete) throw new Error("Sub2API 账号列表不完整，已停止工作空间同步以避免写错账号");
+  const email = sub2ApiAccountEmail(localAccount) || String(job.email || "").trim().toLowerCase();
+  const matches = listing.accounts.filter((account) => sub2ApiAccountEmail(account) === email);
+  if (!matches.length) {
+    invalidateSub2ApiAccountStatusCache();
+    return { configured: true, matched: 0, updated: 0, accountIds: [] };
+  }
+
+  const profileState = snapshotSub2ApiProfileState();
+  const accountIds = [];
+  for (const remoteAccount of matches) {
+    const accountId = normalizeSub2ApiAccountId(remoteAccount?.id);
+    if (!accountId) continue;
+    const accountConfig = resolveSub2ApiConfigForAccount(config, localAccount, profileState);
+    const accountUpdate = buildSub2ApiAccountUpdate(localAccount, accountConfig, remoteAccount);
+    await requestSub2Api(config, `/api/v1/admin/accounts/${encodeURIComponent(accountId)}`, {
+      method: "PUT",
+      body: JSON.stringify(accountUpdate),
+    });
+    accountIds.push(accountId);
+  }
+  if (accountIds.length) invalidateSub2ApiAccountStatusCache();
+  return { configured: true, matched: matches.length, updated: accountIds.length, accountIds };
+}
+
 function createSub2ApiAutoRepairOperation(config, accounts, profileState = snapshotSub2ApiProfileState()) {
   const validAccounts = accounts.filter((account) => {
     const id = Number(account?.id);
@@ -3962,7 +4089,7 @@ function getSub2ApiAccountStatusForJob(job, state = sub2ApiAccountStatusCache) {
 }
 
 function getJobPlanType(job, state = sub2ApiAccountStatusCache) {
-  return getSub2ApiAccountStatusForJob(job, state).planType || job.planType || null;
+  return job.workspacePlanType || job.planType || getSub2ApiAccountStatusForJob(job, state).planType || null;
 }
 
 function normalizeSub2ApiAccountId(value) {
@@ -4365,6 +4492,7 @@ function publicJob(job) {
     sub2apiAccountIds: sub2ApiStatus.accountIds,
     sub2apiGroupIds: sub2ApiStatus.groupIds,
     sub2apiRemoteStatus: sub2ApiStatus.remoteStatus,
+    sub2apiPlanType: sub2ApiStatus.planType,
     sub2apiUsage: publicSub2ApiUsage(sub2ApiStatus.usage),
     lastError: job.lastError,
     canDownload: Boolean(job.resultSaved),
@@ -4623,6 +4751,7 @@ function publicSelectionJob(job) {
     sub2apiAccountId: sub2ApiStatus.accountId,
     sub2apiAccountIds: sub2ApiStatus.accountIds,
     canDownload: Boolean(job.resultSaved),
+    sub2apiPlanType: sub2ApiStatus.planType,
     canRetry: ["failed", "canceled", "reauth_required", "resume_available"].includes(job.status),
     canRegenerate: job.status === "completed" && job.resultSaved,
     canForceRelogin: canForceRelogin(job),

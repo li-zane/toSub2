@@ -1661,6 +1661,13 @@ function App() {
             setJobs((current) => current.map((item) => item.id === nextJob.id ? nextJob : item));
             setJobSelectionIndex((current) => current.map((item) => item.id === nextJob.id ? nextJob : item));
           }}
+          onWorkspaceSwitched={() => {
+            // The server invalidates its Sub2API status cache after the
+            // in-place credential update. Refresh once immediately so the
+            // account row keeps its pool badge/priority without waiting for
+            // the regular 15-second status poll.
+            void refreshSub2ApiAccountStatus(true).catch(() => {});
+          }}
         />
       )}
       {smsSettingsOpen && (
@@ -2489,6 +2496,16 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
       </td>
       <td className={`plan-cell ${job.planType ? "" : "unknown"}`} title={job.planType || "未知"}>
         <span className="plan-tag">{formatPlanTypeLabel(job.planType, planTypeMapping)}</span>
+        {job.sub2apiInPool === true && job.sub2apiPlanType && job.planType
+          && job.sub2apiPlanType !== job.planType && (
+          <span
+            className="plan-sync-note"
+            title={`本地工作空间：${job.planType}；Sub2API 号池：${job.sub2apiPlanType}`}
+            aria-label={`Sub2API 号池中的 PlanType 为 ${formatPlanTypeLabel(job.sub2apiPlanType, planTypeMapping)}`}
+          >
+            号池：{formatPlanTypeLabel(job.sub2apiPlanType, planTypeMapping)}
+          </span>
+        )}
       </td>
       <td className="usage-cell-column">
         <AccountUsageCell usage={accountUsage} available={job.canDownload} enabled={accountUsageAvailable} onRefresh={onRefreshUsage} />
@@ -3242,7 +3259,7 @@ function formatSessionLocation(device) {
   return [...new Set(parts)].join(" · ");
 }
 
-function WorkspaceDialog({ token, job, planTypeMapping, onClose, onError, onJobUpdate }) {
+function WorkspaceDialog({ token, job, planTypeMapping, onClose, onError, onJobUpdate, onWorkspaceSwitched }) {
   const [workspaces, setWorkspaces] = useState([]);
   const [currentWorkspaceId, setCurrentWorkspaceId] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -3301,9 +3318,20 @@ function WorkspaceDialog({ token, job, planTypeMapping, onClose, onError, onJobU
         body: JSON.stringify({ workspaceId: workspace.id }),
       });
       if (data.job) onJobUpdate(data.job);
+      onWorkspaceSwitched?.();
       setCurrentWorkspaceId(workspace.id);
       setWorkspaces((current) => current.map((item) => ({ ...item, current: item.id === workspace.id })));
-      setNotice(`已切换到“${workspace.name || workspace.id}”，PlanType 已同步更新。`);
+      if (data.sub2api?.error) {
+        setNotice(`已切换到“${workspace.name || workspace.id}”，PlanType 已更新；号池同步失败：${data.sub2api.error}`);
+      } else if (data.sub2api?.statusRefreshError) {
+        setNotice(`已切换到“${workspace.name || workspace.id}”，号池中 ${data.sub2api.updated || 0} 条凭据已更新，但状态刷新失败：${data.sub2api.statusRefreshError}`);
+      } else if (data.sub2api?.updated) {
+        setNotice(`已切换到“${workspace.name || workspace.id}”，PlanType 已更新，号池中 ${data.sub2api.updated} 条凭据已原地同步。`);
+      } else if (data.sub2api?.configured) {
+        setNotice(`已切换到“${workspace.name || workspace.id}”，PlanType 已更新；号池中没有找到同邮箱账号。`);
+      } else {
+        setNotice(`已切换到“${workspace.name || workspace.id}”，PlanType 已同步更新。`);
+      }
       onError("");
     } catch (error) {
       setDialogError(error.message);
@@ -4215,9 +4243,13 @@ function sub2ApiStatusJobFields(status) {
     sub2apiGroupIds: Array.isArray(status?.groupIds) ? status.groupIds : [],
     sub2apiRemoteStatus: status?.remoteStatus || null,
     sub2apiUsage: status?.usage || null,
+    // Keep the remote PlanType separate from the local account/workspace
+    // PlanType. A workspace switch updates the local OAuth bundle first, while
+    // Sub2API may still be serving its previous snapshot until the account
+    // update completes. Overwriting `planType` here caused the table to
+    // oscillate on every 15-second status refresh.
+    sub2apiPlanType: String(status?.sub2apiPlanType || status?.planType || "").trim() || null,
   };
-  const planType = String(status?.planType || "").trim();
-  if (planType) fields.planType = planType;
   return fields;
 }
 
@@ -4225,8 +4257,14 @@ function mergeSub2ApiStatusIntoJob(job, state) {
   if (!state?.fetchedAt) return job;
   const key = String(job.email || "").toLowerCase();
   const status = state.accounts?.[key];
-  if (!status) return { ...job, ...sub2ApiStatusJobFields({ inPool: false }) };
-  return { ...job, ...sub2ApiStatusJobFields(status) };
+  if (!status) return { ...job, ...sub2ApiStatusJobFields({ inPool: false }), sub2apiPlanType: null };
+  const fields = sub2ApiStatusJobFields(status);
+  // `planType` is the account's currently selected workspace and is supplied
+  // by the completed local OAuth output. Only use the remote value as a
+  // fallback for legacy jobs that never persisted a local PlanType.
+  const localPlanType = String(job.workspacePlanType || job.planType || "").trim();
+  if (!localPlanType && fields.sub2apiPlanType) fields.planType = fields.sub2apiPlanType;
+  return { ...job, ...fields };
 }
 
 function mergeJobs(...groups) {
