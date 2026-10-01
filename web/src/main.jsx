@@ -3477,60 +3477,43 @@ function AccountUsageCell({ usage, available, enabled, onRefresh }) {
   }
   const restricted = usage.limitReached === true || usage.allowed === false || credits?.overageLimitReached === true;
   const windows = [
-    { key: "primary", label: usageWindowLabel("5h", primary), value: primary, stats: primary?.stats || tokens?.byWindow?.primary },
-    { key: "secondary", label: usageWindowLabel("7d", secondary), value: secondary, stats: secondary?.stats || tokens?.byWindow?.secondary },
+    { key: "primary", label: usageWindowLabel("5h", primary), value: primary },
+    { key: "secondary", label: usageWindowLabel("7d", secondary), value: secondary },
   ].filter((item) => item.value);
-  const detailItems = [
-    credits && (credits.unlimited === true || credits.balance !== null)
-      ? {
-          label: "额度",
-          value: credits.unlimited === true ? "无限" : `余额 ${formatUsageCount(credits.balance)}`,
-          title: credits.unlimited === true ? "Sub2API 额度：无限" : `Sub2API 额度余额：${credits.balance}`,
-          tone: credits.overageLimitReached === true ? "danger" : "",
-        }
-      : null,
-    tokens ? { label: "Token", value: formatUsageTokenSummary(tokens), title: formatUsageTokenDetails(tokens) } : null,
-    billing ? { label: "计费", value: formatUsageBillingSummary(billing), title: formatUsageBillingDetails(billing) } : null,
-    reset ? { label: "重置卡", value: formatUsageResetSummary(reset), title: formatUsageResetDetails(reset) } : null,
-    points ? { label: "点数", value: formatUsagePointsSummary(points), title: formatUsagePointsDetails(points) } : null,
-  ].filter(Boolean);
-  const statusLabel = restricted ? "受限" : usage.allowed === true ? "可用" : "已读取";
   return (
     <div className={`account-usage ${restricted ? "restricted" : ""}`} title={usage.fetchedAt ? `Sub2API 同步于 ${formatDateTime(usage.fetchedAt)}` : "Sub2API 用量"}>
-      <div className="usage-head-row">
-        <span className="usage-state"><span className="usage-state-dot" aria-hidden="true" />{statusLabel}</span>
-        {usage.fetchedAt && <span className="usage-updated-at">{formatUsageUpdatedAt(usage.fetchedAt)}</span>}
+      <div className="usage-state-row">
+        <span className="usage-state">{restricted ? "受限" : usage.allowed === true ? "可用" : "已读取"}</span>
         {onRefresh && <button type="button" className="usage-refresh-icon" onClick={onRefresh} title="从 Sub2API 同步用量" aria-label="从 Sub2API 同步用量"><RefreshCw size={13} /></button>}
       </div>
-      {windows.length > 0 && <div className="usage-window-list">{windows.map((item) => <UsageWindowProgress key={item.key} tone={item.key} label={item.label} window={item.value} stats={item.stats} />)}</div>}
-      {detailItems.length > 0 && <div className="usage-detail-grid">{detailItems.map((item) => <UsageDetailsCard key={item.label} {...item} />)}</div>}
+      {windows.map((item) => <UsageWindowProgress key={item.key} tone={item.key} label={item.label} window={item.value} />)}
+      {credits && credits.unlimited === true && <span className="usage-window">无限额度</span>}
+      {credits && credits.balance !== null && <span className="usage-window">额度 {credits.balance}</span>}
+      {tokens && <UsageDetailsRow label="Token" value={formatUsageTokenSummary(tokens)} title={formatUsageTokenDetails(tokens)} />}
+      {billing && <UsageDetailsRow label="计费" value={formatUsageBillingSummary(billing)} title={formatUsageBillingDetails(billing)} />}
+      {reset && reset.available !== null && <UsageDetailsRow label="重置卡" value={`${formatUsageCount(reset.available)} 张`} title={formatUsageResetDetails(reset)} />}
+      {points && <UsageDetailsRow label="点数" value={formatUsagePointsSummary(points)} title={formatUsagePointsDetails(points)} />}
     </div>
   );
 }
 
-function UsageDetailsCard({ label, value, title, tone = "" }) {
+function UsageDetailsRow({ label, value, title }) {
   if (!value) return null;
-  return (
-    <div className={`usage-detail-card ${tone}`} title={title || value}>
-      <span className="usage-detail-label">{label}</span>
-      <strong className="usage-detail-value">{value}</strong>
-    </div>
-  );
+  return <span className="usage-detail" title={title || value}><strong>{label}</strong>{value}</span>;
 }
 
 function formatUsageCount(value) {
   const number = Number(value);
   if (!Number.isFinite(number)) return "—";
-  return new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 }).format(number);
+  return new Intl.NumberFormat("zh-CN", { notation: "compact", maximumFractionDigits: 1 }).format(number);
 }
 
 function formatUsageTokenSummary(tokens) {
-  const parts = [];
-  if (tokens.total !== null) parts.push(`总 ${formatUsageCount(tokens.total)}`);
-  if (tokens.input !== null) parts.push(`入 ${formatUsageCount(tokens.input)}`);
-  if (tokens.output !== null) parts.push(`出 ${formatUsageCount(tokens.output)}`);
-  if (tokens.cached !== null) parts.push(`缓存 ${formatUsageCount(tokens.cached)}`);
-  if (parts.length) return parts.join(" · ");
+  if (tokens.input !== null || tokens.output !== null) {
+    return `入 ${formatUsageCount(tokens.input)} / 出 ${formatUsageCount(tokens.output)}`;
+  }
+  if (tokens.total !== null) return `总 ${formatUsageCount(tokens.total)}`;
+  if (tokens.cached !== null) return `缓存 ${formatUsageCount(tokens.cached)}`;
   return tokens.requests !== null ? `${formatUsageCount(tokens.requests)} 次请求` : "已同步";
 }
 
@@ -3545,44 +3528,27 @@ function formatUsageTokenDetails(tokens) {
 }
 
 function formatUsageBillingSummary(billing) {
-  const parts = [];
-  if (billing.cost !== null) parts.push(`A${formatUsageMoney(billing.cost, billing.currency)}`);
-  if (billing.standardCost !== null) parts.push(`S${formatUsageMoney(billing.standardCost, billing.currency)}`);
-  if (billing.userCost !== null) parts.push(`U${formatUsageMoney(billing.userCost, billing.currency)}`);
-  return parts.join(" · ") || "已同步";
+  const value = billing.cost ?? billing.standardCost ?? billing.userCost;
+  if (value === null || value === undefined) return "已同步";
+  const currency = billing.currency ? `${billing.currency} ` : "";
+  return `${currency}${Number(value).toFixed(4)}`;
 }
 
 function formatUsageBillingDetails(billing) {
   const parts = [];
-  if (billing.cost !== null) parts.push(`账号费用 ${formatUsageMoney(billing.cost, billing.currency)}`);
-  if (billing.standardCost !== null) parts.push(`标准费用 ${formatUsageMoney(billing.standardCost, billing.currency)}`);
-  if (billing.userCost !== null) parts.push(`用户费用 ${formatUsageMoney(billing.userCost, billing.currency)}`);
+  if (billing.cost !== null) parts.push(`账号费用 ${formatUsageBillingSummary({ ...billing, standardCost: null, userCost: null })}`);
+  if (billing.standardCost !== null) parts.push(`标准费用 ${Number(billing.standardCost).toFixed(4)}`);
+  if (billing.userCost !== null) parts.push(`用户费用 ${Number(billing.userCost).toFixed(4)}`);
   if (billing.periodStart) parts.push(`开始 ${formatDateTime(billing.periodStart)}`);
   if (billing.periodEnd) parts.push(`结束 ${formatDateTime(billing.periodEnd)}`);
   return parts.join("，") || "计费数据已同步";
 }
 
-function formatUsageMoney(value, currency = null) {
-  const number = Number(value);
-  if (!Number.isFinite(number)) return "—";
-  const prefix = currency ? `${currency} ` : "$";
-  return `${prefix}${number.toFixed(4)}`;
-}
-
-function formatUsageResetSummary(reset) {
-  const count = reset.available === null ? null : `${formatUsageCount(reset.available)} 张`;
-  const next = reset.credits?.find((credit) => credit.expiresAt)?.expiresAt || reset.resetAt;
-  if (count && next) return `${count} · ${formatUsageResetAt(next)}`;
-  if (count) return count;
-  return next ? `下次 ${formatUsageResetAt(next)}` : "已同步";
-}
-
 function formatUsageResetDetails(reset) {
-  const parts = [];
-  if (reset.available !== null) parts.push(`可用 ${formatUsageCount(reset.available)} 张`);
+  const parts = [`可用 ${formatUsageCount(reset.available)} 张`];
   if (reset.credits?.length) parts.push(`最近到期 ${formatUsageResetAt(reset.credits[0].expiresAt)}`);
   if (reset.resetAt) parts.push(`窗口 ${formatUsageResetAt(reset.resetAt)}`);
-  return parts.join("，") || "重置卡数据已同步";
+  return parts.join("，");
 }
 
 function formatUsagePointsSummary(points) {
@@ -3601,27 +3567,10 @@ function formatUsagePointsDetails(points) {
   return parts.join("，") || "点数数据已同步";
 }
 
-function formatUsageUpdatedAt(value) {
-  const timestamp = new Date(value).getTime();
-  if (!Number.isFinite(timestamp)) return "已同步";
-  const seconds = Math.max(0, Math.round((Date.now() - timestamp) / 1000));
-  if (seconds < 60) return "刚刚";
-  if (seconds < 3600) return `${Math.floor(seconds / 60)}分前`;
-  return `${Math.floor(seconds / 3600)}小时前`;
-}
-
-function UsageWindowProgress({ tone, label, window, stats: statsOverride = null }) {
+function UsageWindowProgress({ tone, label, window }) {
   const percent = usageWindowPercent(window);
   const percentText = percent === null ? "—" : `${Math.round(percent)}%`;
   const resetText = formatUsageReset(window);
-  const stats = statsOverride || window?.stats;
-  const statItems = [
-    stats?.requests !== null && stats?.requests !== undefined ? `${formatUsageCount(stats.requests)} req` : null,
-    stats?.tokens !== null && stats?.tokens !== undefined ? `${formatUsageCount(stats.tokens)} Token` : null,
-    stats?.cost !== null && stats?.cost !== undefined ? `A ${formatUsageMoney(stats.cost)}` : null,
-    stats?.standardCost !== null && stats?.standardCost !== undefined ? `S ${formatUsageMoney(stats.standardCost)}` : null,
-    stats?.userCost !== null && stats?.userCost !== undefined ? `U ${formatUsageMoney(stats.userCost)}` : null,
-  ].filter(Boolean);
   return (
     <div className="usage-window-block" title={`${label}窗口${percent === null ? "暂无百分比" : `已用 ${percentText}`}${resetText ? `，${resetText}` : ""}`}>
       <span className={`usage-window-label ${tone}`}>{label}</span>
@@ -3637,7 +3586,6 @@ function UsageWindowProgress({ tone, label, window, stats: statsOverride = null 
       </div>
       <strong className="usage-window-percent">{percentText}</strong>
       {resetText && <span className="usage-window-reset">{resetText}</span>}
-      {statItems.length > 0 && <div className="usage-window-stats">{statItems.map((item) => <span key={item}>{item}</span>)}</div>}
     </div>
   );
 }

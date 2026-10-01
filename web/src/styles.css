@@ -411,17 +411,13 @@ tbody tr:last-child td { border-bottom: 0; }
 .usage-cell-column { overflow: hidden; }
 .account-usage { min-width: 0; display: grid; gap: 5px; color: #55635d; font-size: 10px; line-height: 1.25; }
 .account-usage.restricted { color: var(--danger); }
-.usage-head-row { min-width: 0; display: flex; align-items: center; gap: 5px; }
-.usage-state { min-width: 0; display: inline-flex; align-items: center; gap: 4px; color: var(--green-strong); font-size: 11px; font-weight: 750; white-space: nowrap; }
+.usage-state { color: var(--green-strong); font-size: 11px; font-weight: 750; white-space: nowrap; }
 .account-usage.restricted .usage-state { color: var(--danger); }
-.usage-state-dot { width: 6px; height: 6px; flex: 0 0 auto; background: currentColor; border-radius: 50%; }
-.usage-updated-at { min-width: 0; overflow: hidden; color: #9aa49f; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
 .usage-state.muted { color: #8a9490; font-weight: 600; }
-.usage-window-list { min-width: 0; display: grid; gap: 4px; }
 .usage-window-block { min-width: 0; display: grid; grid-template-columns: 32px minmax(28px, 1fr) 34px auto; align-items: center; gap: 4px; }
 .usage-window-label { width: 32px; min-height: 16px; padding: 2px 3px; overflow: hidden; color: #3b6b5c; background: #e8f4ee; border-radius: 3px; font-size: 9px; font-weight: 700; line-height: 1.35; text-align: center; text-overflow: ellipsis; white-space: nowrap; }
 .usage-window-label.secondary { color: #4b5f87; background: #edf2fb; }
-.usage-progress { width: 100%; height: 7px; overflow: hidden; background: #e4ebe7; border: 1px solid #d6e0da; border-radius: 4px; }
+.usage-progress { width: 100%; height: 6px; overflow: hidden; background: #e4ebe7; border: 1px solid #d6e0da; border-radius: 3px; }
 .usage-progress > span { display: block; height: 100%; min-width: 0; background: var(--green); border-radius: 2px; transition: width .25s ease, background .2s ease; }
 .usage-progress.warning > span { background: var(--amber); }
 .usage-progress.critical > span { background: var(--danger); }
@@ -429,14 +425,9 @@ tbody tr:last-child td { border-bottom: 0; }
 .usage-progress.empty { background: #f1f3f2; }
 .usage-window-percent { min-width: 34px; color: var(--ink); font-size: 10px; font-variant-numeric: tabular-nums; text-align: right; }
 .usage-window-reset { min-width: 0; overflow: hidden; color: #8a9490; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
-.usage-window-stats { grid-column: 1 / -1; min-width: 0; display: flex; flex-wrap: wrap; gap: 3px; }
-.usage-window-stats span { min-width: 0; padding: 2px 4px; overflow: hidden; color: #68756f; background: #f2f5f3; border: 1px solid #e5ebe7; border-radius: 3px; font-size: 9px; font-variant-numeric: tabular-nums; text-overflow: ellipsis; white-space: nowrap; }
-.usage-detail-grid { min-width: 0; display: flex; flex-wrap: wrap; gap: 4px; }
-.usage-detail-card { min-width: 0; flex: 1 1 86px; padding: 4px 5px; overflow: hidden; background: #fbfcfb; border: 1px solid #e0e8e3; border-radius: 4px; }
-.usage-detail-card.danger { color: var(--danger); background: #fff8f8; border-color: #efcaca; }
-.usage-detail-label { display: block; overflow: hidden; color: #84918b; font-size: 9px; line-height: 1.1; text-overflow: ellipsis; white-space: nowrap; }
-.usage-detail-value { display: block; margin-top: 2px; overflow: hidden; color: var(--ink); font-size: 10px; font-variant-numeric: tabular-nums; line-height: 1.25; overflow-wrap: anywhere; }
-.usage-detail-card.danger .usage-detail-value { color: var(--danger); }
+.usage-window { min-width: 0; overflow: hidden; color: #68756f; text-overflow: ellipsis; white-space: nowrap; }
+.usage-detail { min-width: 0; overflow: hidden; color: #68756f; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.usage-detail strong { margin-right: 3px; color: #4d5d55; font-weight: 750; }
 .usage-state-row, .usage-empty { min-width: 0; display: inline-flex; align-items: center; gap: 4px; }
 .usage-refresh-icon { width: 20px; height: 20px; padding: 0; display: inline-grid; place-items: center; color: var(--blue); background: transparent; border: 0; border-radius: 3px; cursor: pointer; }
 .usage-refresh-icon:hover { color: var(--green); background: #edf5f0; }
