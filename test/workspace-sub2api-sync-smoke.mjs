@@ -117,6 +117,17 @@ await listen(sub2api);
 const officialBase = `http://127.0.0.1:${officialApi.address().port}`;
 const sub2apiBase = `http://127.0.0.1:${sub2api.address().port}`;
 const consolePort = await findAvailablePort();
+const uploadConfig = {
+  baseUrl: sub2apiBase,
+  adminApiKey: "test-admin-key",
+  groupIds: [9],
+  profiles: [
+    { id: "default", name: "默认", groupIds: [9], accountNameTemplate: "managed-{email}", codexFingerprintMode: "session", wsMode: "off" },
+    { id: "free-plan", name: "Free", groupIds: [11], accountNameTemplate: "free-{email}", codexFingerprintMode: "off", wsMode: "off" },
+  ],
+  activeProfileId: "default",
+  planTypeBindings: { free: "free-plan" },
+};
 const consoleProcess = spawn(process.execPath, [path.join(projectRoot, "src", "console-server.mjs"), "--host", "127.0.0.1", "--port", String(consolePort)], {
   cwd: projectRoot,
   env: { ...process.env, ONBOARDING_OUTPUT_ROOT: outputRoot, CHATGPT_BASE: officialBase, AUTH_BASE: officialBase, TOSUB2_SESSION_NATIVE_HTTP: "1", SUB2API_MONITOR_ENABLED: "0" },
@@ -135,19 +146,7 @@ try {
   const settings = await fetch(`http://127.0.0.1:${consolePort}/api/sub2api/settings`, {
     method: "POST",
     headers,
-    body: JSON.stringify({
-      config: {
-        baseUrl: sub2apiBase,
-        adminApiKey: "test-admin-key",
-        groupIds: [9],
-        profiles: [
-          { id: "default", name: "默认", groupIds: [9], accountNameTemplate: "managed-{email}", codexFingerprintMode: "session", wsMode: "off" },
-          { id: "free-plan", name: "Free", groupIds: [11], accountNameTemplate: "free-{email}", codexFingerprintMode: "off", wsMode: "off" },
-        ],
-        activeProfileId: "default",
-        planTypeBindings: { free: "free-plan" },
-      },
-    }),
+    body: JSON.stringify({ config: uploadConfig }),
   });
   assert.equal(settings.status, 200, await settings.text());
 
@@ -173,6 +172,7 @@ try {
     assert.equal(request.body.credentials.refresh_token, "mock-refresh");
     assert.equal(request.body.credentials.access_token, accessToken);
     assert.equal(request.body.extra.workspace_id, personalId);
+    assert.equal(request.body.extra.privacy_mode, "training_off");
     assert.equal(request.body.extra.codex_fingerprint_mode, "off");
     assert.equal(request.body.extra.openai_oauth_responses_websockets_v2_mode, "off");
     assert.deepEqual(request.body.group_ids, [11]);
@@ -182,6 +182,22 @@ try {
   assert.deepEqual(putRequests.find((request) => request.id === remoteId).body.extra.usage, { used: 7 });
   assert.equal(putRequests.find((request) => request.id === 78).body.credentials.provider_field, "keep-duplicate");
   assert.deepEqual(putRequests.find((request) => request.id === 78).body.extra.usage, { used: 11 });
+
+  const uploadResponse = await fetch(`http://127.0.0.1:${consolePort}/api/sub2api/upload`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ ids: [jobId], config: uploadConfig }),
+  });
+  const uploadText = await uploadResponse.text();
+  assert.equal(uploadResponse.status, 200, uploadText);
+  const uploaded = JSON.parse(uploadText);
+  assert.equal(uploaded.created, 0);
+  assert.equal(uploaded.updated, 2);
+  assert.deepEqual(uploaded.updatedAccountIds, [String(remoteId), "78"]);
+  assert.equal(putRequests.length, 4, "uploading after a workspace switch must update, not duplicate");
+  assert.deepEqual(putRequests.slice(2).map((request) => request.id), [remoteId, 78]);
+  assert.equal(putRequests[2].body.extra.privacy_mode, "training_off");
+  assert.equal(putRequests[3].body.extra.privacy_mode, "training_off");
   assert.equal(batchRequests, 0, "workspace switching must update the existing record, not batch upload");
   console.log("workspace Sub2API in-place sync smoke passed");
 } catch (error) {

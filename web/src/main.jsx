@@ -707,6 +707,12 @@ function App() {
   }
 
   function formatSub2ApiUploadNotice(data) {
+    if (Object.hasOwn(data || {}, "created") || Object.hasOwn(data || {}, "updated")) {
+      const created = Math.max(0, Number(data?.created) || 0);
+      const updated = Math.max(0, Number(data?.updated) || 0);
+      const total = created + updated;
+      return `已同步 ${total} 条（新增 ${created}，原地更新 ${updated}）${data.skipped ? `，跳过未完成任务 ${data.skipped} 条` : ""}`;
+    }
     const rawResults = Array.isArray(data.result) ? data.result : [data.result || {}];
     const countField = (result, keys) => {
       const value = Number(keys.map((key) => result?.[key]).find((candidate) => candidate !== undefined) ?? 0);

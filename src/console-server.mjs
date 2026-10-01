@@ -531,12 +531,47 @@ async function handleApi(req, res, requestUrl) {
     }
     const results = [];
     let profileBatchIndex = 0;
+    let createdCount = 0;
+    let updatedCount = 0;
+    const updatedAccountIds = [];
     for (const { config: accountConfig, accounts } of accountsByProfile.values()) {
-      results.push(await requestSub2Api(accountConfig, "/api/v1/admin/accounts/batch", {
-        method: "POST",
-        headers: { "Idempotency-Key": `${idempotencyKey}-${profileBatchIndex++}` },
-        body: JSON.stringify({ accounts }),
-      }));
+      // Resolve the current pool before uploading. A workspace switch changes
+      // the OAuth account id but not the email, so an existing record must be
+      // updated by its remote id instead of being sent through batch import.
+      // Refuse to fall back to batch when the listing is incomplete; that is
+      // the only way to guarantee this upload cannot create a duplicate.
+      const listing = await listSub2ApiAccounts(accountConfig, { withMeta: true });
+      if (!listing.complete) throw new Error("Sub2API 账号列表不完整，已停止上传以避免创建重复账号");
+      const accountsToCreate = [];
+      for (const account of accounts) {
+        const email = sub2ApiAccountEmail(account);
+        const matches = email
+          ? listing.accounts.filter((remoteAccount) => sub2ApiAccountEmail(remoteAccount) === email)
+          : [];
+        if (!matches.length) {
+          accountsToCreate.push(account);
+          continue;
+        }
+        for (const remoteAccount of matches) {
+          const accountId = normalizeSub2ApiAccountId(remoteAccount?.id);
+          if (!accountId) continue;
+          const accountUpdate = buildSub2ApiAccountUpdate(account, accountConfig, remoteAccount);
+          await requestSub2Api(accountConfig, `/api/v1/admin/accounts/${encodeURIComponent(accountId)}`, {
+            method: "PUT",
+            body: JSON.stringify(accountUpdate),
+          });
+          updatedCount += 1;
+          updatedAccountIds.push(accountId);
+        }
+      }
+      if (accountsToCreate.length) {
+        createdCount += accountsToCreate.length;
+        results.push(await requestSub2Api(accountConfig, "/api/v1/admin/accounts/batch", {
+          method: "POST",
+          headers: { "Idempotency-Key": `${idempotencyKey}-${profileBatchIndex++}` },
+          body: JSON.stringify({ accounts: accountsToCreate }),
+        }));
+      }
     }
     const result = results.length === 1 ? results[0] : results;
     invalidateSub2ApiAccountStatusCache();
@@ -545,6 +580,9 @@ async function handleApi(req, res, requestUrl) {
       selected: selected.length,
       uploaded: downloadable.length,
       skipped: selected.length - downloadable.length,
+      created: createdCount,
+      updated: updatedCount,
+      updatedAccountIds,
       groupIds: config.groupIds,
       result,
     });
@@ -3056,6 +3094,10 @@ function normalizeSub2ApiWsMode(value) {
 
 function buildSub2ApiAccountExtra(value, config) {
   const extra = value && typeof value === "object" ? { ...value } : {};
+  // OpenAI OAuth accounts imported by toSub2 are always opted out of model
+  // training. Keep this in the shared payload builder so new uploads,
+  // workspace switches, and credential repairs use the same privacy state.
+  extra.privacy_mode = "training_off";
   extra.codex_fingerprint_mode = config.codexFingerprintMode;
   extra.openai_oauth_responses_websockets_v2_mode = config.wsMode;
   extra.openai_oauth_responses_websockets_v2_enabled = config.wsMode !== "off";

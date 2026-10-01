@@ -835,6 +835,7 @@ try {
   assert.equal(uploadedAccounts[0].status, "active");
   assert.equal(uploadedAccounts[0].schedulable, true);
   assert.equal(uploadedAccounts[0].extra.codex_fingerprint_mode, "full");
+  assert.equal(uploadedAccounts[0].extra.privacy_mode, "training_off");
   assert.equal(uploadedAccounts[0].extra.openai_oauth_responses_websockets_v2_mode, "http_bridge");
   assert.equal(uploadedAccounts[0].extra.openai_oauth_responses_websockets_v2_enabled, true);
   assert.deepEqual(uploadedAccounts[0].credentials.model_mapping, { "gpt-5": "gpt-5", "gpt-5-mini": "gpt-5-mini" });
@@ -1161,9 +1162,10 @@ try {
     }),
   });
   assert.equal(legacyUploadResponse.status, 200, await legacyUploadResponse.text());
-  assert.equal(uploadedAccounts[0].extra.codex_fingerprint_mode, "session", "旧配置未填写时应使用 Sub2API 的推荐默认值");
-  assert.equal(uploadedAccounts[0].extra.openai_oauth_responses_websockets_v2_mode, "off", "旧配置未填写时 WS mode 应保持关闭");
-  assert.equal(uploadedAccounts[0].extra.openai_oauth_responses_websockets_v2_enabled, false);
+  assert.equal(updatedRemoteAccounts.get(101).extra.codex_fingerprint_mode, "session", "旧配置未填写时应使用 Sub2API 的推荐默认值");
+  assert.equal(updatedRemoteAccounts.get(101).extra.openai_oauth_responses_websockets_v2_mode, "off", "旧配置未填写时 WS mode 应保持关闭");
+  assert.equal(updatedRemoteAccounts.get(101).extra.openai_oauth_responses_websockets_v2_enabled, false);
+  assert.equal(updatedRemoteAccounts.get(101).extra.privacy_mode, "training_off");
 
   const legacyWsModeUploadResponse = await fetch(`${baseUrl}/api/sub2api/upload`, {
     method: "POST",
@@ -1174,8 +1176,8 @@ try {
     }),
   });
   assert.equal(legacyWsModeUploadResponse.status, 200, await legacyWsModeUploadResponse.text());
-  assert.equal(uploadedAccounts[0].extra.openai_oauth_responses_websockets_v2_mode, "http_bridge", "旧 WS mode 别名应归一化");
-  assert.equal(uploadedAccounts[0].extra.openai_oauth_responses_websockets_v2_enabled, true);
+  assert.equal(updatedRemoteAccounts.get(101).extra.openai_oauth_responses_websockets_v2_mode, "http_bridge", "旧 WS mode 别名应归一化");
+  assert.equal(updatedRemoteAccounts.get(101).extra.openai_oauth_responses_websockets_v2_enabled, true);
 
   const disabledFingerprintUploadResponse = await fetch(`${baseUrl}/api/sub2api/upload`, {
     method: "POST",
@@ -1186,7 +1188,7 @@ try {
     }),
   });
   assert.equal(disabledFingerprintUploadResponse.status, 200, await disabledFingerprintUploadResponse.text());
-  assert.equal(uploadedAccounts[0].extra.codex_fingerprint_mode, "off", "关闭模式必须显式写入，不能退回默认值");
+  assert.equal(updatedRemoteAccounts.get(101).extra.codex_fingerprint_mode, "off", "关闭模式必须显式写入，不能退回默认值");
 
   const invalidWsModeUploadResponse = await fetch(`${baseUrl}/api/sub2api/upload`, {
     method: "POST",
@@ -1297,11 +1299,11 @@ try {
   assert.equal(mixedUploadResponse.status, 200, mixedUploadText);
   const mixedUpload = JSON.parse(mixedUploadText);
   assert.equal(mixedUpload.uploaded, 2);
-  assert.equal(Array.isArray(mixedUpload.result), true);
-  assert.equal(mixedUpload.result.length, 2);
-  assert.equal(batchUploadCount - mixedUploadStart, 2, "同一批不同 PlanType 应按方案各发一个 batch");
-  const mixedBatches = uploadedBatches.slice(-2);
-  assert.deepEqual(mixedBatches.map((batch) => batch[0].group_ids).sort((a, b) => a[0] - b[0]), [[7], [71]]);
+  assert.equal(mixedUpload.created, 1);
+  assert.equal(mixedUpload.updated, 2);
+  assert.equal(batchUploadCount - mixedUploadStart, 1, "已存在账号应 PUT 更新，新账号才走 batch");
+  const mixedBatches = uploadedBatches.slice(-1);
+  assert.deepEqual(mixedBatches.map((batch) => batch[0].group_ids), [[7]]);
 
   const sourceResponse = await fetch(`${baseUrl}/api/jobs/export-source`, {
     method: "POST",
@@ -1578,6 +1580,7 @@ try {
   assert.deepEqual(updatedRemoteAccounts.get(91).extra, {
     existing_setting: "preserved",
     codex_fingerprint_mode: "full",
+    privacy_mode: "training_off",
     openai_oauth_responses_websockets_v2_mode: "http_bridge",
     openai_oauth_responses_websockets_v2_enabled: true,
   });
