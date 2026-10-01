@@ -1955,8 +1955,15 @@ function App() {
                   </label>
                   <button type="button" className="icon-button danger" onClick={removeSub2ApiProfile} disabled={sub2apiSettingsDraft.profiles.length <= 1 || sub2apiSettingsDraft.activeProfileId === "default"} title={sub2apiSettingsDraft.activeProfileId === "default" ? "默认方案不可删除" : "删除当前方案"} aria-label="删除当前方案"><Trash2 size={16} /></button>
                 </div>
+                <div className="sub2api-profile-fallback-hint" role="note">
+                  <strong>未绑定回退规则</strong>
+                  <span>账号的 PlanType 没有绑定方案时，会使用当前方案“{sub2apiSettingsDraft.name || "当前方案"}”；已绑定的 PlanType 优先使用绑定方案。</span>
+                </div>
                 <div className="sub2api-binding-panel">
-                  <div className="sub2api-binding-heading"><span>PlanType 绑定（当前方案）</span><small>仅显示绑定到“{sub2apiSettingsDraft.name || "当前方案"}”的检测类型；切换方案后列表会随之切换。巡检发现订阅类型变化时，会更新已有账号，不会新建文件。</small></div>
+                  <div className="sub2api-binding-heading">
+                    <span>PlanType 绑定（当前方案）</span>
+                    <small>左框是账号实际检测到的原始 PlanType（括号内显示原始值）；右框是匹配后使用的 Sub2API 配置方案。箭头表示“检测类型 → 配置方案”。仅显示绑定到“{sub2apiSettingsDraft.name || "当前方案"}”的检测类型；切换方案后列表会随之切换。</small>
+                  </div>
                   <div className="sub2api-binding-list">
                     {activeProfileBindings.map(([planType, profileId]) => (
                       <div className="sub2api-binding-row" key={planType}>
