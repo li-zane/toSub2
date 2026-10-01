@@ -3958,7 +3958,8 @@ function normalizeSub2ApiUsage(account, fallbackFetchedAt = null) {
         overageLimitReached: typeof creditsRaw.overage_limit_reached === "boolean" ? creditsRaw.overage_limit_reached : null,
       }
     : null;
-  if (!primary && !secondary && !credits) return null;
+  const details = normalizeSub2ApiUsageDetails(extra, primary, secondary, account);
+  if (!primary && !secondary && !credits && !details.tokens && !details.billing && !details.reset && !details.points) return null;
   const limitReached = [primary, secondary].some((window) => window?.usedPercent !== null && window.usedPercent >= 100)
     ? true
     : [primary, secondary].some(Boolean) ? false : null;
@@ -3972,6 +3973,7 @@ function normalizeSub2ApiUsage(account, fallbackFetchedAt = null) {
     primary,
     secondary,
     credits,
+    ...details,
   };
 }
 
@@ -3997,6 +3999,10 @@ function publicSub2ApiUsage(usage) {
     primary: publicSub2ApiUsageWindow(usage.primary),
     secondary: publicSub2ApiUsageWindow(usage.secondary),
     credits: usage.credits ? { ...usage.credits } : null,
+    tokens: usage.tokens ? { ...usage.tokens, byWindow: usage.tokens.byWindow ? { ...usage.tokens.byWindow } : null } : null,
+    billing: usage.billing ? { ...usage.billing } : null,
+    reset: usage.reset ? { ...usage.reset, credits: Array.isArray(usage.reset.credits) ? usage.reset.credits.map((credit) => ({ ...credit })) : [] } : null,
+    points: usage.points ? { ...usage.points, items: Array.isArray(usage.points.items) ? usage.points.items.map((item) => ({ ...item })) : [] } : null,
   };
 }
 
@@ -4018,6 +4024,10 @@ function mergeSub2ApiUsage(current, next) {
   const primary = preferNext ? (next.primary || current.primary) : (current.primary || next.primary);
   const secondary = preferNext ? (next.secondary || current.secondary) : (current.secondary || next.secondary);
   const credits = preferNext ? (next.credits || current.credits) : (current.credits || next.credits);
+  const tokens = preferNext ? (next.tokens || current.tokens) : (current.tokens || next.tokens);
+  const billing = preferNext ? (next.billing || current.billing) : (current.billing || next.billing);
+  const reset = preferNext ? (next.reset || current.reset) : (current.reset || next.reset);
+  const points = preferNext ? (next.points || current.points) : (current.points || next.points);
   return {
     ...current,
     ...next,
@@ -4029,6 +4039,10 @@ function mergeSub2ApiUsage(current, next) {
     primary,
     secondary,
     credits,
+    tokens,
+    billing,
+    reset,
+    points,
   };
 }
 
@@ -4051,13 +4065,198 @@ function normalizeSub2ApiUsageWindow(extra, window) {
     [extra[`${prefix}_window_minutes`], extra[`${legacyPrefix}_window_minutes`]],
     normalizeSub2ApiUsageSeconds,
   );
-  if (usedPercent === null && !resetAt && resetAfterSeconds === null && windowMinutes === null) return null;
+  const stats = normalizeSub2ApiWindowStats(
+    extra[`${prefix}_window_stats`]
+      || extra[`${prefix}_windowStats`]
+      || extra[`${legacyPrefix}_window_stats`]
+      || extra[`${legacyPrefix}_windowStats`],
+  );
+  if (usedPercent === null && !resetAt && resetAfterSeconds === null && windowMinutes === null && !stats) return null;
   return {
     usedPercent: usagePercentAfterReset(usedPercent, resetAt),
     resetAfterSeconds: resetAfterSeconds && resetAfterSeconds > 0 ? resetAfterSeconds : null,
     resetAt,
     limitWindowSeconds: windowMinutes && windowMinutes > 0 ? windowMinutes * 60 : null,
+    stats,
   };
+}
+
+function normalizeSub2ApiUsageDetails(data, primary = null, secondary = null, account = null) {
+  const source = data && typeof data === "object" && !Array.isArray(data) ? data : {};
+  const stats = {
+    primary: primary?.stats || null,
+    secondary: secondary?.stats || null,
+  };
+  const tokens = normalizeSub2ApiTokens(source, stats);
+  const billing = normalizeSub2ApiBilling(source, stats);
+  const reset = normalizeSub2ApiReset(source, account, primary, secondary);
+  const points = normalizeSub2ApiPoints(source);
+  return { tokens, billing, reset, points };
+}
+
+function normalizeSub2ApiUsageWindowStats(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const requests = firstSub2ApiUsageNumber(
+    [value.requests, value.request_count, value.requestCount],
+    { integer: true },
+  );
+  const tokens = firstSub2ApiUsageNumber(
+    [value.tokens, value.total_tokens, value.totalTokens, value.token_count, value.tokenCount],
+    { integer: true },
+  );
+  const inputTokens = firstSub2ApiUsageNumber(
+    [value.input_tokens, value.inputTokens, value.prompt_tokens, value.promptTokens],
+    { integer: true },
+  );
+  const outputTokens = firstSub2ApiUsageNumber(
+    [value.output_tokens, value.outputTokens, value.completion_tokens, value.completionTokens],
+    { integer: true },
+  );
+  const cachedTokens = firstSub2ApiUsageNumber(
+    [value.cached_tokens, value.cachedTokens, value.cache_read_input_tokens, value.cacheReadInputTokens],
+    { integer: true },
+  );
+  const cost = firstSub2ApiUsageNumber([value.cost, value.amount, value.total_cost, value.totalCost]);
+  const standardCost = firstSub2ApiUsageNumber([value.standard_cost, value.standardCost]);
+  const userCost = firstSub2ApiUsageNumber([value.user_cost, value.userCost, value.actual_cost, value.actualCost]);
+  if ([requests, tokens, inputTokens, outputTokens, cachedTokens, cost, standardCost, userCost].every((item) => item === null)) return null;
+  return {
+    requests,
+    tokens,
+    inputTokens,
+    outputTokens,
+    cachedTokens,
+    cost,
+    standardCost,
+    userCost,
+  };
+}
+
+function normalizeSub2ApiWindowStats(value) {
+  return normalizeSub2ApiUsageWindowStats(value);
+}
+
+function firstSub2ApiUsageNumber(values, { integer = false } = {}) {
+  for (const value of values) {
+    if (value === null || value === undefined || String(value).trim() === "") continue;
+    const number = Number(value);
+    if (!Number.isFinite(number) || number < 0) continue;
+    return integer ? Math.round(number) : number;
+  }
+  return null;
+}
+
+function normalizeSub2ApiTokens(data, stats) {
+  const source = data.tokens || data.token_usage || data.tokenUsage || data.usage_tokens;
+  const tokenSource = source && typeof source === "object" && !Array.isArray(source) ? source : data;
+  const byWindow = {};
+  for (const [key, value] of Object.entries(stats || {})) {
+    if (value) byWindow[key] = { ...value };
+  }
+  const windowValues = Object.values(stats || {}).filter(Boolean);
+  const total = firstSub2ApiUsageNumber(
+    [tokenSource.total, tokenSource.total_tokens, tokenSource.totalTokens, tokenSource.tokens],
+    { integer: true },
+  ) ?? sumSub2ApiUsageNumbers(windowValues.map((item) => item.tokens));
+  const input = firstSub2ApiUsageNumber(
+    [tokenSource.input, tokenSource.input_tokens, tokenSource.inputTokens, tokenSource.prompt_tokens, tokenSource.promptTokens],
+    { integer: true },
+  ) ?? sumSub2ApiUsageNumbers(windowValues.map((item) => item.inputTokens));
+  const output = firstSub2ApiUsageNumber(
+    [tokenSource.output, tokenSource.output_tokens, tokenSource.outputTokens, tokenSource.completion_tokens, tokenSource.completionTokens],
+    { integer: true },
+  ) ?? sumSub2ApiUsageNumbers(windowValues.map((item) => item.outputTokens));
+  const cached = firstSub2ApiUsageNumber(
+    [tokenSource.cached, tokenSource.cached_tokens, tokenSource.cachedTokens, tokenSource.cache_read_input_tokens, tokenSource.cacheReadInputTokens],
+    { integer: true },
+  ) ?? sumSub2ApiUsageNumbers(windowValues.map((item) => item.cachedTokens));
+  const requests = firstSub2ApiUsageNumber(
+    [tokenSource.requests, tokenSource.request_count, tokenSource.requestCount],
+    { integer: true },
+  ) ?? sumSub2ApiUsageNumbers(windowValues.map((item) => item.requests));
+  if (total === null && input === null && output === null && cached === null && requests === null && !Object.keys(byWindow).length) return null;
+  return { total, input, output, cached, requests, byWindow };
+}
+
+function normalizeSub2ApiBilling(data, stats) {
+  const source = data.billing || data.billing_data || data.billingData || data.grok_billing;
+  const billingSource = source && typeof source === "object" && !Array.isArray(source) ? source : data;
+  const statValues = Object.values(stats || {}).filter(Boolean);
+  const cost = firstSub2ApiUsageNumber(
+    [billingSource.cost, billingSource.amount, billingSource.total_cost, billingSource.totalCost, billingSource.charged],
+  ) ?? sumSub2ApiUsageNumbers(statValues.map((item) => item.cost));
+  const standardCost = firstSub2ApiUsageNumber(
+    [billingSource.standard_cost, billingSource.standardCost],
+  ) ?? sumSub2ApiUsageNumbers(statValues.map((item) => item.standardCost));
+  const userCost = firstSub2ApiUsageNumber(
+    [billingSource.user_cost, billingSource.userCost, billingSource.actual_cost, billingSource.actualCost],
+  ) ?? sumSub2ApiUsageNumbers(statValues.map((item) => item.userCost));
+  const currency = normalizeSub2ApiLabel(billingSource.currency || billingSource.currency_code || billingSource.currencyCode);
+  const periodStart = normalizeSub2ApiUsageDate(billingSource.period_start || billingSource.periodStart || billingSource.start_at || billingSource.startAt);
+  const periodEnd = normalizeSub2ApiUsageDate(billingSource.period_end || billingSource.periodEnd || billingSource.end_at || billingSource.endAt);
+  if (cost === null && standardCost === null && userCost === null && !currency && !periodStart && !periodEnd) return null;
+  return { cost, standardCost, userCost, currency: currency || null, periodStart, periodEnd };
+}
+
+function normalizeSub2ApiReset(data, account, primary, secondary) {
+  const source = data.rate_limit_reset_credits
+    || data.rateLimitResetCredits
+    || data.reset_credits
+    || data.resetCredits;
+  const resetSource = source && typeof source === "object" && !Array.isArray(source) ? source : null;
+  const credits = Array.isArray(resetSource?.credits)
+    ? resetSource.credits.map((credit) => ({
+        expiresAt: normalizeSub2ApiUsageDate(credit?.expires_at ?? credit?.expiresAt),
+      })).filter((credit) => credit.expiresAt)
+    : [];
+  const availableCount = firstSub2ApiUsageNumber(
+    [resetSource?.available_count, resetSource?.availableCount, data.reset_credit_count, data.resetCreditCount],
+    { integer: true },
+  );
+  const available = availableCount ?? (credits.length ? credits.length : null);
+  const directResetAt = normalizeSub2ApiUsageDate(
+    data.rate_limit_reset_at
+      ?? data.rateLimitResetAt
+      ?? account?.rate_limit_reset_at
+      ?? account?.rateLimitResetAt,
+  );
+  const windowResetAt = [primary?.resetAt, secondary?.resetAt].filter(Boolean).sort()[0] || null;
+  const resetAt = directResetAt || windowResetAt;
+  if (available === null && !credits.length && !resetAt) return null;
+  return { available, credits, resetAt };
+}
+
+function normalizeSub2ApiPoints(data) {
+  const direct = data.points
+    || data.point_balance
+    || data.pointBalance
+    || data.ai_credits;
+  const items = Array.isArray(direct)
+    ? direct.map((item) => ({
+        type: normalizeSub2ApiLabel(item?.credit_type || item?.creditType || item?.type),
+        amount: firstSub2ApiUsageNumber([item?.amount, item?.balance, item?.value]),
+        minimum: firstSub2ApiUsageNumber([item?.minimum_balance, item?.minimumBalance, item?.minimum]),
+      })).filter((item) => item.type || item.amount !== null)
+    : [];
+  const source = direct && typeof direct === "object" && !Array.isArray(direct) ? direct : data;
+  const balance = firstSub2ApiUsageNumber([source.balance, source.points, source.point_balance, source.pointBalance]);
+  const total = firstSub2ApiUsageNumber([source.total, source.total_points, source.totalPoints]);
+  const unlimited = typeof source.unlimited === "boolean" ? source.unlimited : null;
+  const hasCredits = typeof source.has_credits === "boolean"
+    ? source.has_credits
+    : typeof source.hasCredits === "boolean" ? source.hasCredits : null;
+  if (balance === null && total === null && !items.length && unlimited === null && hasCredits === null) return null;
+  return { balance, total, unlimited, hasCredits, items };
+}
+
+function sumSub2ApiUsageNumbers(values) {
+  const numbers = values.filter((value) => Number.isFinite(value));
+  return numbers.length ? numbers.reduce((sum, value) => sum + value, 0) : null;
+}
+
+function normalizeSub2ApiLabel(value) {
+  const text = String(value ?? "").trim();
+  return text && text.length <= 64 ? text : "";
 }
 
 function firstSub2ApiUsageValue(values, normalize) {
@@ -4611,6 +4810,10 @@ async function getAccountUsage(job, forceRefresh = false) {
     primary: null,
     secondary: null,
     credits: null,
+    tokens: null,
+    billing: null,
+    reset: null,
+    points: null,
   };
 }
 
@@ -4618,10 +4821,10 @@ async function refreshSub2ApiAccountUsage(config, accountIds) {
   if (!config?.baseUrl || !config?.adminApiKey) return null;
   const ids = [...new Set(accountIds.map((value) => normalizeSub2ApiAccountId(value)).filter(Boolean))].slice(0, 8);
   if (!ids.length) return null;
-  const responses = await Promise.allSettled(ids.map((accountId) => requestSub2Api(
-    config,
-    `/api/v1/admin/accounts/${encodeURIComponent(accountId)}/usage?source=active&force=true`,
-  )));
+  const responses = await Promise.allSettled(ids.flatMap((accountId) => [
+    requestSub2Api(config, `/api/v1/admin/accounts/${encodeURIComponent(accountId)}/usage?source=active&force=true`),
+    requestSub2Api(config, `/api/v1/admin/openai/accounts/${encodeURIComponent(accountId)}/quota`),
+  ]));
   const usages = responses
     .filter((result) => result.status === "fulfilled")
     .map((result) => normalizeSub2ApiUsagePayload(result.value))
@@ -4644,7 +4847,8 @@ function normalizeSub2ApiUsagePayload(payload) {
   );
   const snapshotTimestamp = normalizeSub2ApiUsageDate(data.updated_at ?? data.updatedAt ?? data.fetched_at ?? data.fetchedAt);
   const fetchedAt = snapshotTimestamp || new Date().toISOString();
-  if (!primary && !secondary) return null;
+  const details = normalizeSub2ApiUsageDetails(data, primary, secondary);
+  if (!primary && !secondary && !details.tokens && !details.billing && !details.reset && !details.points) return null;
   const inferredLimitReached = [primary, secondary].some((window) => window?.usedPercent !== null && window.usedPercent >= 100);
   const limitReached = typeof data.limit_reached === "boolean"
     ? data.limit_reached
@@ -4669,7 +4873,8 @@ function normalizeSub2ApiUsagePayload(payload) {
     limitReached,
     primary,
     secondary,
-    credits: normalizeSub2ApiCredits(data.credits),
+    credits: normalizeSub2ApiCredits(data.credits || data.codex_credits_snapshot?.credits),
+    ...details,
   };
 }
 
@@ -4687,7 +4892,8 @@ function normalizeSub2ApiResponseWindow(value, fallbackWindow) {
     [value.remaining_seconds, value.reset_after_seconds, value.resetAfterSeconds],
     normalizeSub2ApiUsageSeconds,
   );
-  if (usedPercent === null && !resetAt && resetAfterSeconds === null) return null;
+  const stats = normalizeSub2ApiWindowStats(value.window_stats ?? value.windowStats ?? value.stats);
+  if (usedPercent === null && !resetAt && resetAfterSeconds === null && !stats) return null;
   return {
     usedPercent: usagePercentAfterReset(usedPercent, resetAt),
     resetAfterSeconds: resetAfterSeconds && resetAfterSeconds > 0 ? resetAfterSeconds : null,
@@ -4696,6 +4902,7 @@ function normalizeSub2ApiResponseWindow(value, fallbackWindow) {
       [value.limit_window_seconds, value.limitWindowSeconds],
       normalizeSub2ApiUsageSeconds,
     ) || (fallbackWindow === "5h" ? 18_000 : 604_800),
+    stats,
   };
 }
 

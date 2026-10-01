@@ -3463,7 +3463,11 @@ function AccountUsageCell({ usage, available, enabled, onRefresh }) {
   const primary = usage.primary;
   const secondary = usage.secondary;
   const credits = usage.credits;
-  if (!primary && !secondary && !credits && usage.allowed === null && usage.limitReached === null) {
+  const tokens = usage.tokens;
+  const billing = usage.billing;
+  const reset = usage.reset;
+  const points = usage.points;
+  if (!primary && !secondary && !credits && !tokens && !billing && !reset && !points && usage.allowed === null && usage.limitReached === null) {
     return (
       <span className="usage-empty">
         <span className="usage-state muted">暂无数据</span>
@@ -3485,8 +3489,82 @@ function AccountUsageCell({ usage, available, enabled, onRefresh }) {
       {windows.map((item) => <UsageWindowProgress key={item.key} tone={item.key} label={item.label} window={item.value} />)}
       {credits && credits.unlimited === true && <span className="usage-window">无限额度</span>}
       {credits && credits.balance !== null && <span className="usage-window">额度 {credits.balance}</span>}
+      {tokens && <UsageDetailsRow label="Token" value={formatUsageTokenSummary(tokens)} title={formatUsageTokenDetails(tokens)} />}
+      {billing && <UsageDetailsRow label="计费" value={formatUsageBillingSummary(billing)} title={formatUsageBillingDetails(billing)} />}
+      {reset && reset.available !== null && <UsageDetailsRow label="重置卡" value={`${formatUsageCount(reset.available)} 张`} title={formatUsageResetDetails(reset)} />}
+      {points && <UsageDetailsRow label="点数" value={formatUsagePointsSummary(points)} title={formatUsagePointsDetails(points)} />}
     </div>
   );
+}
+
+function UsageDetailsRow({ label, value, title }) {
+  if (!value) return null;
+  return <span className="usage-detail" title={title || value}><strong>{label}</strong>{value}</span>;
+}
+
+function formatUsageCount(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "—";
+  return new Intl.NumberFormat("zh-CN", { notation: "compact", maximumFractionDigits: 1 }).format(number);
+}
+
+function formatUsageTokenSummary(tokens) {
+  if (tokens.input !== null || tokens.output !== null) {
+    return `入 ${formatUsageCount(tokens.input)} / 出 ${formatUsageCount(tokens.output)}`;
+  }
+  if (tokens.total !== null) return `总 ${formatUsageCount(tokens.total)}`;
+  if (tokens.cached !== null) return `缓存 ${formatUsageCount(tokens.cached)}`;
+  return tokens.requests !== null ? `${formatUsageCount(tokens.requests)} 次请求` : "已同步";
+}
+
+function formatUsageTokenDetails(tokens) {
+  const parts = [];
+  if (tokens.total !== null) parts.push(`总量 ${formatUsageCount(tokens.total)}`);
+  if (tokens.input !== null) parts.push(`输入 ${formatUsageCount(tokens.input)}`);
+  if (tokens.output !== null) parts.push(`输出 ${formatUsageCount(tokens.output)}`);
+  if (tokens.cached !== null) parts.push(`缓存 ${formatUsageCount(tokens.cached)}`);
+  if (tokens.requests !== null) parts.push(`请求 ${formatUsageCount(tokens.requests)}`);
+  return parts.join("，") || "Token 已同步";
+}
+
+function formatUsageBillingSummary(billing) {
+  const value = billing.cost ?? billing.standardCost ?? billing.userCost;
+  if (value === null || value === undefined) return "已同步";
+  const currency = billing.currency ? `${billing.currency} ` : "";
+  return `${currency}${Number(value).toFixed(4)}`;
+}
+
+function formatUsageBillingDetails(billing) {
+  const parts = [];
+  if (billing.cost !== null) parts.push(`账号费用 ${formatUsageBillingSummary({ ...billing, standardCost: null, userCost: null })}`);
+  if (billing.standardCost !== null) parts.push(`标准费用 ${Number(billing.standardCost).toFixed(4)}`);
+  if (billing.userCost !== null) parts.push(`用户费用 ${Number(billing.userCost).toFixed(4)}`);
+  if (billing.periodStart) parts.push(`开始 ${formatDateTime(billing.periodStart)}`);
+  if (billing.periodEnd) parts.push(`结束 ${formatDateTime(billing.periodEnd)}`);
+  return parts.join("，") || "计费数据已同步";
+}
+
+function formatUsageResetDetails(reset) {
+  const parts = [`可用 ${formatUsageCount(reset.available)} 张`];
+  if (reset.credits?.length) parts.push(`最近到期 ${formatUsageResetAt(reset.credits[0].expiresAt)}`);
+  if (reset.resetAt) parts.push(`窗口 ${formatUsageResetAt(reset.resetAt)}`);
+  return parts.join("，");
+}
+
+function formatUsagePointsSummary(points) {
+  if (points.unlimited === true) return "无限";
+  if (points.balance !== null) return formatUsageCount(points.balance);
+  if (points.total !== null) return formatUsageCount(points.total);
+  if (points.items?.length) return `${formatUsageCount(points.items.reduce((sum, item) => sum + (Number(item.amount) || 0), 0))}`;
+  return "已同步";
+}
+
+function formatUsagePointsDetails(points) {
+  const parts = [];
+  if (points.balance !== null) parts.push(`余额 ${formatUsageCount(points.balance)}`);
+  if (points.total !== null) parts.push(`总量 ${formatUsageCount(points.total)}`);
+  if (points.items?.length) parts.push(points.items.map((item) => `${item.type || "点数"} ${formatUsageCount(item.amount)}`).join("、"));
+  return parts.join("，") || "点数数据已同步";
 }
 
 function UsageWindowProgress({ tone, label, window }) {
