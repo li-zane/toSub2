@@ -23,6 +23,9 @@ const acceptedAdminKeys = new Set(["test-admin-key", "rotated-admin-key"]);
 let openaiGroupsMode = "normal";
 let compositeGroupsMode = "normal";
 const updatedRemoteAccounts = new Map();
+const proxyStates = new Map([
+  [3, { id: 3, name: "测试代理", protocol: "http", host: "proxy.example", port: 8080, ip_address: "203.0.113.10", status: "active" }],
+]);
 const activeUsageByAccountId = new Map();
 const clearedRemoteAccountIds = new Set();
 const scheduledRemoteAccounts = new Map();
@@ -61,7 +64,19 @@ const sub2api = http.createServer(async (req, res) => {
   }
   if (req.method === "GET" && req.url === "/api/v1/admin/proxies/all") {
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify([{ id: 3, name: "测试代理", protocol: "http", host: "proxy.example", port: 8080, ip_address: "203.0.113.10", status: "active" }]));
+    res.end(JSON.stringify([...proxyStates.values()]));
+    return;
+  }
+  const proxyDetailMatch = /^\/api\/v1\/admin\/proxies\/(\d+)$/.exec(req.url || "");
+  if (req.method === "GET" && proxyDetailMatch) {
+    const proxy = proxyStates.get(Number(proxyDetailMatch[1]));
+    if (!proxy) {
+      res.writeHead(404, { "content-type": "application/json" });
+      res.end(JSON.stringify({ message: "proxy not found" }));
+      return;
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ code: 0, message: "success", data: proxy }));
     return;
   }
   if (req.method === "POST" && req.url === "/api/v1/admin/accounts/batch") {
@@ -1522,6 +1537,204 @@ try {
   assert.equal(nonActiveGroupResponse.status, 200, nonActiveGroupText);
   const nonActiveGroupResult = JSON.parse(nonActiveGroupText).result;
   assert.equal(nonActiveGroupResult.missingTask, 1, "非活动方案号池中的异常账号也应被巡检");
+
+  // Saving a changed profile pushes only the changed fields to pool accounts
+  // whose PlanType was already bound to it.
+  remoteErrorAccounts = [
+    {
+      id: 130,
+      name: "oauth---bound-a@example.com",
+      platform: "openai",
+      type: "oauth",
+      status: "active",
+      credentials: { email: "bound-a@example.com", plan_type: "self_serve_business_prolite" },
+      group_ids: [71],
+      concurrency: 4,
+      priority: 99,
+      extra: { existing_setting: "keep" },
+    },
+    {
+      id: 131,
+      name: "oauth---unbound-free@example.com",
+      platform: "openai",
+      type: "oauth",
+      status: "active",
+      credentials: { email: "unbound-free@example.com", plan_type: "free" },
+      group_ids: [7],
+    },
+    {
+      id: 132,
+      name: "oauth---bound-b@example.com",
+      platform: "openai",
+      type: "oauth",
+      status: "active",
+      credentials: { email: "bound-b@example.com", plan_type: "self_serve_business_prolite" },
+      group_ids: [71],
+      extra: JSON.stringify({ existing_setting: "keep-string" }),
+    },
+  ];
+  const withBusinessProfile = (overrides, extra = {}, defaultOverrides = {}) => ({
+    ...monitorConfig,
+    ...extra,
+    profiles: monitorConfig.profiles.map((profile) => {
+      if (profile.id === "business-plan") return { ...profile, ...overrides };
+      if (profile.id === "default") return { ...profile, ...defaultOverrides };
+      return profile;
+    }),
+  });
+  const saveSettings = async (config) => {
+    const response = await fetch(`${baseUrl}/api/sub2api/settings`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ config }),
+    });
+    const text = await response.text();
+    assert.equal(response.status, 200, text);
+    return JSON.parse(text);
+  };
+
+  updatedRemoteAccounts.clear();
+  // The same save also edits the fallback (default) profile and newly binds
+  // free; neither may be pushed automatically.
+  const concurrencySave = await saveSettings(withBusinessProfile(
+    { concurrency: "8" },
+    { planTypeBindings: { self_serve_business_prolite: "business-plan", free: "business-plan" } },
+    { groupIds: ["8"] },
+  ));
+  assert.deepEqual(concurrencySave.profileSync.planTypes, ["self_serve_business_prolite"]);
+  assert.deepEqual(concurrencySave.profileSync.fields, ["concurrency"]);
+  assert.equal(concurrencySave.profileSync.matched, 2);
+  assert.equal(concurrencySave.profileSync.updated, 2);
+  assert.equal(concurrencySave.profileSync.failed, 0);
+  assert.deepEqual(updatedRemoteAccounts.get(130), { concurrency: 8 }, "只推送改动的字段，保留手动调整过的优先级");
+  assert.deepEqual(updatedRemoteAccounts.get(132), { concurrency: 8 });
+  assert.equal(updatedRemoteAccounts.has(131), false, "新绑定或未绑定的 PlanType 不应自动推送");
+  assert.equal(remoteErrorAccounts.find((account) => account.id === 130).priority, 99);
+
+  updatedRemoteAccounts.clear();
+  const unchangedSave = await saveSettings(withBusinessProfile({ concurrency: "8" }, {
+    planTypeBindings: { self_serve_business_prolite: "business-plan", free: "business-plan" },
+  }));
+  assert.equal(unchangedSave.profileSync, null, "方案参数未变化时不应推送");
+  assert.equal(updatedRemoteAccounts.size, 0);
+
+  updatedRemoteAccounts.clear();
+  const wsModeSave = await saveSettings(withBusinessProfile({ concurrency: "8", wsMode: "passthrough" }, {
+    planTypeBindings: { self_serve_business_prolite: "business-plan", free: "business-plan" },
+  }));
+  assert.deepEqual(wsModeSave.profileSync.fields, ["wsMode"]);
+  assert.equal(wsModeSave.profileSync.updated, 3, "free 已在上一次保存时绑定，本次变更应一并推送");
+  assert.deepEqual(Object.keys(updatedRemoteAccounts.get(130)), ["extra"]);
+  assert.equal(updatedRemoteAccounts.get(130).extra.existing_setting, "keep");
+  assert.equal(updatedRemoteAccounts.get(130).extra.openai_oauth_responses_websockets_v2_mode, "passthrough");
+  assert.equal(updatedRemoteAccounts.get(130).extra.codex_fingerprint_mode, "full");
+  assert.equal(updatedRemoteAccounts.get(132).extra.existing_setting, "keep-string", "字符串形式的 extra 应先解析再合并");
+
+  updatedRemoteAccounts.clear();
+  const clearedSave = await saveSettings(withBusinessProfile({ concurrency: "", wsMode: "passthrough" }, {
+    planTypeBindings: { self_serve_business_prolite: "business-plan", free: "business-plan" },
+  }));
+  assert.deepEqual(clearedSave.profileSync.fields, []);
+  assert.deepEqual(clearedSave.profileSync.skippedFields, ["concurrency"]);
+  assert.equal(updatedRemoteAccounts.size, 0, "清空方案字段时应保留号池账号原值");
+
+  updatedRemoteAccounts.clear();
+  const directProxySave = await saveSettings(withBusinessProfile({ concurrency: "", wsMode: "passthrough", proxyId: "direct" }, {
+    planTypeBindings: { self_serve_business_prolite: "business-plan", free: "business-plan" },
+  }));
+  assert.deepEqual(directProxySave.profileSync.fields, ["proxyId"]);
+  assert.equal(directProxySave.profileSync.updated, 3);
+  assert.deepEqual(updatedRemoteAccounts.get(130), { proxy_id: 0 }, "明确选择无代理时应清除号池账号代理");
+  assert.deepEqual(updatedRemoteAccounts.get(132), { proxy_id: 0 });
+
+  const directUploadResponse = await fetch(`${baseUrl}/api/sub2api/upload`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      ids: [profileJob.id],
+      config: { baseUrl: sub2apiUrl, adminApiKey: "test-admin-key", proxyId: "direct" },
+    }),
+  });
+  const directUploadText = await directUploadResponse.text();
+  assert.equal(directUploadResponse.status, 200, directUploadText);
+  assert.equal(JSON.parse(directUploadText).created, 1);
+  assert.equal(uploadedAccounts[0].proxy_id, 0, "新上传账号选择无代理时也应显式发送 0");
+
+  remoteErrorAccounts = [];
+  const restoreProfileResponse = await fetch(`${baseUrl}/api/sub2api/monitor`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ enabled: true, config: monitorConfig }),
+  });
+  const restoreProfileText = await restoreProfileResponse.text();
+  assert.equal(restoreProfileResponse.status, 200, restoreProfileText);
+  assert.equal(JSON.parse(restoreProfileText).profileSync.matched, 0);
+
+  proxyStates.set(3, { id: 3, name: "过期代理", protocol: "http", host: "proxy.example", port: 8080, status: "expired", fallback_mode: "proxy", backup_proxy_id: 4 });
+  proxyStates.set(4, { id: 4, name: "备用代理", protocol: "http", host: "backup.example", port: 8080, status: "active" });
+  const refreshProxyStateResponse = await fetch(`${baseUrl}/api/sub2api/monitor`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ enabled: true, config: monitorConfig }),
+  });
+  assert.equal(refreshProxyStateResponse.status, 200, await refreshProxyStateResponse.text());
+  remoteErrorAccounts = [{
+    id: 133,
+    name: "oauth---proxy-fallback@example.com",
+    platform: "openai",
+    type: "oauth",
+    status: "active",
+    credentials: { email: "proxy-fallback@example.com", plan_type: "self_serve_business_prolite" },
+    group_ids: [71],
+    proxy_id: 3,
+  }];
+  updatedRemoteAccounts.clear();
+  const backupFallbackResponse = await fetch(`${baseUrl}/api/sub2api/monitor/check`, {
+    method: "POST",
+    headers,
+  });
+  const backupFallbackText = await backupFallbackResponse.text();
+  assert.equal(backupFallbackResponse.status, 200, backupFallbackText);
+  assert.equal(JSON.parse(backupFallbackText).result.proxyFallbackUpdated, 1);
+  assert.equal(updatedRemoteAccounts.get(133).proxy_id, 4, "过期代理应优先回退到可用备用代理");
+  assert.equal(remoteErrorAccounts[0].proxy_id, 4);
+
+  proxyStates.set(3, { id: 3, name: "已删除代理", protocol: "http", host: "proxy.example", port: 8080, status: "expired" });
+  remoteErrorAccounts = [{
+    id: 134,
+    name: "oauth---proxy-direct@example.com",
+    platform: "openai",
+    type: "oauth",
+    status: "active",
+    credentials: { email: "proxy-direct@example.com", plan_type: "self_serve_business_prolite" },
+    group_ids: [71],
+    proxy_id: 3,
+  }];
+  updatedRemoteAccounts.clear();
+  const rotatedMonitorResponse = await fetch(`${baseUrl}/api/sub2api/monitor`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ enabled: true, config: { ...monitorConfig, adminApiKey: "rotated-admin-key" } }),
+  });
+  assert.equal(rotatedMonitorResponse.status, 200, await rotatedMonitorResponse.text());
+  const directFallbackResponse = await fetch(`${baseUrl}/api/sub2api/monitor/check`, {
+    method: "POST",
+    headers,
+  });
+  const directFallbackText = await directFallbackResponse.text();
+  assert.equal(directFallbackResponse.status, 200, directFallbackText);
+  assert.equal(JSON.parse(directFallbackText).result.proxyFallbackUpdated, 1);
+  assert.equal(updatedRemoteAccounts.get(134).proxy_id, 0, "没有可用备用代理时应切换为直连");
+  assert.equal(remoteErrorAccounts[0].proxy_id, 0);
+
+  proxyStates.set(3, { id: 3, name: "测试代理", protocol: "http", host: "proxy.example", port: 8080, status: "active" });
+  remoteErrorAccounts = [];
+  const restoreProxyMonitorResponse = await fetch(`${baseUrl}/api/sub2api/monitor`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ enabled: true, config: monitorConfig }),
+  });
+  assert.equal(restoreProxyMonitorResponse.status, 200, await restoreProxyMonitorResponse.text());
 
   remoteErrorAccounts = [{
     id: 91,

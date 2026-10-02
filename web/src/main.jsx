@@ -588,6 +588,12 @@ function App() {
       void refreshSub2ApiAccountStatus(true).catch(() => {});
       setSub2apiSettingsOpen(false);
       setSub2apiSettingsError("");
+      const profileSync = savedSettings.profileSync || monitor.profileSync;
+      if (profileSync) {
+        const notice = formatProfileSyncNotice(profileSync);
+        if (profileSync.failed || (profileSync.error && !profileSync.updated)) setError(notice);
+        else setUploadNotice(notice);
+      }
     } catch (requestError) {
       setSub2apiSettingsError(requestError.message);
     } finally {
@@ -1957,7 +1963,7 @@ function App() {
                 <div className="sub2api-profile-header">
                   <div>
                     <strong>配置方案</strong>
-                    <small>管理地址、管理员密钥和自动检测为全局设置；号池、代理、模型、并发等内容按方案独立保存。</small>
+                    <small>管理地址、管理员密钥和自动检测为全局设置；号池、代理、模型、并发等内容按方案独立保存。保存后，改动的参数会自动同步到已绑定 PlanType 的号池账号。</small>
                   </div>
                   <button type="button" className="secondary-button" onClick={addSub2ApiProfile}><Plus size={15} />新增方案</button>
                 </div>
@@ -2067,6 +2073,7 @@ function App() {
                   onChange={(event) => updateSub2ApiDraftProfile({ proxyId: event.target.value })}
                 >
                   <option value="">使用账号原配置</option>
+                  <option value="direct">直连（无代理）</option>
                   {sub2apiProxies.map((proxy) => <option key={proxy.id} value={String(proxy.id)}>{formatSub2ApiProxy(proxy)}</option>)}
                 </select>
               </label>
@@ -3713,6 +3720,20 @@ function localTimestamp(date = new Date()) {
   return `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}-${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`;
 }
 
+function formatProfileSyncNotice(sync) {
+  const planTypes = (sync.planTypes || []).join("、");
+  const fields = (sync.fieldLabels || []).join("、");
+  const parts = [];
+  if (fields) {
+    parts.push(`已将方案变更（${fields}）同步到 ${planTypes} 的号池账号：更新 ${Number(sync.updated || 0)} / ${Number(sync.matched || 0)} 条`);
+  }
+  if (sync.failed) parts.push(`失败 ${sync.failed} 条`);
+  if (sync.incomplete) parts.push("Sub2API 账号列表不完整，可能有账号未更新");
+  if (sync.skippedFieldLabels?.length) parts.push(`${sync.skippedFieldLabels.join("、")}已清空，号池账号保留原值`);
+  if (sync.error) parts.push(sync.error);
+  return parts.join("；") || "配置已保存";
+}
+
 function formatMonitorResult(result) {
   if (!result || typeof result !== "object") return "号池巡检已完成";
   const parts = [`检查 ${Number(result.checked || 0)} 条异常记录`];
@@ -3721,6 +3742,8 @@ function formatMonitorResult(result) {
   if (result.planTypeUpdated) parts.push(`已按订阅方案更新 ${result.planTypeUpdated} 条`);
   if (result.planTypeSkipped) parts.push(`订阅方案未绑定 ${result.planTypeSkipped} 条`);
   if (result.planTypeUpdateFailed) parts.push(`订阅方案更新失败 ${result.planTypeUpdateFailed} 条`);
+  if (result.proxyFallbackUpdated) parts.push(`代理失效回退 ${result.proxyFallbackUpdated} 条`);
+  if (result.proxyFallbackFailed) parts.push(`代理回退失败 ${result.proxyFallbackFailed} 条`);
   if (result.planTypeScanIncomplete) parts.push("订阅扫描不完整，已保留上次基线");
   if (result.blocked) parts.push(`永久跳过 ${result.blocked} 条`);
   if (result.ineligible) parts.push(`需人工 ${result.ineligible} 条`);

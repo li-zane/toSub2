@@ -45,6 +45,8 @@ const SUB2API_SETTINGS_FILENAME = "sub2api-settings.json";
 const SUB2API_MONITOR_FILENAME = "sub2api-monitor.json";
 const PLAN_TYPE_MAPPING_FILENAME = "plan-type-mapping.json";
 const SUB2API_WS_MODES = new Set(["off", "ctx_pool", "passthrough", "http_bridge"]);
+// Profile proxy value meaning "explicitly no proxy".
+const SUB2API_PROXY_DIRECT = "direct";
 const SUB2API_PROFILE_FIELDS = [
   "groupIds",
   "proxyId",
@@ -504,7 +506,7 @@ async function handleApi(req, res, requestUrl) {
 
     const accountsByProfile = new Map();
     for (const account of payload.accounts) {
-      const accountConfig = resolveSub2ApiConfigForAccount(config, account, requestProfileState);
+      const accountConfig = await resolveSub2ApiWriteConfig(resolveSub2ApiConfigForAccount(config, account, requestProfileState));
       const { proxy_key: _proxyKey, ...accountData } = account;
       const credentials = { ...(account.credentials || {}) };
       const extra = buildSub2ApiAccountExtra(account.extra, accountConfig);
@@ -520,7 +522,7 @@ async function handleApi(req, res, requestUrl) {
         status: "active",
         schedulable: true,
         group_ids: accountConfig.groupIds.length ? accountConfig.groupIds : (account.group_ids || []),
-        ...(accountConfig.proxyId ? { proxy_id: accountConfig.proxyId } : {}),
+        ...sub2ApiProxyFields(accountConfig),
         ...(accountConfig.concurrency !== null ? { concurrency: accountConfig.concurrency } : {}),
         ...(accountConfig.loadFactor !== null ? { load_factor: accountConfig.loadFactor } : {}),
         ...(accountConfig.priority !== null ? { priority: accountConfig.priority } : {}),
@@ -701,14 +703,18 @@ async function handleApi(req, res, requestUrl) {
 
   if (req.method === "POST" && requestUrl.pathname === "/api/sub2api/settings") {
     const body = await readJson(req);
+    const previousProfileState = snapshotSub2ApiProfileState();
     const config = applySub2ApiSettingsBody(body);
+    const profileSyncTargets = diffSub2ApiProfileSyncTargets(previousProfileState, snapshotSub2ApiProfileState());
+    sub2ApiProxyStateCache.clear();
     if (sub2ApiMonitorConfig) {
       sub2ApiMonitorConfig = { ...config, enabled: sub2ApiMonitorConfig.enabled === true };
       await persistSub2ApiMonitorConfiguration();
     }
     invalidateSub2ApiAccountStatusCache();
     await persistSub2ApiSettingsConfiguration();
-    sendJson(res, 200, publicSub2ApiSettingsState());
+    const profileSync = await syncSub2ApiProfileChanges(config, profileSyncTargets, snapshotSub2ApiProfileState());
+    sendJson(res, 200, { ...publicSub2ApiSettingsState(), profileSync });
     return;
   }
 
@@ -719,14 +725,18 @@ async function handleApi(req, res, requestUrl) {
 
   if (req.method === "POST" && requestUrl.pathname === "/api/sub2api/monitor") {
     const body = await readJson(req);
+    const previousProfileState = snapshotSub2ApiProfileState();
     const config = applySub2ApiSettingsBody(body);
+    const profileSyncTargets = diffSub2ApiProfileSyncTargets(previousProfileState, snapshotSub2ApiProfileState());
+    sub2ApiProxyStateCache.clear();
     invalidateSub2ApiAccountStatusCache();
     await persistSub2ApiSettingsConfiguration();
     sub2ApiMonitorConfig = { ...config, enabled: body.enabled === true };
     sub2ApiMonitorState.lastError = null;
     await persistSub2ApiMonitorConfiguration();
     scheduleSub2ApiMonitor();
-    sendJson(res, 200, publicSub2ApiMonitorState());
+    const profileSync = await syncSub2ApiProfileChanges(config, profileSyncTargets, snapshotSub2ApiProfileState());
+    sendJson(res, 200, { ...publicSub2ApiMonitorState(), profileSync });
     return;
   }
 
@@ -2871,11 +2881,13 @@ function normalizeSub2ApiConfig(value, options = {}) {
   // rejecting a configuration during the next process start.
   const proxyText = rawProxyId === 0 || String(rawProxyId ?? "").trim() === "0"
     ? ""
-    : String(rawProxyId ?? "").trim();
-  if (proxyText && (!/^\d+$/.test(proxyText) || Number(proxyText) <= 0 || Number(proxyText) > Number.MAX_SAFE_INTEGER)) {
+    : String(rawProxyId ?? "").trim().toLowerCase();
+  if (proxyText && proxyText !== SUB2API_PROXY_DIRECT
+    && (!/^\d+$/.test(proxyText) || Number(proxyText) <= 0 || Number(proxyText) > Number.MAX_SAFE_INTEGER)) {
     throw httpError(400, "代理 ID 无效");
   }
-  const proxyId = proxyText ? Number(proxyText) : 0;
+  // 0 keeps the account's existing proxy, "direct" clears it, a number pins it.
+  const proxyId = proxyText === SUB2API_PROXY_DIRECT ? SUB2API_PROXY_DIRECT : proxyText ? Number(proxyText) : 0;
   const concurrency = parseOptionalSub2ApiInteger(
     Object.hasOwn(config, "concurrency") ? config.concurrency : stored.concurrency,
     "并发数",
@@ -2916,10 +2928,17 @@ function normalizeSub2ApiConfig(value, options = {}) {
   return { baseUrl, adminApiKey, groupIds, proxyId, concurrency, loadFactor, priority, accountNameTemplate, modelWhitelist, codexFingerprintMode, wsMode, profileId: String(config.profileId || stored.profileId || "default") };
 }
 
+function normalizeSub2ApiProxyId(stored = {}) {
+  const raw = stored.proxyId ?? "";
+  if (raw === 0 || String(raw).trim() === "0") return "";
+  const text = String(raw).trim().toLowerCase();
+  return text === SUB2API_PROXY_DIRECT ? SUB2API_PROXY_DIRECT : text;
+}
+
 function normalizeSub2ApiProfile(value, fallback = {}, id = "default") {
   const source = value && typeof value === "object" ? value : {};
   const merged = { ...fallback, ...source };
-  if (merged.proxyId === 0 || String(merged.proxyId ?? "").trim() === "0") merged.proxyId = "";
+  merged.proxyId = normalizeSub2ApiProxyId(merged);
   const normalized = normalizeSub2ApiConfig({
     baseUrl: "http://127.0.0.1",
     adminApiKey: "profile-placeholder-key",
@@ -3471,6 +3490,8 @@ async function runSub2ApiMonitor(trigger = "scheduled") {
       planTypeSkipped: 0,
       planTypeUpdateFailed: 0,
       planTypeScanIncomplete: false,
+      proxyFallbackUpdated: 0,
+      proxyFallbackFailed: 0,
     };
     try {
       await syncCompletedOutputs(true);
@@ -3479,6 +3500,7 @@ async function runSub2ApiMonitor(trigger = "scheduled") {
       const accountListing = await listSub2ApiAccounts(config, { withMeta: true });
       const allRemoteAccounts = accountListing.accounts;
       if (accountListing.complete) {
+        await fallBackExpiredSub2ApiProxies(config, profileState, allRemoteAccounts, summary);
         const previousPlanTypes = sub2ApiMonitorState.planTypesBackend === backend
           ? normalizeSub2ApiPlanTypeState(sub2ApiMonitorState.planTypes)
           : Object.create(null);
@@ -3595,13 +3617,272 @@ async function runSub2ApiMonitor(trigger = "scheduled") {
   return sub2ApiMonitorPromise;
 }
 
+const SUB2API_PROFILE_FIELD_LABELS = {
+  groupIds: "号池",
+  proxyId: "代理",
+  concurrency: "并发数",
+  loadFactor: "负载因子",
+  priority: "优先级",
+  accountNameTemplate: "账号命名模板",
+  modelWhitelist: "模型白名单",
+  codexFingerprintMode: "Codex 指纹模式",
+  wsMode: "WS mode",
+};
+const SUB2API_PROFILE_SYNC_CONCURRENCY = 4;
+const SUB2API_PROXY_STATE_TTL_MS = 60_000;
+const sub2ApiProxyStateCache = new Map();
+
+function isSub2ApiProxyExpired(proxy, now = Date.now()) {
+  if (["expired", "deleted", "removed", "disabled", "inactive"].includes(String(proxy?.status || "").trim().toLowerCase())) return true;
+  const expiresAt = proxy?.expires_at ? Date.parse(proxy.expires_at) : Number.NaN;
+  return Number.isFinite(expiresAt) && expiresAt <= now;
+}
+
+async function getSub2ApiProxyState(config, proxyId) {
+  const key = `${monitorBackendIdentity(config)}:${proxyId}`;
+  const cached = sub2ApiProxyStateCache.get(key);
+  if (cached && Date.now() - cached.fetchedAt < SUB2API_PROXY_STATE_TTL_MS) return cached.state;
+  let state;
+  try {
+    const payload = await requestSub2Api(config, `/api/v1/admin/proxies/${encodeURIComponent(proxyId)}`);
+    const proxy = payload?.data && typeof payload.data === "object" ? payload.data : payload;
+    if (!proxy || Number(proxy.id) !== Number(proxyId)) return { found: null };
+    state = { found: true, proxy };
+  } catch (error) {
+    // Some Sub2API versions expose only /proxies/all. Confirm a 404 against
+    // that list before treating the configured proxy as deleted.
+    if (error?.remoteStatus !== 404) return { found: null };
+    try {
+      const payload = await requestSub2Api(config, "/api/v1/admin/proxies/all");
+      const items = Array.isArray(payload)
+        ? payload
+        : Array.isArray(payload?.data) ? payload.data : [];
+      const proxy = items.find((item) => Number(item?.id) === Number(proxyId));
+      state = proxy ? { found: true, proxy } : { found: false };
+    } catch (listError) {
+      // A transient failure must not switch accounts to direct. Only a
+      // successful list that omits the ID is treated as a deletion.
+      return { found: null };
+    }
+  }
+  sub2ApiProxyStateCache.set(key, { fetchedAt: Date.now(), state });
+  return state;
+}
+
+/**
+ * Resolve the proxy that should actually be written for a configured proxy ID.
+ * An expired or deleted proxy falls back to direct, unless Sub2API itself was
+ * configured to fall back to a backup proxy that is still usable. When the
+ * state cannot be read, the configured proxy is kept unchanged.
+ */
+async function resolveSub2ApiProxyFallback(config, proxyId) {
+  const state = await getSub2ApiProxyState(config, proxyId);
+  if (state.found === null) return proxyId;
+  if (state.found && !isSub2ApiProxyExpired(state.proxy)) return proxyId;
+  const backupId = Number(state.proxy?.backup_proxy_id);
+  if (state.found && state.proxy.fallback_mode === "proxy" && Number.isSafeInteger(backupId) && backupId > 0 && backupId !== proxyId) {
+    const backup = await getSub2ApiProxyState(config, backupId);
+    if (backup.found && !isSub2ApiProxyExpired(backup.proxy)
+      && String(backup.proxy.status || "active").toLowerCase() === "active") {
+      return backupId;
+    }
+  }
+  return SUB2API_PROXY_DIRECT;
+}
+
+async function resolveSub2ApiWriteConfig(accountConfig) {
+  const proxyId = Number(accountConfig?.proxyId);
+  if (!Number.isSafeInteger(proxyId) || proxyId <= 0) return accountConfig;
+  const target = await resolveSub2ApiProxyFallback(accountConfig, proxyId);
+  return target === proxyId ? accountConfig : { ...accountConfig, proxyId: target, proxyFallbackFrom: proxyId };
+}
+
+function sub2ApiProxyFields(accountConfig) {
+  if (String(accountConfig?.proxyId || "").trim().toLowerCase() === SUB2API_PROXY_DIRECT) {
+    return { proxy_id: 0 };
+  }
+  return accountConfig.proxyId ? { proxy_id: accountConfig.proxyId } : {};
+}
+
+/**
+ * Move pool accounts off proxies that a profile uses but that have expired or
+ * been deleted. Accounts Sub2API already moved (to direct or a backup proxy)
+ * no longer reference the expired ID and are left alone.
+ */
+async function fallBackExpiredSub2ApiProxies(config, profileState, accounts, summary) {
+  const proxyIds = [...new Set([...profileState.profiles.values()]
+    .map((profile) => Number(profile.proxyId))
+    .filter((id) => Number.isSafeInteger(id) && id > 0))];
+  for (const proxyId of proxyIds) {
+    if (shuttingDown) return;
+    const target = await resolveSub2ApiProxyFallback(config, proxyId);
+    if (target === proxyId) continue;
+    for (const account of accounts) {
+      const accountId = normalizeSub2ApiAccountId(account?.id);
+      if (!accountId || Number(account?.proxy_id) !== proxyId) continue;
+      try {
+        await requestSub2Api(config, `/api/v1/admin/accounts/${encodeURIComponent(accountId)}`, {
+          method: "PUT",
+          body: JSON.stringify({ proxy_id: target === SUB2API_PROXY_DIRECT ? 0 : target }),
+        });
+        summary.proxyFallbackUpdated += 1;
+      } catch (error) {
+        summary.proxyFallbackFailed += 1;
+        console.warn(`[warn] Sub2API 账号 ${accountId} 代理回退失败：${String(error?.message || error).slice(0, 180)}`);
+      }
+    }
+  }
+  if (summary.proxyFallbackUpdated) invalidateSub2ApiAccountStatusCache();
+}
+
+/**
+ * Compare the profile state before and after a settings save and return the
+ * PlanTypes whose bound profile parameters changed. Only PlanTypes that were
+ * explicitly bound both before and after the save qualify: for a newly bound
+ * PlanType the parameters currently stored on its pool accounts are unknown,
+ * and unbound PlanTypes follow the fallback profile, which is deliberately
+ * never pushed automatically.
+ */
+function diffSub2ApiProfileSyncTargets(previous, next) {
+  const targets = [];
+  for (const [planType, profileId] of Object.entries(next.bindings || {})) {
+    const previousProfileId = resolveSub2ApiProfileBinding(planType, previous.bindings);
+    if (!previousProfileId) continue;
+    const before = previous.profiles.get(previousProfileId);
+    const after = next.profiles.get(profileId);
+    if (!before || !after) continue;
+    const fields = SUB2API_PROFILE_FIELDS.filter((field) => (
+      JSON.stringify(before[field] ?? null) !== JSON.stringify(after[field] ?? null)
+    ));
+    if (fields.length) targets.push({ planType, profileId, fields });
+  }
+  return targets;
+}
+
+// A cleared profile value means "keep whatever the account already has" on
+// every other write path, so a save never clears these fields remotely either.
+function unsyncableSub2ApiProfileFields(accountConfig, fields) {
+  return fields.filter((field) => {
+    if (field === "groupIds") return !accountConfig.groupIds.length;
+    if (field === "proxyId") return !accountConfig.proxyId;
+    if (["concurrency", "loadFactor", "priority"].includes(field)) return accountConfig[field] === null;
+    if (field === "accountNameTemplate") return !accountConfig.accountNameTemplate;
+    if (field === "modelWhitelist") return !accountConfig.modelWhitelist.length;
+    return false;
+  });
+}
+
+function buildSub2ApiProfileSyncUpdate(remoteAccount, accountConfig, fields) {
+  const changed = new Set(fields);
+  const body = {};
+  if (changed.has("groupIds")) body.group_ids = accountConfig.groupIds;
+  if (changed.has("proxyId")) Object.assign(body, sub2ApiProxyFields(accountConfig));
+  if (changed.has("concurrency")) body.concurrency = accountConfig.concurrency;
+  if (changed.has("loadFactor")) body.load_factor = accountConfig.loadFactor;
+  if (changed.has("priority")) body.priority = accountConfig.priority;
+  if (changed.has("accountNameTemplate")) {
+    const accountName = renderSub2ApiAccountName(accountConfig.accountNameTemplate, remoteAccount);
+    if (accountName) body.name = accountName;
+  }
+  if (changed.has("codexFingerprintMode") || changed.has("wsMode")) {
+    body.extra = buildSub2ApiAccountExtra(normalizeSub2ApiExtra(remoteAccount.extra), accountConfig);
+  }
+  if (changed.has("modelWhitelist")) {
+    body.credentials = {
+      ...(remoteAccount.credentials && typeof remoteAccount.credentials === "object" ? remoteAccount.credentials : {}),
+      model_mapping: Object.fromEntries(accountConfig.modelWhitelist.map((model) => [model, model])),
+    };
+  }
+  return body;
+}
+
+/**
+ * Push changed profile parameters to every pool account whose PlanType is
+ * bound to the edited profile. Only the changed fields are written, so
+ * per-account adjustments to other fields (for example a manually edited
+ * priority) survive unrelated profile edits. The settings are already saved
+ * when this runs; failures are reported back instead of failing the save.
+ */
+async function syncSub2ApiProfileChanges(config, targets, profileState) {
+  if (!targets.length) return null;
+  const syncTargets = [];
+  for (const target of targets) {
+    const profile = profileState.profiles.get(target.profileId);
+    const accountConfig = await resolveSub2ApiWriteConfig(profileConfig(profile, config));
+    const skipped = unsyncableSub2ApiProfileFields(accountConfig, target.fields);
+    syncTargets.push({ ...target, accountConfig, fields: target.fields.filter((field) => !skipped.includes(field)), skipped });
+  }
+  const fields = [...new Set(syncTargets.flatMap((target) => target.fields))];
+  const skippedFields = [...new Set(syncTargets.flatMap((target) => target.skipped))];
+  const result = {
+    planTypes: syncTargets.map((target) => target.planType),
+    fields,
+    fieldLabels: fields.map((field) => SUB2API_PROFILE_FIELD_LABELS[field] || field),
+    skippedFields,
+    skippedFieldLabels: skippedFields.map((field) => SUB2API_PROFILE_FIELD_LABELS[field] || field),
+    matched: 0,
+    updated: 0,
+    failed: 0,
+    incomplete: false,
+    error: null,
+  };
+  const pushTargets = new Map(syncTargets
+    .filter((target) => target.fields.length)
+    .map((target) => [target.planType.toLowerCase(), target]));
+  if (!pushTargets.size) return result;
+  if (!config?.baseUrl || !config?.adminApiKey) {
+    result.error = "尚未配置 Sub2API 后端地址和管理员 API Key";
+    return result;
+  }
+
+  let listing;
+  try {
+    listing = await listSub2ApiAccounts(config, { withMeta: true });
+  } catch (error) {
+    result.error = String(error?.message || error).slice(0, 500);
+    return result;
+  }
+  result.incomplete = !listing.complete;
+  const work = [];
+  for (const account of listing.accounts) {
+    const accountId = normalizeSub2ApiAccountId(account?.id);
+    const planType = normalizePlanType(extractPlanTypeFromAccount(account, { preferJwt: false }) || "");
+    const target = planType ? pushTargets.get(planType.toLowerCase()) : null;
+    if (accountId && target) work.push({ accountId, account, target });
+  }
+  result.matched = work.length;
+
+  let cursor = 0;
+  const worker = async () => {
+    while (cursor < work.length && !shuttingDown) {
+      const { accountId, account, target } = work[cursor];
+      cursor += 1;
+      const body = buildSub2ApiProfileSyncUpdate(account, target.accountConfig, target.fields);
+      if (!Object.keys(body).length) continue;
+      try {
+        await requestSub2Api(config, `/api/v1/admin/accounts/${encodeURIComponent(accountId)}`, {
+          method: "PUT",
+          body: JSON.stringify(body),
+        });
+        result.updated += 1;
+      } catch (error) {
+        result.failed += 1;
+        result.error ||= String(error?.message || error).slice(0, 500);
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(SUB2API_PROFILE_SYNC_CONCURRENCY, work.length) }, worker));
+  if (result.updated) invalidateSub2ApiAccountStatusCache();
+  return result;
+}
+
 async function updateSub2ApiAccountFromProfile(globalConfig, remoteAccount, profile) {
   const accountId = normalizeSub2ApiAccountId(remoteAccount?.id);
   if (!accountId) return false;
-  const accountConfig = profileConfig(profile, globalConfig);
+  const accountConfig = await resolveSub2ApiWriteConfig(profileConfig(profile, globalConfig));
   const body = {};
   if (Array.isArray(accountConfig.groupIds) && accountConfig.groupIds.length) body.group_ids = accountConfig.groupIds;
-  if (accountConfig.proxyId) body.proxy_id = accountConfig.proxyId;
+  Object.assign(body, sub2ApiProxyFields(accountConfig));
   if (accountConfig.concurrency !== null) body.concurrency = accountConfig.concurrency;
   if (accountConfig.loadFactor !== null) body.load_factor = accountConfig.loadFactor;
   if (accountConfig.priority !== null) body.priority = accountConfig.priority;
@@ -3667,7 +3948,7 @@ function buildSub2ApiAccountUpdate(localAccount, accountConfig, remoteAccount = 
     ...(accountConfig.groupIds.length
       ? { group_ids: accountConfig.groupIds }
       : { group_ids: sub2ApiAccountGroupIds(remoteAccount) }),
-    ...(accountConfig.proxyId ? { proxy_id: accountConfig.proxyId } : {}),
+    ...sub2ApiProxyFields(accountConfig),
     ...(accountConfig.concurrency !== null ? { concurrency: accountConfig.concurrency } : {}),
     ...(accountConfig.loadFactor !== null ? { load_factor: accountConfig.loadFactor } : {}),
     ...(accountConfig.priority !== null ? { priority: accountConfig.priority } : {}),
@@ -3706,7 +3987,7 @@ async function synchronizeSub2ApiWorkspaceAccount(job) {
   for (const remoteAccount of matches) {
     const accountId = normalizeSub2ApiAccountId(remoteAccount?.id);
     if (!accountId) continue;
-    const accountConfig = resolveSub2ApiConfigForAccount(config, localAccount, profileState);
+    const accountConfig = await resolveSub2ApiWriteConfig(resolveSub2ApiConfigForAccount(config, localAccount, profileState));
     const accountUpdate = buildSub2ApiAccountUpdate(localAccount, accountConfig, remoteAccount);
     await requestSub2Api(config, `/api/v1/admin/accounts/${encodeURIComponent(accountId)}`, {
       method: "PUT",
@@ -4380,7 +4661,7 @@ async function performSub2ApiAutoRepairSuccess(job) {
         },
       };
       if (remotePlanType || localPlanType) profileAccount.plan_type = remotePlanType || localPlanType;
-      const accountConfig = resolveSub2ApiConfigForAccount(operation.config, profileAccount, operation.profileState);
+      const accountConfig = await resolveSub2ApiWriteConfig(resolveSub2ApiConfigForAccount(operation.config, profileAccount, operation.profileState));
       const credentials = {
         ...(remoteAccount.credentials && typeof remoteAccount.credentials === "object" ? remoteAccount.credentials : {}),
         ...localAccount.credentials,
@@ -4399,7 +4680,7 @@ async function performSub2ApiAutoRepairSuccess(job) {
         extra,
         ...(accountName ? { name: accountName } : {}),
         ...(accountConfig.groupIds.length ? { group_ids: accountConfig.groupIds } : {}),
-        ...(accountConfig.proxyId ? { proxy_id: accountConfig.proxyId } : {}),
+        ...sub2ApiProxyFields(accountConfig),
         ...(accountConfig.concurrency !== null ? { concurrency: accountConfig.concurrency } : {}),
         ...(accountConfig.loadFactor !== null ? { load_factor: accountConfig.loadFactor } : {}),
         ...(accountConfig.priority !== null ? { priority: accountConfig.priority } : {}),
