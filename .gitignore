@@ -16,5 +16,6 @@ job-meta.json
 # Runtime state and credentials stay outside the Git working tree.
 sub2api-settings.json
 sub2api-monitor.json
+task-settings.json
 credentials/
 .vite/

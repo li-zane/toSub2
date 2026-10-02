@@ -27,7 +27,8 @@ import { DirectTlsProfileProbe, proxySupportsSessionRotation } from "./tls-trans
 
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 4399;
-const MAX_ACTIVE_JOBS = 20;
+const DEFAULT_MAX_ACTIVE_JOBS = 4;
+const MAX_ACTIVE_JOBS_LIMIT = 20;
 const DEFAULT_TLS_PROFILE = "chrome146";
 const MAX_BATCH_JOBS = 500;
 const MAX_PROXY_RISK_RETRIES = 10;
@@ -44,6 +45,7 @@ const PASSWORD_ADD_RESULT_FILENAME = "password-add-result.json";
 const SUB2API_SETTINGS_FILENAME = "sub2api-settings.json";
 const SUB2API_MONITOR_FILENAME = "sub2api-monitor.json";
 const PLAN_TYPE_MAPPING_FILENAME = "plan-type-mapping.json";
+const TASK_SETTINGS_FILENAME = "task-settings.json";
 const SUB2API_WS_MODES = new Set(["off", "ctx_pool", "passthrough", "http_bridge"]);
 // Profile proxy value meaning "explicitly no proxy".
 const SUB2API_PROXY_DIRECT = "direct";
@@ -99,6 +101,7 @@ const OUTPUT_ROOT = path.resolve(
 const SUB2API_MONITOR_PATH = path.join(OUTPUT_ROOT, SUB2API_MONITOR_FILENAME);
 const SUB2API_SETTINGS_PATH = path.join(OUTPUT_ROOT, SUB2API_SETTINGS_FILENAME);
 const PLAN_TYPE_MAPPING_PATH = path.join(OUTPUT_ROOT, PLAN_TYPE_MAPPING_FILENAME);
+const TASK_SETTINGS_PATH = path.join(OUTPUT_ROOT, TASK_SETTINGS_FILENAME);
 const credentialStore = createCredentialStore();
 const consoleToken = crypto.randomBytes(24).toString("base64url");
 const jobs = new Map();
@@ -108,6 +111,8 @@ let outputSyncPromise = null;
 let lastOutputSyncAt = 0;
 let shuttingDown = false;
 let queueSchedulingPaused = false;
+let maxActiveJobs = initialMaxActiveJobs();
+let taskSettingsWritePromise = Promise.resolve();
 let shutdownPromise = null;
 let sub2ApiSettingsConfig = null;
 let sub2ApiMonitorConfig = null;
@@ -168,6 +173,7 @@ if (!Number.isInteger(requestedPort) || requestedPort < 1 || requestedPort > 655
 }
 
 await fs.mkdir(OUTPUT_ROOT, { recursive: true });
+await loadTaskSettings();
 await loadPlanTypeLabelMapping();
 await loadSub2ApiSettingsConfiguration();
 await loadSub2ApiMonitorConfiguration();
@@ -253,6 +259,7 @@ async function handleApi(req, res, requestUrl) {
   if (req.method === "GET" && requestUrl.pathname === "/api/bootstrap") {
     sendJson(res, 200, {
       token: consoleToken,
+      taskSettings: publicTaskSettings(),
       features: {
         retry: true,
         regenerate: true,
@@ -263,6 +270,7 @@ async function handleApi(req, res, requestUrl) {
         uniqueEmail: true,
         smsProviders: publicSmsProviderDefinitions(),
         queue: true,
+        taskSettings: true,
         sourceExport: true,
         cancelAll: true,
         sub2apiUpload: true,
@@ -287,6 +295,18 @@ async function handleApi(req, res, requestUrl) {
 
   if (req.headers["x-console-token"] !== consoleToken) {
     sendJson(res, 403, { error: "Invalid console token" });
+    return;
+  }
+
+  if (req.method === "GET" && requestUrl.pathname === "/api/task-settings") {
+    sendJson(res, 200, { settings: publicTaskSettings() });
+    return;
+  }
+
+  if (req.method === "POST" && requestUrl.pathname === "/api/task-settings") {
+    const body = await readJson(req);
+    const settings = await saveTaskSettings(body?.maxActiveJobs);
+    sendJson(res, 200, { settings });
     return;
   }
 
@@ -1003,6 +1023,7 @@ async function sendJobsPage(res, requestedPage, emailFilter = null, filters = {}
       queued: allJobs.filter((job) => job.status === "queued").length,
       completed: allJobs.filter((job) => job.status === "completed").length,
     },
+    taskSettings: publicTaskSettings(),
   });
 }
 
@@ -1127,6 +1148,7 @@ async function startJob(email, credentials = {}, proxyUrl = null) {
     proxySessionAttemptIds: new Set(),
     proxyAttemptParserTail: "",
     queueRunId: null,
+    startedAt: null,
     lastAuthAutomated: false,
     lastAuthAutomationReason: "尚未完成可验证的全自动登录",
     lastAuthAutomatedAt: null,
@@ -1152,7 +1174,7 @@ async function startJob(email, credentials = {}, proxyUrl = null) {
 
 function scheduleQueuedJobs() {
   if (shuttingDown || queueSchedulingPaused) return;
-  let availableSlots = MAX_ACTIVE_JOBS - [...jobs.values()].filter(occupiesActiveSlot).length;
+  let availableSlots = maxActiveJobs - [...jobs.values()].filter(occupiesActiveSlot).length;
   if (availableSlots <= 0) return;
   const queuedJobs = [...jobs.values()]
     .filter((job) => job.status === "queued")
@@ -1176,6 +1198,7 @@ function scheduleQueuedJobs() {
           ? "正在重新验证账号并准备添加密码"
           : "正在建立登录会话");
     job.queuedAt = null;
+    job.startedAt = new Date().toISOString();
     touch(job);
     void saveJobMetadata(job).catch(() => {});
     void prepareAndLaunchJob(job, mode, queueRunId);
@@ -3132,6 +3155,55 @@ function readDurationEnv(name, fallback, minimum) {
   return Number.isFinite(value) && value >= minimum ? value : fallback;
 }
 
+function initialMaxActiveJobs() {
+  const value = Number(process.env.TOSUB2_MAX_ACTIVE_JOBS);
+  return Number.isInteger(value) && value >= 1 && value <= MAX_ACTIVE_JOBS_LIMIT
+    ? value : DEFAULT_MAX_ACTIVE_JOBS;
+}
+
+function validateMaxActiveJobs(value) {
+  if (!Number.isInteger(value) || value < 1 || value > MAX_ACTIVE_JOBS_LIMIT) {
+    throw httpError(400, `同时运行任务数必须是 1 到 ${MAX_ACTIVE_JOBS_LIMIT} 的整数`);
+  }
+  return value;
+}
+
+function publicTaskSettings() {
+  return { maxActiveJobs, min: 1, max: MAX_ACTIVE_JOBS_LIMIT, default: DEFAULT_MAX_ACTIVE_JOBS };
+}
+
+async function loadTaskSettings() {
+  try {
+    const saved = JSON.parse(await fs.readFile(TASK_SETTINGS_PATH, "utf8"));
+    maxActiveJobs = validateMaxActiveJobs(saved.maxActiveJobs);
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      throw new Error(`任务设置读取失败：${error.message}`);
+    }
+  }
+}
+
+async function saveTaskSettings(value) {
+  const nextLimit = validateMaxActiveJobs(value);
+  // Serialize writes so memory and the last persisted setting always agree.
+  const operation = taskSettingsWritePromise.catch(() => {}).then(async () => {
+    const tempPath = `${TASK_SETTINGS_PATH}.${process.pid}.${crypto.randomUUID()}.tmp`;
+    try {
+      await fs.writeFile(tempPath, `${JSON.stringify({ version: 1, maxActiveJobs: nextLimit }, null, 2)}\n`, { mode: 0o600 });
+      await fs.rename(tempPath, TASK_SETTINGS_PATH);
+    } finally {
+      await fs.rm(tempPath, { force: true }).catch(() => {});
+    }
+    maxActiveJobs = nextLimit;
+    // Reducing the limit leaves running jobs alone; they drain before new work
+    // starts. Increasing it immediately makes extra slots available.
+    scheduleQueuedJobs();
+    return publicTaskSettings();
+  });
+  taskSettingsWritePromise = operation;
+  return operation;
+}
+
 function parseOptionalSub2ApiInteger(value, label, min, max) {
   const text = String(value ?? "").trim();
   if (!text) return null;
@@ -4807,6 +4879,8 @@ function publicJob(job) {
     lastOperationAt: job.lastOperationAt || job.createdAt,
     lastOperationType: job.lastOperationType || "initial_authorization",
     completedAt: job.completedAt,
+    startedAt: job.startedAt,
+    durationMs: getJobDurationMs(job),
     planType: job.workspacePlanType || getJobPlanType(job),
     sub2apiInPool: sub2ApiStatus.inPool,
     sub2apiEnabled: sub2ApiStatus.enabled,
@@ -5202,6 +5276,18 @@ function touch(job) {
   job.updatedAt = new Date().toISOString();
 }
 
+function getJobDurationMs(job, now = Date.now()) {
+  if (job.status === "queued") return null;
+  const startedAt = Date.parse(job.startedAt || "");
+  if (!Number.isFinite(startedAt)) return null;
+  const completedAt = Date.parse(job.completedAt || "");
+  const end = isTerminalStatus(job.status)
+    ? (completedAt >= startedAt ? completedAt : Date.parse(job.updatedAt || ""))
+    : now;
+  if (!Number.isFinite(end)) return null;
+  return Math.max(0, end - startedAt);
+}
+
 function recordJobOperation(job, type, at = new Date().toISOString()) {
   job.lastOperationAt = at;
   job.lastOperationType = type;
@@ -5366,6 +5452,7 @@ async function syncCompletedOutputs(force = false) {
           lastOperationAt: metadata.last_operation_at || metadata.created_at || completedAt,
           lastOperationType: metadata.last_operation_type || "initial_authorization",
           completedAt: metadata.completed_at || completedAt,
+          startedAt: metadata.started_at || null,
           outputPath,
           checkpointPath,
           totpResultPath,
@@ -5453,6 +5540,7 @@ async function syncCompletedOutputs(force = false) {
           lastOperationAt: metadata.last_operation_at || metadata.created_at || restoredAt,
           lastOperationType: metadata.last_operation_type || "initial_authorization",
           completedAt: null,
+          startedAt: metadata.started_at || null,
           outputPath,
           checkpointPath,
           totpResultPath,
@@ -5547,6 +5635,7 @@ async function syncCompletedOutputs(force = false) {
           lastOperationAt: metadata.last_operation_at || metadata.created_at || restoredAt,
           lastOperationType: metadata.last_operation_type || "initial_authorization",
           completedAt: metadata.completed_at || null,
+          startedAt: metadata.started_at || null,
           outputPath,
           checkpointPath,
           totpResultPath,
@@ -6449,6 +6538,7 @@ async function saveJobMetadata(job) {
         plan_type: job.planType || null,
         workspace_plan_type: job.workspacePlanType || null,
         completed_at: job.completedAt || null,
+        started_at: job.startedAt || null,
         attempt: Number(job.attempt || 1),
         security_check_required: Boolean(job.securityCheckRequired),
         queued_mode: job.queuedMode || null,
@@ -6786,6 +6876,7 @@ async function shutdown() {
     for (const controller of sub2ApiRequestControllers) controller.abort();
     await Promise.allSettled([
       sub2ApiMonitorPromise,
+      taskSettingsWritePromise,
       ...sub2ApiRequestPromises,
       ...sub2ApiAutoRepairPromises,
     ].filter(Boolean));

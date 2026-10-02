@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   Ban,
@@ -107,6 +107,10 @@ function App() {
   const [page, setPage] = useState(1);
   const [pagination, setPagination] = useState({ page: 1, pageSize: 20, total: 0, totalPages: 1 });
   const [stats, setStats] = useState({ active: 0, queued: 0, completed: 0 });
+  const [taskSettings, setTaskSettings] = useState(null);
+  const [taskSettingsOpen, setTaskSettingsOpen] = useState(false);
+  const [taskSettingsOpening, setTaskSettingsOpening] = useState(false);
+  const taskSettingsButtonRef = useRef(null);
   const [smsSettings, setSmsSettings] = useState(readSmsProviderSettings);
   const [smsSettingsOpen, setSmsSettingsOpen] = useState(false);
   const [smsSettingsDraft, setSmsSettingsDraft] = useState(readSmsProviderSettings);
@@ -176,6 +180,7 @@ function App() {
         if (!stopped) {
           setToken(data.token);
           setFeatures(data.features || {});
+          setTaskSettings(data.taskSettings || null);
         }
       })
       .catch((requestError) => setError(requestError.message));
@@ -252,6 +257,7 @@ function App() {
           setJobSelectionIndex(data.selection || data.jobs);
           setPagination(data.pagination || { page, pageSize: 20, total: data.jobs.length, totalPages: 1 });
           setStats(data.stats || { active: 0, queued: 0, completed: 0 });
+          if (data.taskSettings) setTaskSettings(data.taskSettings);
           setPlanTypeOptions(Array.isArray(data.filterOptions?.planTypes) ? data.filterOptions.planTypes : []);
           if (data.pagination?.page && data.pagination.page !== page) setPage(data.pagination.page);
           setError("");
@@ -418,6 +424,19 @@ function App() {
     setSmsSettingsDraft(draft);
     setSmsSettingsError("");
     setSmsSettingsOpen(true);
+  }
+
+  async function openTaskSettings() {
+    setTaskSettingsOpening(true);
+    try {
+      const data = await apiFetch(token, "/api/task-settings");
+      setTaskSettings(data.settings);
+      setTaskSettingsOpen(true);
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally {
+      setTaskSettingsOpening(false);
+    }
   }
 
   function openMailRequestSettings() {
@@ -1270,9 +1289,14 @@ function App() {
           </div>
         </div>
         <div className="summary" aria-label="任务统计">
-          <span className="summary-pill"><i className="status-dot active" />进行中 <strong>{stats.active}</strong></span>
+          <span className="summary-pill" title="进行中任务数 / 同时运行任务数上限"><i className="status-dot active" />进行中 <strong>{stats.active}{taskSettings ? ` / ${taskSettings.maxActiveJobs}` : ""}</strong></span>
           <span className="summary-pill"><i className="status-dot queued" />排队中 <strong>{stats.queued || 0}</strong></span>
           <span className="summary-pill"><i className="status-dot complete" />已完成 <strong>{stats.completed}</strong></span>
+          {features.taskSettings && (
+            <button ref={taskSettingsButtonRef} type="button" className="secondary-button" onClick={openTaskSettings} disabled={!token || taskSettingsOpening}>
+              {taskSettingsOpening ? <LoaderCircle className="spin" size={16} /> : <Settings2 size={16} />}任务设置
+            </button>
+          )}
         </div>
       </header>
 
@@ -2188,6 +2212,19 @@ function App() {
           </form>
         </div>
       )}
+      {taskSettingsOpen && taskSettings && (
+        <TaskSettingsDialog
+          token={token}
+          settings={taskSettings}
+          returnFocusRef={taskSettingsButtonRef}
+          onClose={() => setTaskSettingsOpen(false)}
+          onSaved={(settings) => {
+            setTaskSettings(settings);
+            setTaskSettingsOpen(false);
+            setUploadNotice(`任务设置已保存，最多同时运行 ${settings.maxActiveJobs} 条任务`);
+          }}
+        />
+      )}
       {planTypeMappingOpen && (
         <div className="modal-backdrop" role="presentation" onMouseDown={(event) => {
           if (event.target === event.currentTarget) setPlanTypeMappingOpen(false);
@@ -2764,6 +2801,86 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
         </div>
       </td>
     </tr>
+  );
+}
+
+function TaskSettingsDialog({ token, settings, returnFocusRef, onClose, onSaved }) {
+  const dialogRef = useRef(null);
+  const [limit, setLimit] = useState(() => String(settings.maxActiveJobs));
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    dialog.showModal();
+    dialog.querySelector("input").focus();
+    return () => {
+      dialog.close();
+      returnFocusRef.current?.focus();
+    };
+  }, [returnFocusRef]);
+
+  async function save(event) {
+    event.preventDefault();
+    if (saving) return;
+    const value = Number(limit);
+    if (!Number.isInteger(value) || value < settings.min || value > settings.max) {
+      setError(`同时运行任务数必须是 ${settings.min} 到 ${settings.max} 的整数`);
+      return;
+    }
+    setSaving(true);
+    setError("");
+    try {
+      const data = await apiFetch(token, "/api/task-settings", {
+        method: "POST",
+        body: JSON.stringify({ maxActiveJobs: value }),
+      });
+      onSaved(data.settings);
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <dialog
+      ref={dialogRef}
+      className="batch-dialog task-settings-dialog"
+      aria-labelledby="task-settings-title"
+      aria-describedby="task-settings-description"
+      onCancel={(event) => {
+        event.preventDefault();
+        if (!saving) onClose();
+      }}
+    >
+      <form onSubmit={save} className="task-settings-form" noValidate>
+        <div className="dialog-header">
+          <div><h2 id="task-settings-title">任务设置</h2><span>保存到服务端，所有浏览器共用</span></div>
+          <button type="button" className="icon-button" onClick={onClose} disabled={saving} aria-label="关闭任务设置"><X size={18} /></button>
+        </div>
+        <label className="settings-field task-limit-field" htmlFor="task-limit">
+          <span>同时运行任务数</span>
+          <div>
+            <input id="task-limit" type="number" min={settings.min} max={settings.max} step="1" required autoFocus
+              value={limit} onChange={(event) => setLimit(event.target.value)} disabled={saving}
+              aria-describedby="task-settings-description" aria-invalid={Boolean(error)} />
+            <span>条</span>
+          </div>
+        </label>
+        <p id="task-settings-description" className="task-settings-help">可设置 {settings.min}–{settings.max} 条，默认 {settings.default} 条。超过上限的任务自动排队。并发越高，服务器和代理的负载越大。</p>
+        <p className="task-settings-help">调高后立即启动排队任务；调低后等待当前任务完成，再按新上限调度。服务重启后保留此设置。</p>
+        {error && <div className="dialog-error" role="alert"><CircleAlert size={15} />{error}</div>}
+        <div className="dialog-footer">
+          <button type="button" className="selection-text-button" onClick={() => setLimit(String(settings.default))} disabled={saving}>恢复默认</button>
+          <span className="dialog-actions-spacer" />
+          <button type="button" className="cancel-button" onClick={onClose} disabled={saving}>取消</button>
+          <button type="submit" className="primary-button" disabled={saving}>
+            {saving ? <LoaderCircle className="spin" size={16} /> : <Check size={16} />}保存设置
+          </button>
+        </div>
+      </form>
+    </dialog>
   );
 }
 
