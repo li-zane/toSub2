@@ -59,6 +59,28 @@ const DEFAULT_PLAN_TYPE_MAPPING = {
   self_serve_business_usage_based: "Business Usage Based",
   self_serve_pro: "Pro",
 };
+const JOB_STATUS_LABELS = {
+  queued: "排队中",
+  starting: "启动中",
+  working: "处理中",
+  password: "待密码",
+  mfa_otp: "待 2FA",
+  totp_starting: "准备 2FA",
+  password_add_starting: "准备密码",
+  totp_setup_otp: "激活 2FA",
+  email_otp: "待邮箱码",
+  phone: "待手机号",
+  phone_otp: "待手机码",
+  finalizing: "生成中",
+  refreshing: "刷新授权",
+  completed: "已完成",
+  failed: "失败",
+  banned: "封禁",
+  canceled: "已取消",
+  reauth_required: "待重新授权",
+  resume_available: "可继续",
+};
+const DEFAULT_JOB_STATUS_OPTIONS = Object.keys(JOB_STATUS_LABELS);
 const SUB2API_WS_MODE_OPTIONS = [
   { value: "off", label: "关闭（off）" },
   { value: "ctx_pool", label: "上下文池（ctx_pool）" },
@@ -95,10 +117,12 @@ function App() {
   const [filterText, setFilterText] = useState("");
   const [filterError, setFilterError] = useState("");
   const [emailFilter, setEmailFilter] = useState([]);
+  const [statusFilter, setStatusFilter] = useState("");
   const [planTypeFilter, setPlanTypeFilter] = useState("");
   const [sub2apiPoolFilter, setSub2apiPoolFilter] = useState("");
   const [sub2apiEnabledFilter, setSub2apiEnabledFilter] = useState("");
   const [planTypeOptions, setPlanTypeOptions] = useState([]);
+  const [statusOptions, setStatusOptions] = useState(DEFAULT_JOB_STATUS_OPTIONS);
   const [error, setError] = useState("");
   const [expandedJobId, setExpandedJobId] = useState(null);
   const [selectedJobIds, setSelectedJobIds] = useState(() => new Set());
@@ -235,6 +259,7 @@ function App() {
     const poll = async () => {
       try {
         const filters = {
+          status: statusFilter || undefined,
           planType: planTypeFilter || undefined,
           sub2apiPool: sub2apiPoolFilter || undefined,
           sub2apiEnabled: sub2apiEnabledFilter || undefined,
@@ -246,6 +271,7 @@ function App() {
             })
           : await apiFetch(token, `/api/jobs?${new URLSearchParams({
               page: String(page),
+              ...(filters.status ? { status: filters.status } : {}),
               ...(filters.planType ? { planType: filters.planType } : {}),
               ...(filters.sub2apiPool ? { sub2apiPool: filters.sub2apiPool } : {}),
               ...(filters.sub2apiEnabled ? { sub2apiEnabled: filters.sub2apiEnabled } : {}),
@@ -259,6 +285,9 @@ function App() {
           setStats(data.stats || { active: 0, queued: 0, completed: 0 });
           if (data.taskSettings) setTaskSettings(data.taskSettings);
           setPlanTypeOptions(Array.isArray(data.filterOptions?.planTypes) ? data.filterOptions.planTypes : []);
+          if (Array.isArray(data.filterOptions?.statuses) && data.filterOptions.statuses.length) {
+            setStatusOptions(data.filterOptions.statuses.filter((value) => Object.hasOwn(JOB_STATUS_LABELS, value)));
+          }
           if (data.pagination?.page && data.pagination.page !== page) setPage(data.pagination.page);
           setError("");
         }
@@ -273,7 +302,7 @@ function App() {
       stopped = true;
       window.clearTimeout(timer);
     };
-  }, [token, page, emailFilter, planTypeFilter, sub2apiPoolFilter, sub2apiEnabledFilter]);
+  }, [token, page, emailFilter, statusFilter, planTypeFilter, sub2apiPoolFilter, sub2apiEnabledFilter]);
 
   useEffect(() => {
     if (!token || !features.sub2apiMonitor) return undefined;
@@ -387,7 +416,7 @@ function App() {
   const passwordAddSelectedCount = selectedJobs.filter((job) => job.canAddPassword).length;
   const canAddPasswordSelected = selectedJobs.length > 0 && selectedJobs.length === selectedJobIds.size
     && passwordAddSelectedCount > 0;
-  const hasJobFilters = Boolean(emailFilter.length || planTypeFilter || sub2apiPoolFilter || sub2apiEnabledFilter);
+  const hasJobFilters = Boolean(emailFilter.length || statusFilter || planTypeFilter || sub2apiPoolFilter || sub2apiEnabledFilter);
   const availablePlanTypes = [...new Set([
     ...planTypeOptions,
     ...jobs.map((job) => job.planType).filter(Boolean),
@@ -805,7 +834,7 @@ function App() {
       const completed = latest.filter(predicate).length;
       setUploadNotice(`${label} ${completed}/${ids.length}`);
       const failed = latest.find((job) => failurePredicate?.(job) || (
-        ["failed", "canceled", "reauth_required", "resume_available"].includes(job.status) && !predicate(job)
+        ["failed", "banned", "canceled", "reauth_required", "resume_available"].includes(job.status) && !predicate(job)
       ));
       if (failed) {
         const detail = extractResponseMessage(failed.totpSetupError || failed.lastError || failed.prompt || "任务失败");
@@ -1622,7 +1651,21 @@ function App() {
                   </div>
                 </th>
                 <th className="priority-heading">Sub2API 优先级</th>
-                <th>状态</th>
+                <th>
+                  <div className="column-filter-heading">
+                    <span>状态</span>
+                    <select
+                      value={statusFilter}
+                      onChange={(event) => applyColumnFilter(setStatusFilter, event.target.value)}
+                      aria-label="筛选任务状态"
+                    >
+                      <option value="">全部</option>
+                      {statusOptions.map((value) => (
+                        <option key={value} value={value}>{JOB_STATUS_LABELS[value] || value}</option>
+                      ))}
+                    </select>
+                  </div>
+                </th>
                 <th>当前操作</th>
                 <th>开始时间</th>
                 <th>最近操作时间</th>
@@ -2549,7 +2592,7 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
   }
 
   const inputConfig = getInputConfig(job.status, job.currentPhone);
-  const terminal = ["completed", "failed", "canceled", "reauth_required", "resume_available"].includes(job.status);
+  const terminal = ["completed", "failed", "banned", "canceled", "reauth_required", "resume_available"].includes(job.status);
 
   return (
     <tr className={`job-row status-${job.status}`}>
@@ -3586,6 +3629,7 @@ function StatusBadge({ status }) {
     refreshing: ["刷新授权", <RefreshCw className="spin" size={14} />],
     completed: ["已完成", <Check size={14} />],
     failed: ["失败", <CircleAlert size={14} />],
+    banned: ["封禁", <Ban size={14} />],
     canceled: ["已取消", <Ban size={14} />],
     reauth_required: ["待重新授权", <RefreshCw size={14} />],
     resume_available: ["可继续", <RotateCcw size={14} />],

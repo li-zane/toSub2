@@ -37,6 +37,27 @@ const PROXY_CONNECTION_RETRY_BASE_MS = Math.max(1, Number(process.env.PROXY_CONN
 const PROXY_CONNECTION_RETRY_MAX_MS = 15_000;
 const PAGE_SIZE = 20;
 const MAX_LOG_CHARS = 80_000;
+const JOB_STATUS_FILTER_VALUES = [
+  "queued",
+  "starting",
+  "working",
+  "password",
+  "mfa_otp",
+  "totp_starting",
+  "password_add_starting",
+  "totp_setup_otp",
+  "email_otp",
+  "phone",
+  "phone_otp",
+  "finalizing",
+  "refreshing",
+  "completed",
+  "failed",
+  "banned",
+  "canceled",
+  "reauth_required",
+  "resume_available",
+];
 const SUB2API_ACCOUNT_STATUS_CACHE_TTL_MS = readDurationEnv("SUB2API_ACCOUNT_STATUS_CACHE_TTL_MS", 15_000, 1_000);
 const JOB_META_FILENAME = "job-meta.json";
 const LOGIN_CHECKPOINT_FILENAME = "login-checkpoint.json";
@@ -313,6 +334,7 @@ async function handleApi(req, res, requestUrl) {
   if (req.method === "GET" && requestUrl.pathname === "/api/jobs") {
     const requestedPage = Math.max(1, Number.parseInt(requestUrl.searchParams.get("page") || "1", 10) || 1);
     await sendJobsPage(res, requestedPage, null, normalizeJobFilters({
+      status: requestUrl.searchParams.get("status"),
       planType: requestUrl.searchParams.get("planType"),
       sub2apiPool: requestUrl.searchParams.get("sub2apiPool"),
       sub2apiEnabled: requestUrl.searchParams.get("sub2apiEnabled"),
@@ -1008,14 +1030,16 @@ async function sendJobsPage(res, requestedPage, emailFilter = null, filters = {}
     selection: visibleJobs.map(publicSelectionJob),
     pagination: { page, pageSize: PAGE_SIZE, total, totalPages, totalAll: allJobs.length },
     filter: {
-      active: Boolean(emailSet || filters.planType || filters.sub2apiPool || filters.sub2apiEnabled),
+      active: Boolean(emailSet || filters.status || filters.planType || filters.sub2apiPool || filters.sub2apiEnabled),
       requested: emailFilter?.length || 0,
       matched: total,
+      status: filters.status || "",
       planType: filters.planType || "",
       sub2apiPool: filters.sub2apiPool || "",
       sub2apiEnabled: filters.sub2apiEnabled || "",
     },
     filterOptions: {
+      statuses: JOB_STATUS_FILTER_VALUES,
       planTypes: [...new Set(allJobs.map((job) => getJobPlanType(job)).filter(Boolean))].sort(),
     },
     stats: {
@@ -1029,12 +1053,14 @@ async function sendJobsPage(res, requestedPage, emailFilter = null, filters = {}
 
 function normalizeJobFilters(value) {
   const source = value && typeof value === "object" ? value : {};
+  const statusValue = String(source.status || "").trim().toLowerCase();
   const planTypeValue = String(source.planType || "").trim();
   const sub2apiPoolValue = String(source.sub2apiPool || "").trim().toLowerCase();
   const sub2apiEnabledValue = String(source.sub2apiEnabled || "").trim().toLowerCase();
   const allowedPoolValues = new Set(["added", "not_added", "unknown"]);
   const allowedEnabledValues = new Set(["enabled", "disabled", "unknown"]);
   return {
+    status: JOB_STATUS_FILTER_VALUES.includes(statusValue) ? statusValue : null,
     planType: planTypeValue || null,
     sub2apiPool: allowedPoolValues.has(sub2apiPoolValue) ? sub2apiPoolValue : null,
     sub2apiEnabled: allowedEnabledValues.has(sub2apiEnabledValue) ? sub2apiEnabledValue : null,
@@ -1042,6 +1068,7 @@ function normalizeJobFilters(value) {
 }
 
 function matchesJobFilters(job, filters) {
+  if (filters.status && job.status !== filters.status) return false;
   if (filters.planType) {
     const actualPlanType = getJobPlanType(job) || "__unknown__";
     if (actualPlanType !== filters.planType) return false;
@@ -1348,7 +1375,7 @@ async function handleChildClose(job, { code, signal, mode, runId }) {
     scheduleQueuedJobs();
     return;
   }
-  if (code === 0 && job.resultSaved && (await fileExists(job.outputPath))) {
+  if (!isTerminalStatus(job.status) && code === 0 && job.resultSaved && (await fileExists(job.outputPath))) {
     job.planType = await readPlanTypeFromOutput(job.outputPath);
     if (mode === "full") completeAuthorizationAutomationAttempt(job);
     job.loginCheckpointAvailable = false;
@@ -1361,7 +1388,7 @@ async function handleChildClose(job, { code, signal, mode, runId }) {
     scheduleQueuedJobs();
     return;
   }
-  if (job.status !== "failed") {
+  if (!isTerminalStatus(job.status)) {
     if (await fileExists(job.checkpointPath)) {
       markResumeAvailable(job, signal ? `登录进程被 ${signal} 终止` : "登录流程中断");
     } else {
@@ -5159,7 +5186,7 @@ function publicSelectionJob(job) {
 }
 
 function canForceRelogin(job) {
-  return ["completed", "failed", "canceled", "reauth_required", "resume_available"].includes(job.status);
+  return ["completed", "failed", "banned", "canceled", "reauth_required", "resume_available"].includes(job.status);
 }
 
 function canSetupTotp(job) {
@@ -5188,10 +5215,11 @@ function failJob(job, message) {
   if (isTerminalStatus(job.status)) return;
   stopMailPolling(job);
   releaseSmsNumber(job, "idle");
-  job.status = "failed";
-  job.prompt = "流程失败";
+  const permanentAccountFailure = isPermanentAccountFailure(message);
+  job.status = permanentAccountFailure ? "banned" : "failed";
+  job.prompt = permanentAccountFailure ? "账号已封禁，号池监控已永久跳过" : "流程失败";
   job.lastError = message;
-  if (isPermanentAccountFailure(message)) markAutoRepairBlocked(job, message);
+  if (permanentAccountFailure) markAutoRepairBlocked(job, message);
   touch(job);
   void saveJobMetadata(job).catch(() => {});
 }
@@ -5316,7 +5344,7 @@ function getQueuePosition(job) {
 }
 
 function isTerminalStatus(status) {
-  return ["completed", "failed", "canceled", "reauth_required", "resume_available"].includes(status);
+  return ["completed", "failed", "banned", "canceled", "reauth_required", "resume_available"].includes(status);
 }
 
 function uniqueByJson(items) {

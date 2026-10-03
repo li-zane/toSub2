@@ -1827,8 +1827,14 @@ try {
   const blockedJob = await waitForJob(
     headers,
     bannedJobId,
-    (value) => value.status === "failed" && value.autoRepairBlocked,
+    (value) => value.status === "banned" && value.autoRepairBlocked,
   );
+  const bannedFilterResponse = await fetch(`${baseUrl}/api/jobs?status=banned`, { headers });
+  const bannedFilterText = await bannedFilterResponse.text();
+  assert.equal(bannedFilterResponse.status, 200, bannedFilterText);
+  const bannedFilter = JSON.parse(bannedFilterText);
+  assert.equal(bannedFilter.filter.status, "banned");
+  assert.ok(bannedFilter.jobs.some((value) => value.id === bannedJobId));
   assert.match(blockedJob.autoRepairBlockedReason, /deactivated/i);
   const blockedCheckResponse = await fetch(`${baseUrl}/api/sub2api/monitor/check`, {
     method: "POST",

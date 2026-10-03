@@ -34,6 +34,7 @@
   --shadow-lg: 0 24px 60px rgba(16, 28, 23, .22), 0 2px 8px rgba(16, 28, 23, .08);
   --ring: 0 0 0 3px rgba(18, 113, 91, .16);
   --ease: cubic-bezier(.2, .7, .3, 1);
+  --button-height: 38px;
 }
 
 * { box-sizing: border-box; }
@@ -213,7 +214,7 @@ button:focus-visible, a:focus-visible, select:focus-visible { outline: 2px solid
 
 /* ---------- Buttons ---------- */
 .primary-button, .download-button, .secondary-button, .cancel-button {
-  height: 38px;
+  height: var(--button-height);
   border: 1px solid transparent;
   border-radius: var(--radius);
   display: inline-flex;
@@ -646,7 +647,7 @@ tbody tr:last-child td { border-bottom: 0; }
 .status-badge.resume_available { color: var(--amber); background: var(--amber-soft); border-color: var(--amber-line); }
 .status-badge.queued, .status-badge.refreshing, .status-badge.totp_starting, .status-badge.password_add_starting { color: var(--blue); background: var(--blue-soft); border-color: var(--blue-line); }
 .status-badge.completed { color: var(--green-strong); background: var(--green-soft); border-color: var(--green-line); }
-.status-badge.failed, .status-badge.reauth_required { color: var(--danger); background: var(--danger-soft); border-color: var(--danger-line); }
+.status-badge.failed, .status-badge.banned, .status-badge.reauth_required { color: var(--danger); background: var(--danger-soft); border-color: var(--danger-line); }
 .status-badge.canceled { color: #69716f; background: #f0f2f1; border-color: var(--line); }
 
 /* ---------- Step cell ---------- */
@@ -753,12 +754,12 @@ tbody tr:last-child td { border-bottom: 0; }
 .operation-time-cell time { display: block; overflow: hidden; text-overflow: ellipsis; font-size: 12px; }
 .operation-time-cell span { display: block; margin-top: 4px; color: var(--subtle); font-size: 11px; white-space: normal; overflow-wrap: anywhere; }
 .row-actions { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 6px; white-space: normal; }
-.row-actions > button { flex: 0 0 auto; white-space: nowrap; }
+.row-actions > button { flex: 0 0 auto; height: var(--button-height); white-space: nowrap; }
 .actions-cell { overflow: visible; }
-.row-actions .download-button, .row-actions .secondary-button { height: 32px; padding: 0 11px; font-size: 12px; }
+.row-actions .download-button, .row-actions .secondary-button { height: var(--button-height); padding: 0 11px; font-size: 12px; }
 .download-button { height: 32px; padding: 0 11px; font-size: 12px; }
 .retry-button, .regenerate-button, .relogin-button {
-  height: 32px;
+  height: var(--button-height);
   padding: 0 10px;
   display: inline-flex;
   align-items: center;
