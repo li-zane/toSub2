@@ -3608,7 +3608,10 @@ function WorkspaceDialog({ token, job, planTypeMapping, onClose, onError, onJobU
           <div className="workspace-list" aria-live="polite">
             {workspaces.map((workspace) => {
               const selected = workspace.id === currentWorkspaceId || (currentWorkspaceId === null && workspace.current === true);
-              const disabled = workspace.canAccess === false || workspace.deactivated;
+              const disabled = workspace.canAccess === false
+                || workspace.deactivated
+                || workspace.availabilityReason && workspace.availabilityReason !== "available";
+              const availabilityLabel = workspace.availabilityLabel || "不可用";
               return (
                 <button
                   type="button"
@@ -3623,7 +3626,7 @@ function WorkspaceDialog({ token, job, planTypeMapping, onClose, onError, onJobU
                       <strong>{workspace.name || workspace.id}</strong>
                       {workspace.structure === "personal" && <span className="workspace-badge personal">个人</span>}
                       {selected && <span className="workspace-badge current">当前</span>}
-                      {disabled && <span className="workspace-badge disabled">不可用</span>}
+                      {disabled && <span className="workspace-badge disabled" title={workspace.availabilityMessage || availabilityLabel}>{availabilityLabel}</span>}
                     </span>
                     <span className="workspace-item-meta">
                       <span>{formatPlanTypeLabel(workspace.planType, planTypeMapping)}</span>

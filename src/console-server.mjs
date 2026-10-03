@@ -16,6 +16,8 @@ import {
   revokeAllAccountSessions,
   listAccountWorkspaces,
   switchAccountWorkspace,
+  accountWorkspaceAvailabilityLabel,
+  isAccountWorkspaceAvailable,
 } from "./account-sessions.mjs";
 import {
   fetchMailboxOtpCandidates,
@@ -858,8 +860,8 @@ async function handleApi(req, res, requestUrl) {
       }
       const available = await listAccountWorkspaces(job);
       const target = available.workspaces.find((workspace) => workspace.id === workspaceId);
-      if (!target || target.canAccess === false || target.deactivated) {
-        throw httpError(409, "该工作空间当前不可用或已失去授权");
+      if (!target || !isAccountWorkspaceAvailable(target)) {
+        throw httpError(409, accountWorkspaceAvailabilityLabel(target));
       }
       const result = await switchAccountWorkspace(job, workspaceId);
       job.workspacePlanType = result.planType || target.planType || null;

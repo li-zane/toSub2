@@ -12,6 +12,8 @@ const outputRoot = await fs.mkdtemp(path.join(os.tmpdir(), "tosub2-workspace-htt
 const accountId = crypto.randomUUID();
 const organizationId = "f7f4cbea-48f8-4790-97f3-71ff6cbe0aa6";
 const personalId = "9f527f90-aa3c-4844-b338-687815539aef";
+const bannedWorkspaceId = "402-workspace";
+const removedWorkspaceId = "removed-workspace";
 const accessToken = `header.${Buffer.from(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 3600 })).toString("base64url")}.signature`;
 const outputDir = path.join(outputRoot, accountId);
 const outputPath = path.join(outputDir, "sub2api-import-oauth.json");
@@ -72,6 +74,23 @@ const officialApi = http.createServer((req, res) => {
           plan_type: "free",
           can_access_with_session: true,
         },
+        {
+          id: removedWorkspaceId,
+          name: "已移出空间",
+          structure: "workspace",
+          plan_type: "self_serve_business_usage_based",
+          can_access_with_session: false,
+          error: { code: "account_removed_from_workspace", message: "You were removed from this workspace" },
+        },
+        {
+          id: bannedWorkspaceId,
+          name: "封禁空间",
+          structure: "workspace",
+          plan_type: "self_serve_business_usage_based",
+          can_access_with_session: false,
+          status_code: 402,
+          error_message: "Workspace is unavailable",
+        },
       ],
     }));
     return;
@@ -122,9 +141,24 @@ try {
   assert.equal(listResponse.status, 200);
   const listed = await listResponse.json();
   assert.equal(listed.workspaces.currentWorkspaceId, organizationId);
-  assert.deepEqual(listed.workspaces.workspaces.map((item) => item.id), [organizationId, personalId]);
+  assert.deepEqual(listed.workspaces.workspaces.map((item) => item.id), [organizationId, personalId, removedWorkspaceId, bannedWorkspaceId]);
   assert.equal(listed.workspaces.workspaces[1].name, "个人账户");
   assert.equal(listed.workspaces.workspaces[1].planType, "free");
+  assert.equal(listed.workspaces.workspaces[2].availabilityReason, "removed");
+  assert.equal(listed.workspaces.workspaces[2].availabilityCode, "account_removed_from_workspace");
+  assert.equal(listed.workspaces.workspaces[2].availabilityLabel, "已移出空间（account_removed_from_workspace）");
+  assert.equal(listed.workspaces.workspaces[3].availabilityReason, "banned");
+  assert.equal(listed.workspaces.workspaces[3].availabilityCode, "402");
+  assert.equal(listed.workspaces.workspaces[3].availabilityLabel, "空间封禁（402）");
+
+  const bannedSwitchResponse = await fetch(`${baseUrl}/api/jobs/${accountId}/workspaces/switch`, {
+    method: "POST",
+    headers: { ...headers, "content-type": "application/json" },
+    body: JSON.stringify({ workspaceId: bannedWorkspaceId }),
+  });
+  const bannedSwitchText = await bannedSwitchResponse.text();
+  assert.equal(bannedSwitchResponse.status, 409, bannedSwitchText);
+  assert.match(bannedSwitchText, /空间封禁（402）/);
 
   const switchResponse = await fetch(`${baseUrl}/api/jobs/${accountId}/workspaces/switch`, {
     method: "POST",

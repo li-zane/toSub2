@@ -1,5 +1,64 @@
 import assert from "node:assert/strict";
-import { normalizeSessionDevice, normalizeSessionDevices } from "../src/account-sessions.mjs";
+import {
+  normalizeAccountWorkspaces,
+  normalizeSessionDevice,
+  normalizeSessionDevices,
+} from "../src/account-sessions.mjs";
+
+const workspaceListing = normalizeAccountWorkspaces({
+  default_account_id: "workspace-available",
+  accounts: [
+    {
+      id: "workspace-available",
+      name: "可用空间",
+      structure: "workspace",
+      status: "active",
+      can_access_with_session: true,
+    },
+    {
+      id: "workspace-removed",
+      name: "被移出空间",
+      structure: "workspace",
+      can_access_with_session: false,
+      error: { code: "account_removed_from_workspace", message: "You were removed from this workspace" },
+    },
+    {
+      id: "workspace-banned",
+      name: "被封禁空间",
+      structure: "workspace",
+      can_access_with_session: false,
+      status_code: 402,
+      error_message: "Workspace is unavailable",
+    },
+    {
+      id: "workspace-deactivated",
+      name: "停用空间",
+      structure: "workspace",
+      is_deactivated: true,
+      error_code: "workspace_deactivated",
+    },
+    {
+      id: "workspace-forbidden",
+      name: "无权空间",
+      structure: "workspace",
+      can_access_with_session: false,
+      error: { code: "forbidden", message: "Access denied" },
+    },
+  ],
+});
+
+assert.equal(workspaceListing.workspaces[0].availabilityReason, "available");
+assert.equal(workspaceListing.workspaces[0].availabilityLabel, "");
+assert.equal(workspaceListing.workspaces[1].availabilityReason, "removed");
+assert.equal(workspaceListing.workspaces[1].availabilityCode, "account_removed_from_workspace");
+assert.equal(workspaceListing.workspaces[1].availabilityLabel, "已移出空间（account_removed_from_workspace）");
+assert.equal(workspaceListing.workspaces[2].availabilityReason, "banned");
+assert.equal(workspaceListing.workspaces[2].availabilityCode, "402");
+assert.equal(workspaceListing.workspaces[2].availabilityLabel, "空间封禁（402）");
+assert.equal(workspaceListing.workspaces[3].availabilityReason, "deactivated");
+assert.equal(workspaceListing.workspaces[4].availabilityReason, "inaccessible");
+assert.equal(workspaceListing.workspaces[4].availabilityCode, "forbidden");
+assert.equal(workspaceListing.workspaces[4].canAccess, false);
 
 const devices = normalizeSessionDevices({
   show_session_manager: true,
