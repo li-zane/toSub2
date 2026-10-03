@@ -1309,13 +1309,17 @@ function App() {
     if (!window.confirm(`确定删除选中的 ${selectedJobIds.size} 条任务吗？对应的本地授权文件也会被删除。`)) return;
     setBatchAction("delete");
     try {
-      await apiFetch(token, "/api/jobs/delete-batch", {
+      const result = await apiFetch(token, "/api/jobs/delete-batch", {
         method: "POST",
         body: JSON.stringify({ ids: [...selectedJobIds] }),
       });
       setJobs((current) => current.filter((job) => !selectedJobIds.has(job.id)));
       setSelectedJobIds(new Set());
       setError("");
+      const synchronized = Number(result?.sub2api?.deleted || 0);
+      setUploadNotice(synchronized
+        ? `已删除 ${result.deleted} 条任务，并同步删除 ${synchronized} 个号池账号`
+        : `已删除 ${result.deleted} 条任务`);
     } catch (requestError) {
       setError(requestError.message);
     } finally {

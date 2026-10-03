@@ -426,8 +426,15 @@ async function handleApi(req, res, requestUrl) {
     const body = await readJson(req);
     const selected = resolveSelectedJobs(body.ids);
     const emails = [...new Set(selected.map((job) => job.email.toLowerCase()))];
-    await Promise.all(emails.map((email) => withEmailJobLock(email, () => deleteJobsByEmail(email))));
-    sendJson(res, 200, { deleted: emails.length });
+    const results = await Promise.all(emails.map((email) => withEmailJobLock(email, () => deleteJobsByEmail(email))));
+    const sub2api = results.reduce((summary, result) => {
+      summary.configured ||= result.sub2api.configured;
+      summary.deleted += result.sub2api.deleted;
+      summary.accountIds.push(...result.sub2api.accountIds);
+      return summary;
+    }, { configured: false, deleted: 0, accountIds: [] });
+    sub2api.accountIds = [...new Set(sub2api.accountIds)];
+    sendJson(res, 200, { deleted: emails.length, sub2api });
     return;
   }
 
@@ -5444,7 +5451,33 @@ function resolveSelectedJobs(ids) {
   return selected;
 }
 
+async function deleteSub2ApiAccountsByEmail(email) {
+  const config = sub2ApiSettingsConfig || sub2ApiMonitorConfig;
+  if (!config?.baseUrl || !config?.adminApiKey) {
+    return { configured: false, deleted: 0, accountIds: [] };
+  }
+
+  const normalizedEmail = String(email || "").trim().toLowerCase();
+  const state = await loadSub2ApiAccountStatus({ forceRefresh: true });
+  const entry = state.accounts.get(normalizedEmail);
+  const accountIds = [...new Set((entry?.accountIds || []).map(normalizeSub2ApiAccountId).filter(Boolean))];
+  if (!accountIds.length) return { configured: true, deleted: 0, accountIds: [] };
+
+  const deletedAccountIds = [];
+  for (const accountId of accountIds) {
+    try {
+      await requestSub2Api(config, `/api/v1/admin/accounts/${encodeURIComponent(accountId)}`, { method: "DELETE" });
+    } catch (error) {
+      if (error?.remoteStatus !== 404) throw error;
+    }
+    deletedAccountIds.push(accountId);
+  }
+  invalidateSub2ApiAccountStatusCache();
+  return { configured: true, deleted: deletedAccountIds.length, accountIds: deletedAccountIds };
+}
+
 async function deleteJobsByEmail(email) {
+  const sub2api = await deleteSub2ApiAccountsByEmail(email);
   const matching = [...jobs.values()].filter((job) => job.email.toLowerCase() === email);
   const directories = new Set();
   matching.forEach((job) => {
@@ -5463,6 +5496,7 @@ async function deleteJobsByEmail(email) {
     deleteStoredLoginCredentials(email),
   ]);
   scheduleQueuedJobs();
+  return { email, sub2api };
 }
 
 function downloadTimestamp(date = new Date()) {

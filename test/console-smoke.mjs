@@ -28,6 +28,7 @@ const proxyStates = new Map([
 ]);
 const activeUsageByAccountId = new Map();
 const clearedRemoteAccountIds = new Set();
+const deletedRemoteAccountIds = new Set();
 const scheduledRemoteAccounts = new Map();
 const clearRemoteCounts = new Map();
 const failClearOnce = new Set();
@@ -125,6 +126,22 @@ const sub2api = http.createServer(async (req, res) => {
     }
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ code: 0, message: "success", data: account }));
+    return;
+  }
+  const deleteMatch = /^\/api\/v1\/admin\/accounts\/(\d+)$/.exec(req.url || "");
+  if (req.method === "DELETE" && deleteMatch) {
+    const accountId = Number(deleteMatch[1]);
+    const existing = remoteErrorAccounts.some((account) => Number(account.id) === accountId);
+    if (!existing) {
+      res.writeHead(404, { "content-type": "application/json" });
+      res.end(JSON.stringify({ message: "account not found" }));
+      return;
+    }
+    deletedRemoteAccountIds.add(accountId);
+    remoteErrorAccounts = remoteErrorAccounts.filter((account) => Number(account.id) !== accountId);
+    activeUsageByAccountId.delete(accountId);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ code: 0, message: "success", data: { id: accountId } }));
     return;
   }
   const updateMatch = /^\/api\/v1\/admin\/accounts\/(\d+)$/.exec(req.url || "");
@@ -1959,6 +1976,24 @@ try {
   );
   assert.match(proxyConnectionAlwaysFailed.lastError || "", /连续失败 20 次/);
 
+  remoteErrorAccounts = [
+    {
+      id: 101,
+      name: "oauth---cross-platform@example.com",
+      platform: "openai",
+      type: "oauth",
+      status: "active",
+      credentials: { email: "cross-platform@example.com" },
+    },
+    {
+      id: 102,
+      name: "oauth-duplicate---cross-platform@example.com",
+      platform: "openai",
+      type: "oauth",
+      status: "active",
+      credentials: { email: "cross-platform@example.com" },
+    },
+  ];
   const deleteResponse = await fetch(`${baseUrl}/api/jobs/delete-batch`, {
     method: "POST",
     headers,
@@ -1987,6 +2022,11 @@ try {
   }
   const deleted = await deleteResponse.json();
   assert.equal(deleted.deleted, 29);
+  assert.equal(deleted.sub2api.configured, true);
+  assert.equal(deleted.sub2api.deleted, 2);
+  assert.deepEqual(new Set(deleted.sub2api.accountIds), new Set(["101", "102"]));
+  assert.deepEqual([...deletedRemoteAccountIds].sort((a, b) => a - b), [101, 102]);
+  assert.equal(remoteErrorAccounts.length, 0);
 
   const finalPage = await (await fetch(`${baseUrl}/api/jobs`, { headers })).json();
   assert.equal(finalPage.pagination.total, 0);
