@@ -813,6 +813,23 @@ tbody tr:last-child td { border-bottom: 0; }
 .pipeline-button { color: var(--amber); background: var(--amber-soft); border-color: var(--amber-line); }
 .pipeline-button:hover:not(:disabled) { color: #fff; background: var(--amber); border-color: var(--amber); }
 
+/* Keep every account-row action button on the same white surface. */
+.row-actions > button {
+  color: var(--ink-2);
+  background: var(--surface);
+  border-color: var(--line-strong);
+}
+.row-actions > button:hover:not(:disabled) {
+  color: var(--green-strong);
+  background: #f6fbf9;
+  border-color: #a9c9be;
+}
+.row-actions .icon-button.danger:hover:not(:disabled) {
+  color: var(--danger);
+  background: var(--danger-soft);
+  border-color: var(--danger-line);
+}
+
 /* ---------- Logs ---------- */
 .log-row td { padding: 0 16px 16px; background: var(--surface-muted); }
 .log-panel { position: sticky; left: 16px; width: min(100%, calc(100vw - 98px)); border: 1px solid #23302b; border-radius: var(--radius); overflow: hidden; background: #0f1714; box-shadow: inset 0 1px 0 rgba(255, 255, 255, .04); }

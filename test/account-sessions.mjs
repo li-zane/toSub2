@@ -60,6 +60,17 @@ assert.equal(workspaceListing.workspaces[4].availabilityReason, "inaccessible");
 assert.equal(workspaceListing.workspaces[4].availabilityCode, "forbidden");
 assert.equal(workspaceListing.workspaces[4].canAccess, false);
 
+const staleCredentialListing = normalizeAccountWorkspaces({
+  default_account_id: "workspace-available",
+  accounts: [
+    { id: "workspace-available", structure: "workspace", can_access_with_session: true },
+    { id: "personal-account", structure: "personal", can_access_with_session: true },
+  ],
+}, "authsess_stale");
+assert.equal(staleCredentialListing.currentWorkspaceId, "workspace-available");
+assert.equal(staleCredentialListing.workspaces.find((item) => item.id === "workspace-available").current, true);
+assert.equal(staleCredentialListing.workspaces.find((item) => item.id === "personal-account").current, false);
+
 const devices = normalizeSessionDevices({
   show_session_manager: true,
   devices: [

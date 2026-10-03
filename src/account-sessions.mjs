@@ -87,14 +87,30 @@ export async function switchAccountWorkspace(job, workspaceId) {
 export function normalizeAccountWorkspaces(payload, currentAccountId = "") {
   const source = isRecord(payload) ? payload : {};
   const defaultAccountId = normalizeIdentifier(source.default_account_id ?? source.defaultAccountId);
-  const selectedAccountId = normalizeIdentifier(currentAccountId) || defaultAccountId;
+  const requestedAccountId = normalizeIdentifier(currentAccountId);
+  const responseSelectedAccountId = normalizeIdentifier(
+    source.current_account_id
+      ?? source.currentAccountId
+      ?? source.selected_account_id
+      ?? source.selectedAccountId,
+  );
   const accounts = Array.isArray(source.accounts) ? source.accounts : [];
+  const accountIds = new Set(accounts.map((account) => normalizeIdentifier(account?.id ?? account?.account_id ?? account?.accountId)).filter(Boolean));
+  const selectedAccountId = responseSelectedAccountId && accountIds.has(responseSelectedAccountId)
+    ? responseSelectedAccountId
+    : requestedAccountId && accountIds.has(requestedAccountId)
+      ? requestedAccountId
+      : responseSelectedAccountId || defaultAccountId || requestedAccountId;
   const workspaces = accounts
     .slice(0, MAX_WORKSPACES)
     .map((account) => normalizeAccountWorkspace(account, selectedAccountId))
     .filter(Boolean);
+  if (!workspaces.some((workspace) => workspace.current)) {
+    const fallback = workspaces.find((workspace) => isAccountWorkspaceAvailable(workspace)) || workspaces[0];
+    if (fallback) fallback.current = true;
+  }
   return {
-    currentWorkspaceId: workspaces.find((workspace) => workspace.current)?.id || selectedAccountId || null,
+    currentWorkspaceId: workspaces.find((workspace) => workspace.current)?.id || null,
     workspaces,
     fetchedAt: new Date().toISOString(),
   };
@@ -109,13 +125,21 @@ function normalizeAccountWorkspace(account, defaultAccountId) {
   const rawCanAccess = account.can_access_with_session !== false;
   const rawDeactivated = account.is_deactivated === true;
   const availability = normalizeAccountWorkspaceAvailability(account, rawCanAccess, rawDeactivated);
+  const currentMarker = firstBoolean(
+    account.current,
+    account.is_current,
+    account.isCurrent,
+    account.selected,
+    account.is_selected,
+    account.isSelected,
+  );
   return {
     id,
     name,
     structure: structure || "workspace",
     planType: normalizeUsageText(account.plan_type ?? account.planType) || null,
     role: normalizeUsageText(account.account_user_role ?? account.role) || null,
-    current: id === defaultAccountId,
+    current: currentMarker === true || (currentMarker !== false && id === defaultAccountId),
     canAccess: rawCanAccess && availability.reason === "available",
     deactivated: rawDeactivated || availability.reason === "deactivated",
     availabilityReason: availability.reason,
