@@ -377,7 +377,19 @@ button:disabled { cursor: not-allowed; opacity: .5; box-shadow: none; }
   box-shadow: var(--shadow);
   overscroll-behavior-x: contain;
 }
-table { width: 100%; min-width: 2000px; border-collapse: separate; border-spacing: 0; table-layout: fixed; }
+table { width: max-content; min-width: 100%; border-collapse: separate; border-spacing: 0; table-layout: fixed; }
+col.select-column { width: 48px; }
+col.account-column { width: 360px; }
+col:nth-child(3) { width: 140px; }
+col:nth-child(4) { width: 160px; }
+col:nth-child(5) { width: 120px; }
+col:nth-child(6) { width: 120px; }
+col:nth-child(7) { width: 140px; }
+col:nth-child(8) { width: 120px; }
+col:nth-child(9) { width: 220px; }
+col:nth-child(10) { width: 120px; }
+col:nth-child(11) { width: 160px; }
+col.actions-column { width: 180px; }
 th {
   position: sticky;
   top: 0;
@@ -396,17 +408,17 @@ th {
   text-overflow: ellipsis;
 }
 th:nth-child(1) { width: 48px; }
-th:nth-child(2) { width: 11%; }
-th:nth-child(3) { width: 7%; }
-th:nth-child(4) { width: 8%; }
-th:nth-child(5) { width: 6%; }
-th:nth-child(6) { width: 6%; }
-th:nth-child(7) { width: 7%; }
-th:nth-child(8) { width: 6%; }
-th:nth-child(9) { width: 11%; }
-th:nth-child(10) { width: 6%; }
-th:nth-child(11) { width: 8%; }
-th:nth-child(12) { width: 248px; }
+th:nth-child(2), .account-heading, .account-column { width: 360px; min-width: 360px; max-width: 360px; }
+th:nth-child(3) { width: 140px; }
+th:nth-child(4) { width: 160px; }
+th:nth-child(5) { width: 120px; }
+th:nth-child(6) { width: 120px; }
+th:nth-child(7) { width: 140px; }
+th:nth-child(8) { width: 120px; }
+th:nth-child(9) { width: 220px; }
+th:nth-child(10) { width: 120px; }
+th:nth-child(11) { width: 160px; }
+th:nth-child(12) { width: 180px; min-width: 180px; }
 /* Pin the checkbox, account, and action columns while scrolling horizontally. */
 th:nth-child(1), .job-row > td:nth-child(1) { position: sticky; left: 0; }
 th:nth-child(2), .job-row > td:nth-child(2) { position: sticky; left: 48px; box-shadow: inset -1px 0 0 var(--line); }
@@ -416,7 +428,7 @@ th:nth-child(12), .job-row > td:nth-child(12) { position: sticky; right: 0; box-
 th:nth-child(12) { z-index: 4; background: #f7f9f8; }
 .job-row > td:nth-child(12) { z-index: 2; background: var(--surface); }
 .job-row:hover > td:nth-child(12), .job-row:has(.select-cell input:checked) > td:nth-child(12) { background: var(--surface); }
-.actions-heading { text-align: right; }
+.actions-heading { text-align: left; }
 .priority-heading { white-space: nowrap; }
 .column-filter-heading { display: grid; gap: 5px; min-width: 0; }
 .column-filter-heading > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -765,11 +777,12 @@ tbody tr:last-child td { border-bottom: 0; }
 .operation-time-cell { color: #4f5b57; font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .operation-time-cell time { display: block; overflow: hidden; text-overflow: ellipsis; font-size: 12px; }
 .operation-time-cell span { display: block; margin-top: 4px; color: var(--subtle); font-size: 11px; white-space: normal; overflow-wrap: anywhere; }
-.row-actions { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 6px; white-space: normal; }
-.row-actions > button { flex: 0 0 auto; height: var(--button-height); white-space: nowrap; }
-.actions-cell { overflow: visible; }
+.row-actions { width: 166px; display: grid; grid-template-columns: repeat(5, 30px); align-content: start; justify-content: start; gap: 4px; white-space: normal; }
+.row-actions > button { width: 32px; min-width: 32px; height: var(--button-height); padding: 0; white-space: nowrap; }
+.actions-cell { overflow: visible; padding: 8px 10px; }
 .row-actions .download-button, .row-actions .secondary-button { height: var(--button-height); padding: 0 11px; font-size: 12px; }
 .row-actions .icon-only-action { width: 32px; min-width: 32px; padding: 0; gap: 0; }
+.row-actions > button, .row-actions .icon-only-action { width: 30px; min-width: 30px; height: 30px; padding: 0; }
 .download-button { height: 32px; padding: 0 11px; font-size: 12px; }
 .retry-button, .regenerate-button, .relogin-button {
   height: var(--button-height);

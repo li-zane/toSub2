@@ -88,6 +88,7 @@ const SUB2API_TARGET_GROUP_PLATFORMS = ["openai", "composite"];
 const SUB2API_ACCOUNT_NAME_TEMPLATE_KEYS = new Set([
   "email",
   "planType",
+  "planType_disp",
   "plan_type",
   "accountId",
   "account_id",
@@ -3158,6 +3159,7 @@ function renderSub2ApiAccountName(template, account) {
   if (!template) return String(account?.name || "").trim().slice(0, 256);
   const email = sub2ApiAccountEmail(account) || "";
   const planType = extractPlanTypeFromAccount(account, { preferJwt: false }) || "";
+  const planTypeDisp = displayPlanTypeLabel(planType);
   const accountId = String(
     account?.id
       ?? account?.account_id
@@ -3169,14 +3171,24 @@ function renderSub2ApiAccountName(template, account) {
   const values = {
     email,
     planType,
+    planType_disp: planTypeDisp,
     plan_type: planType,
     accountId,
     account_id: accountId,
     id: accountId,
     name: String(account?.name || "").trim(),
   };
-  const rendered = template.replace(/\{(email|planType|plan_type|accountId|account_id|id|name)\}/g, (_match, key) => values[key] || "").trim();
+  const rendered = template.replace(/\{(email|planType_disp|planType|plan_type|accountId|account_id|id|name)\}/g, (_match, key) => values[key] || "").trim();
   return (rendered || values.name || email).slice(0, 256);
+}
+
+function displayPlanTypeLabel(planType) {
+  const raw = normalizePlanType(planType);
+  if (!raw) return "";
+  if (planTypeLabelMapping[raw]) return planTypeLabelMapping[raw];
+  const lower = raw.toLowerCase();
+  const match = Object.entries(planTypeLabelMapping).find(([key]) => String(key).toLowerCase() === lower);
+  return match ? String(match[1]) : raw;
 }
 
 function normalizeSub2ApiWsMode(value) {

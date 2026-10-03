@@ -1624,6 +1624,20 @@ function App() {
 
         <div className="table-frame">
           <table>
+            <colgroup>
+              <col className="select-column" />
+              <col className="account-column" />
+              <col />
+              <col />
+              <col />
+              <col />
+              <col />
+              <col />
+              <col />
+              <col />
+              <col />
+              <col className="actions-column" />
+            </colgroup>
             <thead>
               <tr>
                 <th className="select-heading">
@@ -1635,7 +1649,7 @@ function App() {
                     aria-label="选择当前页全部任务"
                   />
                 </th>
-                <th>账号</th>
+                <th className="account-heading">账号</th>
                 <th>
                   <div className="column-filter-heading">
                     <span>Plan type</span>
@@ -2242,7 +2256,7 @@ function App() {
                   placeholder="例如：chatgpt-{email}"
                   spellCheck="false"
                 />
-                <small className="settings-field-hint">留空保留导入文件原名；支持 {'{email}'}、{'{planType}'}、{'{accountId}'}、{'{name}'}</small>
+                <small className="settings-field-hint">留空保留导入文件原名；支持 {'{email}'}、{'{planType}'}、{'{planType_disp}'}（映射值）、{'{accountId}'}、{'{name}'}</small>
               </label>
               <label className="settings-field wide-settings-field">
                 <span>允许使用的模型</span>
@@ -2636,7 +2650,7 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
           aria-label={`选择 ${job.email}`}
         />
       </td>
-      <td>
+      <td className="account-column">
         <div className="account-cell">
           <div className="account-avatar">{job.email.slice(0, 1).toUpperCase()}</div>
           <div className="account-details">

@@ -210,7 +210,7 @@ API Key 只会随取号请求临时发送给本地服务，不会写入任务元
 - 管理员 API Key（管理员接口密钥）。请求时通过 `x-api-key` 请求头发送。
 - 点击“读取配置”后读取目标号池和代理列表。目标号池支持 OpenAI 与 Composite 平台分组多选；不选择具体分组时使用后端默认号池。
 - 可以统一指定代理 IP、并发数、负载因子和优先级。数字参数留空时保留每个账号原来的配置。
-- 可以设置账号命名模板，例如 `chatgpt-{email}`；支持 `{email}`、`{planType}`、`{accountId}` 和 `{name}`，留空时保留导入文件中的原名。模板在服务端上传前渲染，批量上传和单个上传使用同一规则。
+- 可以设置账号命名模板，例如 `chatgpt-{email}`；支持 `{email}`、`{planType}`、`{planType_disp}`（当前 PlanType 映射值）、`{accountId}` 和 `{name}`，留空时保留导入文件中的原名。模板在服务端上传前渲染，批量上传和单个上传使用同一规则。
 - 可以填写允许使用的模型，每行一个，也支持逗号分隔，例如 `gpt-5`、`gpt-5-mini`。
 - 可以设置账号级 `WS mode`：`off`、`ctx_pool`、`passthrough` 或 `http_bridge`。该设置会写入 OpenAI OAuth 账号的 `extra.openai_oauth_responses_websockets_v2_mode` 及对应启用开关，并在上传和号池自动修复时保持一致。使用非 `off` 模式前，需要在 Sub2API 的 `gateway.openai_ws.mode_router_v2_enabled` 中启用新版路由。
 - 可以新增多个配置方案。管理地址、管理员 API Key 和自动检测开关是全局设置；号池、代理、并发、负载因子、优先级、账号命名模板、模型白名单、Codex 指纹模式和 WS mode 由每个方案独立保存。可把任意原始 `PlanType` 绑定到方案，例如 `self_serve_business_prolite` -> Business Premium、`free` -> Free。上传时同一批账号会按绑定方案分组调用 Sub2API。

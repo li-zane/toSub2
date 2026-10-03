@@ -850,7 +850,7 @@ try {
     headers,
     body: JSON.stringify({
       ids: [profileJob.id],
-      config: { baseUrl: sub2apiUrl, adminApiKey: "test-admin-key", groupIds: ["7", "71"], proxyId: "3", concurrency: "10", loadFactor: "100", priority: "1", accountNameTemplate: "managed-{email}-{accountId}", modelWhitelist: "gpt-5\ngpt-5-mini", codexFingerprintMode: "full", wsMode: "http_bridge" },
+      config: { baseUrl: sub2apiUrl, adminApiKey: "test-admin-key", groupIds: ["7", "71"], proxyId: "3", concurrency: "10", loadFactor: "100", priority: "1", accountNameTemplate: "managed-{planType_disp}-{email}", modelWhitelist: "gpt-5\ngpt-5-mini", codexFingerprintMode: "full", wsMode: "http_bridge" },
     }),
   });
   const validUploadText = await validUploadResponse.text();
@@ -863,7 +863,7 @@ try {
   assert.equal(uploadedAccounts[0].concurrency, 10);
   assert.equal(uploadedAccounts[0].load_factor, 100);
   assert.equal(uploadedAccounts[0].priority, 1);
-  assert.equal(uploadedAccounts[0].name, "managed-account-profile@example.com-test-account-account-profile@example.com");
+  assert.equal(uploadedAccounts[0].name, "managed-Free Tier-account-profile@example.com");
   assert.equal(uploadedAccounts[0].status, "active");
   assert.equal(uploadedAccounts[0].schedulable, true);
   assert.equal(uploadedAccounts[0].extra.codex_fingerprint_mode, "full");
