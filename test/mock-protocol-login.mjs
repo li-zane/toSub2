@@ -262,7 +262,7 @@ try {
     return;
   }
 
-  if (args.email === "mfa-prompt@example.com") {
+  if (["mfa-prompt@example.com", "mfa-cancel@example.com"].includes(args.email)) {
     process.stdout.write("[mfa] TOTP 2FA challenge reached.\n2FA OTP (6 digits, q=quit): ");
     await rl.question("");
     await writeCompleted(args.sub2apiOut, args.email, "mfa-login");

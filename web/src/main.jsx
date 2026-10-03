@@ -75,12 +75,22 @@ const JOB_STATUS_LABELS = {
   refreshing: "刷新授权",
   completed: "已完成",
   failed: "失败",
+  mfa_failed: "2FA 未通过",
   banned: "封禁",
   canceled: "已取消",
   reauth_required: "待重新授权",
   resume_available: "可继续",
 };
-const DEFAULT_JOB_STATUS_OPTIONS = Object.keys(JOB_STATUS_LABELS);
+const SUB2API_POOL_FILTER_LABELS = {
+  added: "已加入",
+  not_added: "未加入",
+  unknown: "未同步",
+};
+const SUB2API_ENABLED_FILTER_LABELS = {
+  enabled: "已启用",
+  disabled: "已停用",
+  unknown: "未知",
+};
 const SUB2API_WS_MODE_OPTIONS = [
   { value: "off", label: "关闭（off）" },
   { value: "ctx_pool", label: "上下文池（ctx_pool）" },
@@ -122,7 +132,10 @@ function App() {
   const [sub2apiPoolFilter, setSub2apiPoolFilter] = useState("");
   const [sub2apiEnabledFilter, setSub2apiEnabledFilter] = useState("");
   const [planTypeOptions, setPlanTypeOptions] = useState([]);
-  const [statusOptions, setStatusOptions] = useState(DEFAULT_JOB_STATUS_OPTIONS);
+  const [statusOptions, setStatusOptions] = useState([]);
+  const [sub2apiPoolOptions, setSub2apiPoolOptions] = useState([]);
+  const [sub2apiEnabledOptions, setSub2apiEnabledOptions] = useState([]);
+  const [planTypeUnknown, setPlanTypeUnknown] = useState(false);
   const [error, setError] = useState("");
   const [expandedJobId, setExpandedJobId] = useState(null);
   const [selectedJobIds, setSelectedJobIds] = useState(() => new Set());
@@ -284,10 +297,28 @@ function App() {
           setPagination(data.pagination || { page, pageSize: 20, total: data.jobs.length, totalPages: 1 });
           setStats(data.stats || { active: 0, queued: 0, completed: 0 });
           if (data.taskSettings) setTaskSettings(data.taskSettings);
-          setPlanTypeOptions(Array.isArray(data.filterOptions?.planTypes) ? data.filterOptions.planTypes : []);
-          if (Array.isArray(data.filterOptions?.statuses) && data.filterOptions.statuses.length) {
-            setStatusOptions(data.filterOptions.statuses.filter((value) => Object.hasOwn(JOB_STATUS_LABELS, value)));
-          }
+          const nextPlanTypeOptions = Array.isArray(data.filterOptions?.planTypes) ? data.filterOptions.planTypes : [];
+          const nextPlanTypeUnknown = data.filterOptions?.planTypeUnknown === true;
+          const nextStatusOptions = Array.isArray(data.filterOptions?.statuses)
+            ? data.filterOptions.statuses.filter((value) => Object.hasOwn(JOB_STATUS_LABELS, value))
+            : [];
+          const nextPoolOptions = Array.isArray(data.filterOptions?.sub2apiPools)
+            ? data.filterOptions.sub2apiPools.filter((value) => Object.hasOwn(SUB2API_POOL_FILTER_LABELS, value))
+            : [];
+          const nextEnabledOptions = Array.isArray(data.filterOptions?.sub2apiEnabled)
+            ? data.filterOptions.sub2apiEnabled.filter((value) => Object.hasOwn(SUB2API_ENABLED_FILTER_LABELS, value))
+            : [];
+          setPlanTypeOptions(nextPlanTypeOptions);
+          setPlanTypeUnknown(nextPlanTypeUnknown);
+          setStatusOptions(nextStatusOptions);
+          setSub2apiPoolOptions(nextPoolOptions);
+          setSub2apiEnabledOptions(nextEnabledOptions);
+          if (statusFilter && !nextStatusOptions.includes(statusFilter)) setStatusFilter("");
+          if (planTypeFilter && (planTypeFilter === "__unknown__"
+            ? !nextPlanTypeUnknown
+            : !nextPlanTypeOptions.includes(planTypeFilter))) setPlanTypeFilter("");
+          if (sub2apiPoolFilter && !nextPoolOptions.includes(sub2apiPoolFilter)) setSub2apiPoolFilter("");
+          if (sub2apiEnabledFilter && !nextEnabledOptions.includes(sub2apiEnabledFilter)) setSub2apiEnabledFilter("");
           if (data.pagination?.page && data.pagination.page !== page) setPage(data.pagination.page);
           setError("");
         }
@@ -834,7 +865,7 @@ function App() {
       const completed = latest.filter(predicate).length;
       setUploadNotice(`${label} ${completed}/${ids.length}`);
       const failed = latest.find((job) => failurePredicate?.(job) || (
-        ["failed", "banned", "canceled", "reauth_required", "resume_available"].includes(job.status) && !predicate(job)
+        ["failed", "mfa_failed", "banned", "canceled", "reauth_required", "resume_available"].includes(job.status) && !predicate(job)
       ));
       if (failed) {
         const detail = extractResponseMessage(failed.totpSetupError || failed.lastError || failed.prompt || "任务失败");
@@ -1350,9 +1381,9 @@ function App() {
                 required
               />
             </div>
-            <button className="primary-button" type="submit" disabled={!token || busy}>
+            <button className="primary-button add-task-button" type="submit" disabled={!token || busy}>
               {busy ? <LoaderCircle className="spin" size={17} /> : <Plus size={17} />}
-              添加任务
+              <span className="button-label">添加任务</span>
             </button>
             <button className="secondary-button" type="button" onClick={openPlanTypeMapping} disabled={!token} title="配置 PlanType 映射" aria-label="配置 PlanType 映射">
               <Tags size={17} />
@@ -1614,7 +1645,7 @@ function App() {
                       aria-label="筛选 Plan type"
                     >
                       <option value="">全部</option>
-                      <option value="__unknown__">未知</option>
+                      {planTypeUnknown && <option value="__unknown__">未知</option>}
                       {availablePlanTypes.map((value) => <option key={value} value={value}>{formatPlanTypeLabel(value, planTypeMapping)}</option>)}
                     </select>
                   </div>
@@ -1629,9 +1660,9 @@ function App() {
                       aria-label="筛选 Sub2API 号池状态"
                     >
                       <option value="">全部</option>
-                      <option value="added">已加入</option>
-                      <option value="not_added">未加入</option>
-                      <option value="unknown">未同步</option>
+                      {sub2apiPoolOptions.map((value) => (
+                        <option key={value} value={value}>{SUB2API_POOL_FILTER_LABELS[value]}</option>
+                      ))}
                     </select>
                   </div>
                 </th>
@@ -1644,9 +1675,9 @@ function App() {
                       aria-label="筛选号池启用状态"
                     >
                       <option value="">全部</option>
-                      <option value="enabled">已启用</option>
-                      <option value="disabled">已停用</option>
-                      <option value="unknown">未知</option>
+                      {sub2apiEnabledOptions.map((value) => (
+                        <option key={value} value={value}>{SUB2API_ENABLED_FILTER_LABELS[value]}</option>
+                      ))}
                     </select>
                   </div>
                 </th>
@@ -2592,7 +2623,7 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
   }
 
   const inputConfig = getInputConfig(job.status, job.currentPhone);
-  const terminal = ["completed", "failed", "banned", "canceled", "reauth_required", "resume_available"].includes(job.status);
+  const terminal = ["completed", "failed", "mfa_failed", "banned", "canceled", "reauth_required", "resume_available"].includes(job.status);
 
   return (
     <tr className={`job-row status-${job.status}`}>
@@ -2795,25 +2826,23 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
             </button>
           )}
           {job.canDownload && (
-            <button type="button" className="download-button" onClick={download}>
-              <Download size={16} />下载
+            <button type="button" className="download-button icon-only-action" onClick={download} title="下载导入文件" aria-label="下载导入文件">
+              <Download size={16} />
             </button>
           )}
           {job.canDownload && sub2apiUploadAvailable && (
-            <button type="button" className="secondary-button" onClick={onUpload} disabled={submitting} title="上传到已配置的 Sub2API 号池">
-              <Send size={16} />上传
+            <button type="button" className="secondary-button icon-only-action" onClick={onUpload} disabled={submitting} title="上传到已配置的 Sub2API 号池" aria-label="上传到已配置的 Sub2API 号池">
+              <Send size={16} />
             </button>
           )}
           {job.canRegenerate && (
-            <button type="button" className="regenerate-button" onClick={regenerate} disabled={submitting} title="重新授权：优先使用刷新令牌，失效后自动重新登录">
+            <button type="button" className="regenerate-button icon-only-action" onClick={regenerate} disabled={submitting} title="重新授权：优先使用刷新令牌，失效后自动重新登录" aria-label="重新授权">
               {submitting ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}
-              重新授权
             </button>
           )}
           {forceReloginAvailable && job.canForceRelogin && (
-            <button type="button" className="relogin-button" onClick={forceRelogin} disabled={submitting} title="跳过刷新令牌和旧检查点，完整重新登录后自动授权">
+            <button type="button" className="relogin-button icon-only-action" onClick={forceRelogin} disabled={submitting} title="跳过刷新令牌和旧检查点，完整重新登录后自动授权" aria-label="重新登录并授权">
               {submitting ? <LoaderCircle className="spin" size={16} /> : <LogIn size={16} />}
-              重新登录并授权
             </button>
           )}
           {totpSetupAvailable && job.canSetupTotp && (
@@ -2827,9 +2856,15 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
             </button>
           )}
           {job.canRetry && (
-            <button type="button" className="retry-button" onClick={retry} disabled={submitting}>
+            <button
+              type="button"
+              className="retry-button icon-only-action"
+              onClick={retry}
+              disabled={submitting}
+              title={job.securityCheckRequired ? "手动重试" : job.canResume ? "继续流程" : "重新授权"}
+              aria-label={job.securityCheckRequired ? "手动重试" : job.canResume ? "继续流程" : "重新授权"}
+            >
               {submitting ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}
-              {job.securityCheckRequired ? "手动重试" : job.canResume ? "继续流程" : "重新授权"}
             </button>
           )}
           <button type="button" className="icon-button" onClick={onToggleLogs} title={expanded ? "收起日志" : "查看日志"}>
@@ -3480,8 +3515,9 @@ function WorkspaceDialog({ token, job, planTypeMapping, onClose, onError, onJobU
     setDialogError("");
     try {
       const data = await apiFetch(token, `/api/jobs/${job.id}/workspaces`);
-      setWorkspaces(data.workspaces?.workspaces || []);
-      setCurrentWorkspaceId(data.workspaces?.currentWorkspaceId || null);
+      const listedWorkspaces = data.workspaces?.workspaces || [];
+      setWorkspaces(listedWorkspaces);
+      setCurrentWorkspaceId(data.workspaces?.currentWorkspaceId || listedWorkspaces.find((item) => item.current)?.id || null);
     } catch (error) {
       setDialogError(error.message);
     } finally {
@@ -3496,8 +3532,9 @@ function WorkspaceDialog({ token, job, planTypeMapping, onClose, onError, onJobU
     apiFetch(token, `/api/jobs/${job.id}/workspaces`)
       .then((data) => {
         if (stopped) return;
-        setWorkspaces(data.workspaces?.workspaces || []);
-        setCurrentWorkspaceId(data.workspaces?.currentWorkspaceId || null);
+        const listedWorkspaces = data.workspaces?.workspaces || [];
+        setWorkspaces(listedWorkspaces);
+        setCurrentWorkspaceId(data.workspaces?.currentWorkspaceId || listedWorkspaces.find((item) => item.current)?.id || null);
       })
       .catch((error) => {
         if (!stopped) setDialogError(error.message);
@@ -3570,7 +3607,7 @@ function WorkspaceDialog({ token, job, planTypeMapping, onClose, onError, onJobU
         ) : workspaces.length ? (
           <div className="workspace-list" aria-live="polite">
             {workspaces.map((workspace) => {
-              const selected = workspace.id === currentWorkspaceId;
+              const selected = workspace.id === currentWorkspaceId || (currentWorkspaceId === null && workspace.current === true);
               const disabled = workspace.canAccess === false || workspace.deactivated;
               return (
                 <button
@@ -3629,6 +3666,7 @@ function StatusBadge({ status }) {
     refreshing: ["刷新授权", <RefreshCw className="spin" size={14} />],
     completed: ["已完成", <Check size={14} />],
     failed: ["失败", <CircleAlert size={14} />],
+    mfa_failed: ["2FA 未通过", <CircleAlert size={14} />],
     banned: ["封禁", <Ban size={14} />],
     canceled: ["已取消", <Ban size={14} />],
     reauth_required: ["待重新授权", <RefreshCw size={14} />],

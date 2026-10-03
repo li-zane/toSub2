@@ -484,6 +484,23 @@ try {
   assert.equal(mfaInputResponse.status, 200, await mfaInputResponse.text());
   await waitForJob(headers, mfaPromptJobId, (value) => value.status === "completed");
 
+  const mfaCancelResponse = await fetch(`${baseUrl}/api/jobs`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ email: "mfa-cancel@example.com" }),
+  });
+  assert.equal(mfaCancelResponse.status, 201);
+  const mfaCancelJobId = (await mfaCancelResponse.json()).job.id;
+  await waitForJob(headers, mfaCancelJobId, (value) => value.status === "mfa_otp");
+  const mfaCancelRequest = await fetch(`${baseUrl}/api/jobs/${mfaCancelJobId}/cancel`, {
+    method: "POST",
+    headers,
+  });
+  assert.equal(mfaCancelRequest.status, 200, await mfaCancelRequest.text());
+  const mfaFailedJob = await waitForJob(headers, mfaCancelJobId, (value) => value.status === "mfa_failed");
+  assert.equal(mfaFailedJob.prompt, "2FA 未通过，流程已停止");
+  assert.equal(mfaFailedJob.canRetry, true);
+
   const wrongEmailOtpResponse = await fetch(`${baseUrl}/api/jobs`, {
     method: "POST",
     headers,
@@ -1077,6 +1094,19 @@ try {
   const statusPage = await (await fetch(`${baseUrl}/api/jobs`, { headers })).json();
   assert.equal(statusPage.jobs.find((item) => item.email === "account-profile@example.com").sub2apiPriority, 9);
   assert.equal(statusPage.jobs.find((item) => item.email === "account-profile@example.com").sub2apiUsage.primary.usedPercent, 21);
+  const expectedStatusOptions = [...new Set(statusPage.selection.map((item) => item.status))].sort();
+  assert.deepEqual([...statusPage.filterOptions.statuses].sort(), expectedStatusOptions);
+  const expectedPlanTypes = [...new Set(statusPage.selection.map((item) => item.planType).filter(Boolean))].sort();
+  assert.deepEqual([...statusPage.filterOptions.planTypes].sort(), expectedPlanTypes);
+  const expectedPoolOptions = [...new Set(statusPage.selection.map((item) => (
+    item.sub2apiInPool === true ? "added" : item.sub2apiInPool === false ? "not_added" : "unknown"
+  )))].sort();
+  assert.deepEqual([...statusPage.filterOptions.sub2apiPools].sort(), expectedPoolOptions);
+  const expectedEnabledOptions = [...new Set(statusPage.selection.map((item) => (
+    item.sub2apiEnabled === true ? "enabled" : item.sub2apiEnabled === false ? "disabled" : "unknown"
+  )))].sort();
+  assert.deepEqual([...statusPage.filterOptions.sub2apiEnabled].sort(), expectedEnabledOptions);
+  assert.equal(statusPage.filterOptions.planTypeUnknown, statusPage.selection.some((item) => !item.planType));
   const addedFilter = await (await fetch(`${baseUrl}/api/jobs?sub2apiPool=added`, { headers })).json();
   assert.equal(addedFilter.pagination.total, 1);
   assert.equal(addedFilter.jobs[0].sub2apiInPool, true);
@@ -1936,6 +1966,7 @@ try {
       jobId,
       profileJob.id,
       mfaPromptJobId,
+      mfaCancelJobId,
       wrongEmailOtpJobId,
       ...batch.jobs.map((item) => item.id),
       proxyRetryCreated.job.id,
@@ -1955,7 +1986,7 @@ try {
     throw new Error(`delete request failed with HTTP ${deleteResponse.status}: ${await deleteResponse.text()}`);
   }
   const deleted = await deleteResponse.json();
-  assert.equal(deleted.deleted, 28);
+  assert.equal(deleted.deleted, 29);
 
   const finalPage = await (await fetch(`${baseUrl}/api/jobs`, { headers })).json();
   assert.equal(finalPage.pagination.total, 0);

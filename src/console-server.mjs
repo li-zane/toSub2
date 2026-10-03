@@ -53,6 +53,7 @@ const JOB_STATUS_FILTER_VALUES = [
   "refreshing",
   "completed",
   "failed",
+  "mfa_failed",
   "banned",
   "canceled",
   "reauth_required",
@@ -431,7 +432,7 @@ async function handleApi(req, res, requestUrl) {
     const body = await readJson(req);
     const selected = resolveSelectedJobs(body.ids);
     const unsupported = selected.find(
-      (job) => !["completed", "failed", "canceled", "reauth_required", "resume_available"].includes(job.status),
+      (job) => !["completed", "failed", "mfa_failed", "canceled", "reauth_required", "resume_available"].includes(job.status),
     );
     if (unsupported) throw httpError(409, `${unsupported.email} 当前仍在进行中，不能重新授权`);
     await Promise.all(selected.map((job) => withEmailJobLock(job.email, async () => {
@@ -1008,14 +1009,17 @@ async function handleApi(req, res, requestUrl) {
 
 async function sendJobsPage(res, requestedPage, emailFilter = null, filters = {}) {
   await syncCompletedOutputs();
-  if (filters.planType || filters.sub2apiPool || filters.sub2apiEnabled) {
-    try {
-      await loadSub2ApiAccountStatus();
-    } catch (error) {
-      if (filters.sub2apiPool || filters.sub2apiEnabled) throw error;
-    }
+  try {
+    await loadSub2ApiAccountStatus();
+  } catch (error) {
+    if (filters.sub2apiPool || filters.sub2apiEnabled) throw error;
   }
   const allJobs = listUniqueJobs();
+  const planTypes = [...new Set(allJobs.map((job) => getJobPlanType(job)).filter(Boolean))].sort();
+  const planTypeUnknown = allJobs.some((job) => !getJobPlanType(job));
+  const sub2apiPools = [...new Set(allJobs.map((job) => getSub2ApiPoolFilterValue(job)))];
+  const sub2apiEnabled = [...new Set(allJobs.map((job) => getSub2ApiEnabledFilterValue(job)))];
+  const statuses = JOB_STATUS_FILTER_VALUES.filter((status) => allJobs.some((job) => job.status === status));
   const emailSet = emailFilter?.length ? new Set(emailFilter) : null;
   const visibleJobs = allJobs.filter((job) => {
     if (emailSet && !emailSet.has(job.email.toLowerCase())) return false;
@@ -1039,8 +1043,11 @@ async function sendJobsPage(res, requestedPage, emailFilter = null, filters = {}
       sub2apiEnabled: filters.sub2apiEnabled || "",
     },
     filterOptions: {
-      statuses: JOB_STATUS_FILTER_VALUES,
-      planTypes: [...new Set(allJobs.map((job) => getJobPlanType(job)).filter(Boolean))].sort(),
+      statuses,
+      planTypes,
+      planTypeUnknown,
+      sub2apiPools,
+      sub2apiEnabled,
     },
     stats: {
       active: allJobs.filter(occupiesActiveSlot).length,
@@ -1081,6 +1088,16 @@ function matchesJobFilters(job, filters) {
   if (filters.sub2apiEnabled === "disabled" && sub2ApiStatus.enabled !== false) return false;
   if (filters.sub2apiEnabled === "unknown" && sub2ApiStatus.enabled !== null) return false;
   return true;
+}
+
+function getSub2ApiPoolFilterValue(job) {
+  const value = getSub2ApiAccountStatusForJob(job).inPool;
+  return value === true ? "added" : value === false ? "not_added" : "unknown";
+}
+
+function getSub2ApiEnabledFilterValue(job) {
+  const value = getSub2ApiAccountStatusForJob(job).enabled;
+  return value === true ? "enabled" : value === false ? "disabled" : "unknown";
 }
 
 function normalizeEmailFilter(value) {
@@ -1389,7 +1406,10 @@ async function handleChildClose(job, { code, signal, mode, runId }) {
     return;
   }
   if (!isTerminalStatus(job.status)) {
-    if (await fileExists(job.checkpointPath)) {
+    if (job.status === "mfa_otp") {
+      markMfaFailed(job, signal ? `2FA 验证阶段被 ${signal} 终止` : `2FA 验证阶段退出，代码 ${code ?? "未知"}`);
+      await saveJobMetadata(job);
+    } else if (await fileExists(job.checkpointPath)) {
       markResumeAvailable(job, signal ? `登录进程被 ${signal} 终止` : "登录流程中断");
     } else {
       failJob(job, signal ? `登录进程被 ${signal} 终止` : `登录进程退出，代码 ${code ?? "未知"}`);
@@ -1427,7 +1447,7 @@ function handleChildCloseFailure(job, mode, runId, error) {
 }
 
 async function retryJob(job, options = {}) {
-  if (!["failed", "canceled", "reauth_required", "resume_available"].includes(job.status)) {
+  if (!["failed", "mfa_failed", "canceled", "reauth_required", "resume_available"].includes(job.status)) {
     throw httpError(409, "当前任务不需要重新授权");
   }
   const retryingSecurityCheck = Boolean(job.securityCheckRequired);
@@ -2794,8 +2814,10 @@ async function cancelJob(job) {
   }
   stopMailPolling(job);
   releaseSmsNumber(job, "idle");
-  job.status = "canceled";
-  job.prompt = "流程已取消";
+  const mfaPending = job.status === "mfa_otp";
+  job.status = mfaPending ? "mfa_failed" : "canceled";
+  job.prompt = mfaPending ? "2FA 未通过，流程已停止" : "流程已取消";
+  if (mfaPending) job.lastError = "任务在 2FA 验证阶段停止，验证码未完成校验";
   job.child?.kill("SIGTERM");
   job.child = null;
   touch(job);
@@ -4942,7 +4964,7 @@ function publicJob(job) {
     smsStatus: job.smsStatus,
     smsError: job.smsError,
     securityCheckRequired: Boolean(job.securityCheckRequired),
-    canRetry: ["failed", "canceled", "reauth_required", "resume_available"].includes(job.status),
+    canRetry: ["failed", "mfa_failed", "canceled", "reauth_required", "resume_available"].includes(job.status),
     canResume: job.status === "resume_available",
     canRegenerate: job.status === "completed" && job.resultSaved,
     canForceRelogin: canForceRelogin(job),
@@ -5176,7 +5198,7 @@ function publicSelectionJob(job) {
     sub2apiAccountIds: sub2ApiStatus.accountIds,
     canDownload: Boolean(job.resultSaved),
     sub2apiPlanType: sub2ApiStatus.planType,
-    canRetry: ["failed", "canceled", "reauth_required", "resume_available"].includes(job.status),
+    canRetry: ["failed", "mfa_failed", "canceled", "reauth_required", "resume_available"].includes(job.status),
     canRegenerate: job.status === "completed" && job.resultSaved,
     canForceRelogin: canForceRelogin(job),
     canSetupTotp: canSetupTotp(job),
@@ -5186,21 +5208,21 @@ function publicSelectionJob(job) {
 }
 
 function canForceRelogin(job) {
-  return ["completed", "failed", "banned", "canceled", "reauth_required", "resume_available"].includes(job.status);
+  return ["completed", "failed", "mfa_failed", "banned", "canceled", "reauth_required", "resume_available"].includes(job.status);
 }
 
 function canSetupTotp(job) {
   if (job.totpSecret || job.hasTotpCredential || job.totpKnownEnabled) return false;
   if (job.status === "completed" && job.resultSaved) return true;
   return Boolean(job.loginCheckpointAvailable)
-    && ["phone", "phone_otp", "resume_available", "failed", "canceled", "reauth_required"].includes(job.status);
+    && ["phone", "phone_otp", "resume_available", "failed", "mfa_failed", "canceled", "reauth_required"].includes(job.status);
 }
 
 function canAddPassword(job) {
   if (job.password || job.hasPasswordCredential) return false;
   if (job.status === "completed" && job.resultSaved) return true;
   return Boolean(job.loginCheckpointAvailable)
-    && ["phone", "phone_otp", "resume_available", "failed", "canceled", "reauth_required"].includes(job.status);
+    && ["phone", "phone_otp", "resume_available", "failed", "mfa_failed", "canceled", "reauth_required"].includes(job.status);
 }
 
 function setStage(job, status, prompt) {
@@ -5222,6 +5244,16 @@ function failJob(job, message) {
   if (permanentAccountFailure) markAutoRepairBlocked(job, message);
   touch(job);
   void saveJobMetadata(job).catch(() => {});
+}
+
+function markMfaFailed(job, reason = "2FA 验证未完成") {
+  stopMailPolling(job);
+  releaseSmsNumber(job, "idle");
+  job.status = "mfa_failed";
+  job.prompt = "2FA 未通过，流程已停止";
+  job.lastError = reason;
+  job.child = null;
+  touch(job);
 }
 
 function beginAuthorizationAutomationAttempt(job, source) {
@@ -5344,7 +5376,7 @@ function getQueuePosition(job) {
 }
 
 function isTerminalStatus(status) {
-  return ["completed", "failed", "banned", "canceled", "reauth_required", "resume_available"].includes(status);
+  return ["completed", "failed", "mfa_failed", "banned", "canceled", "reauth_required", "resume_available"].includes(status);
 }
 
 function uniqueByJson(items) {
