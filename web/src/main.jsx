@@ -189,6 +189,7 @@ function App() {
   const [credentialJob, setCredentialJob] = useState(null);
   const [sessionJob, setSessionJob] = useState(null);
   const [workspaceJob, setWorkspaceJob] = useState(null);
+  const [operationDetail, setOperationDetail] = useState(null);
   const [sub2apiAccountStatus, setSub2apiAccountStatus] = useState({ configured: false, fetchedAt: null, accounts: {} });
   const [sub2apiToggleBusy, setSub2apiToggleBusy] = useState(() => new Set());
   const [sub2apiPriorityBusy, setSub2apiPriorityBusy] = useState(() => new Set());
@@ -1754,6 +1755,7 @@ function App() {
                     onOpenSessions={() => setSessionJob(job)}
                     workspacesAvailable={Boolean(features.accountWorkspaces)}
                     onOpenWorkspaces={() => setWorkspaceJob(job)}
+                    onOpenOperationDetail={(detail) => setOperationDetail({ email: job.email, ...detail })}
                   />
                   {expandedJobId === job.id && (
                     <tr className="log-row">
@@ -1817,6 +1819,9 @@ function App() {
             void refreshSub2ApiAccountStatus(true).catch(() => {});
           }}
         />
+      )}
+      {operationDetail && (
+        <OperationDetailDialog detail={operationDetail} onClose={() => setOperationDetail(null)} />
       )}
       {smsSettingsOpen && (
         <div className="modal-backdrop" role="presentation" onMouseDown={(event) => {
@@ -2470,7 +2475,58 @@ function EmptyState({ filtered = false }) {
   );
 }
 
-function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggleSelected, selectionSupported, smsProviderAvailable, smsProvider, onUpload, sub2apiUploadAvailable, sub2apiToggleAvailable, sub2apiToggleBusy, onToggleSub2Api, sub2apiPriorityAvailable, sub2apiPriorityBusy, onUpdateSub2ApiPriority, totpSetupAvailable, passwordAddAvailable, forceReloginAvailable, accountProxyUrl, planTypeMapping, accountUsage, accountUsageAvailable, onRefreshUsage, credentialsAvailable, onOpenCredentials, sessionsAvailable, onOpenSessions, workspacesAvailable, onOpenWorkspaces }) {
+function OperationDetailText({ text, className, onOpen }) {
+  const value = String(text ?? "");
+  if (!value) return null;
+  function open() {
+    onOpen?.({ title: "当前操作详情", text: value });
+  }
+  return (
+    <div
+      className={`${className} operation-detail-trigger`}
+      role="button"
+      tabIndex="0"
+      title="点击查看详细内容"
+      aria-label="查看当前操作详细内容"
+      onClick={open}
+      onKeyDown={(event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          open();
+        }
+      }}
+    >
+      {value}
+    </div>
+  );
+}
+
+function OperationDetailDialog({ detail, onClose }) {
+  return (
+    <div className="modal-backdrop operation-detail-backdrop" role="presentation" onMouseDown={(event) => {
+      if (event.target === event.currentTarget) onClose();
+    }}>
+      <section className="batch-dialog operation-detail-dialog" role="dialog" aria-modal="true" aria-labelledby="operation-detail-title">
+        <div className="dialog-header">
+          <div>
+            <h2 id="operation-detail-title">{detail.title || "当前操作详情"}</h2>
+            {detail.email && <span>{detail.email}</span>}
+          </div>
+          <button type="button" className="icon-button" onClick={onClose} title="关闭" aria-label="关闭详情">
+            <X size={18} />
+          </button>
+        </div>
+        <pre className="operation-detail-content">{detail.text}</pre>
+        <div className="dialog-actions">
+          <span className="dialog-actions-spacer" />
+          <button type="button" className="cancel-button" onClick={onClose}>关闭</button>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggleSelected, selectionSupported, smsProviderAvailable, smsProvider, onUpload, sub2apiUploadAvailable, sub2apiToggleAvailable, sub2apiToggleBusy, onToggleSub2Api, sub2apiPriorityAvailable, sub2apiPriorityBusy, onUpdateSub2ApiPriority, totpSetupAvailable, passwordAddAvailable, forceReloginAvailable, accountProxyUrl, planTypeMapping, accountUsage, accountUsageAvailable, onRefreshUsage, credentialsAvailable, onOpenCredentials, sessionsAvailable, onOpenSessions, workspacesAvailable, onOpenWorkspaces, onOpenOperationDetail }) {
   const [value, setValue] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [priorityValue, setPriorityValue] = useState(() => job.sub2apiPriority === null || job.sub2apiPriority === undefined ? "" : String(job.sub2apiPriority));
@@ -2731,14 +2787,14 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
       </td>
       <td><StatusBadge status={job.status} /></td>
       <td className="step-cell">
-        <div className="prompt-line">{job.prompt}</div>
-        {job.lastError && <div className="row-error">{extractResponseMessage(job.lastError)}</div>}
+        {job.prompt && <OperationDetailText text={job.prompt} className="prompt-line" onOpen={onOpenOperationDetail} />}
+        {job.lastError && <OperationDetailText text={extractResponseMessage(job.lastError)} className="row-error" onOpen={onOpenOperationDetail} />}
         {job.autoRepairBlocked && (
-          <div className="row-error">号池监控已永久跳过：{extractResponseMessage(job.autoRepairBlockedReason || "账号已不可用")}</div>
+          <OperationDetailText text={`号池监控已永久跳过：${extractResponseMessage(job.autoRepairBlockedReason || "账号已不可用")}`} className="row-error" onOpen={onOpenOperationDetail} />
         )}
-        {job.totpSetupError && <div className="row-error">2FA：{extractResponseMessage(job.totpSetupError)}</div>}
-        {job.passwordAddError && <div className="row-error">添加密码：{extractResponseMessage(job.passwordAddError)}</div>}
-        {job.mailApiError && job.status === "email_otp" && <div className="mail-error">{job.mailApiError}</div>}
+        {job.totpSetupError && <OperationDetailText text={`2FA：${extractResponseMessage(job.totpSetupError)}`} className="row-error" onOpen={onOpenOperationDetail} />}
+        {job.passwordAddError && <OperationDetailText text={`添加密码：${extractResponseMessage(job.passwordAddError)}`} className="row-error" onOpen={onOpenOperationDetail} />}
+        {job.mailApiError && job.status === "email_otp" && <OperationDetailText text={job.mailApiError} className="mail-error" onOpen={onOpenOperationDetail} />}
         {job.currentPhone && ["working", "phone", "phone_otp"].includes(job.status) && (
           <div className="phone-target"><Smartphone size={13} />当前手机号：<strong>{job.currentPhone}</strong></div>
         )}
