@@ -880,13 +880,24 @@ tbody tr:last-child td { border-bottom: 0; }
 @keyframes notice-in { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: none; } }
 
 /* ---------- Dialogs ---------- */
-.batch-dialog.task-settings-dialog { width: min(480px, calc(100vw - 32px)); margin: auto; }
+.batch-dialog.task-settings-dialog { width: min(720px, calc(100vw - 32px)); margin: auto; }
 .task-settings-dialog::backdrop { background: rgba(18, 27, 24, .38); backdrop-filter: blur(3px); }
 .task-settings-form { display: flex; flex-direction: column; }
 .task-settings-dialog .dialog-header > div:first-child { flex-direction: column; align-items: flex-start; gap: 5px; }
 .task-limit-field { margin-top: 20px; }
 .task-settings-dialog .task-limit-field > div { height: 44px; }
 .task-settings-dialog .task-limit-field input { font-size: 16px; font-variant-numeric: tabular-nums; }
+.task-auto-settings { display: grid; gap: 12px; margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--line); }
+.task-auto-settings-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.task-auto-settings-heading h3 { margin: 0 0 4px; color: var(--ink); font-size: 14px; }
+.task-auto-settings-heading .secondary-button { flex: 0 0 auto; padding: 8px 10px; }
+.task-auto-rule-list { display: grid; gap: 10px; }
+.task-auto-rule { display: grid; grid-template-columns: minmax(150px, 1fr) minmax(0, 1.3fr) auto; align-items: end; gap: 10px; padding: 11px; border: 1px solid var(--line); border-radius: 12px; background: #fbfcfb; }
+.task-auto-plan-field small { color: var(--muted); font-size: 11px; font-weight: 500; }
+.task-auto-action-options { display: flex; flex-wrap: wrap; align-items: center; gap: 7px 12px; min-height: 42px; }
+.task-auto-action-option { display: inline-flex; align-items: center; gap: 6px; color: var(--ink); font-size: 12px; font-weight: 600; }
+.task-auto-action-option input { accent-color: var(--green); }
+.task-auto-empty { padding: 12px; color: var(--muted); border: 1px dashed var(--line); border-radius: 10px; font-size: 12px; text-align: center; }
 .task-settings-help { margin: 12px 0 0; color: var(--muted); font-size: 13px; line-height: 1.7; }
 .modal-backdrop {
   position: fixed;
@@ -1466,6 +1477,8 @@ tbody tr:last-child td { border-bottom: 0; }
   .settings-field:first-child { grid-column: auto; }
   .wide-settings-field { grid-column: auto; }
   .settings-field > .price-select-row { flex-direction: column; }
+  .task-auto-rule { grid-template-columns: 1fr auto; }
+  .task-auto-action-options { grid-column: 1 / -1; grid-row: 2; }
   .price-refresh-button { width: 100%; }
   .provider-tabs { overflow-x: auto; }
   .plan-type-mapping-row { grid-template-columns: minmax(0, 1fr) 34px; }

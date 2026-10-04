@@ -119,7 +119,7 @@ npm run daemon:stop
 
 PM2 只负责在进程异常退出后重启。toSub2 在正常关闭时仍会先取消巡检请求、停止登录任务并保存任务状态。
 
-任务并发设置保存在数据目录的 `task-settings.json`，登录、授权和 2FA 等后台操作共用此上限。没有保存过 UI 设置时，可以用 `TOSUB2_MAX_ACTIVE_JOBS` 指定初始值（1–20）；保存后的 UI 设置优先于环境变量。`GET /api/task-settings` 和 `POST /api/task-settings` 使用控制台令牌读取或保存 `maxActiveJobs`。任务 API 的 `startedAt`、`durationMs` 可用于观察每次任务取得槽位后的耗时，排队时间不计入。
+任务并发设置保存在数据目录的 `task-settings.json`，登录、授权和 2FA 等后台操作共用此上限。没有保存过 UI 设置时，可以用 `TOSUB2_MAX_ACTIVE_JOBS` 指定初始值（1–20）；保存后的 UI 设置优先于环境变量。`GET /api/task-settings` 和 `POST /api/task-settings` 使用控制台令牌读取或保存 `maxActiveJobs`。任务 API 的 `startedAt`、`durationMs` 可用于观察每次任务取得槽位后的耗时，排队时间不计入。任务设置还可以保存 `autoActions`（PlanType 到 `upload`、`rotate-logout-reauthorize-upload` 的数组），批量导入触发的授权完成并识别到对应 PlanType 后由服务端自动执行；没有匹配规则的 PlanType 不会自动执行其它操作。
 
 ## 账号代理和 TLS 指纹
 

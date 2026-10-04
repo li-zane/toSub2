@@ -59,6 +59,10 @@ const DEFAULT_PLAN_TYPE_MAPPING = {
   self_serve_business_usage_based: "Business Usage Based",
   self_serve_pro: "Pro",
 };
+const DEFAULT_TASK_AUTO_ACTION_OPTIONS = [
+  { value: "upload", label: "上传到 Sub2API" },
+  { value: "rotate-logout-reauthorize-upload", label: "一键轮换并上传" },
+];
 const JOB_STATUS_LABELS = {
   queued: "排队中",
   starting: "启动中",
@@ -2313,6 +2317,8 @@ function App() {
         <TaskSettingsDialog
           token={token}
           settings={taskSettings}
+          availablePlanTypes={availablePlanTypes}
+          planTypeMapping={planTypeMapping}
           returnFocusRef={taskSettingsButtonRef}
           onClose={() => setTaskSettingsOpen(false)}
           onSaved={(settings) => {
@@ -2956,11 +2962,20 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
   );
 }
 
-function TaskSettingsDialog({ token, settings, returnFocusRef, onClose, onSaved }) {
+function TaskSettingsDialog({ token, settings, availablePlanTypes, planTypeMapping, returnFocusRef, onClose, onSaved }) {
   const dialogRef = useRef(null);
   const [limit, setLimit] = useState(() => String(settings.maxActiveJobs));
+  const [autoRows, setAutoRows] = useState(() => taskAutoActionRows(settings.autoActions));
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
+  const actionOptions = Array.isArray(settings.autoActionOptions) && settings.autoActionOptions.length
+    ? settings.autoActionOptions
+    : DEFAULT_TASK_AUTO_ACTION_OPTIONS;
+  const planTypeSuggestions = [...new Set([
+    ...Object.keys(DEFAULT_PLAN_TYPE_MAPPING),
+    ...(Array.isArray(availablePlanTypes) ? availablePlanTypes : []),
+    ...autoRows.map((row) => row.planType).filter(Boolean),
+  ])].sort();
 
   useEffect(() => {
     const dialog = dialogRef.current;
@@ -2980,12 +2995,29 @@ function TaskSettingsDialog({ token, settings, returnFocusRef, onClose, onSaved 
       setError(`同时运行任务数必须是 ${settings.min} 到 ${settings.max} 的整数`);
       return;
     }
+    const configuredRows = autoRows
+      .map((row) => ({ planType: String(row.planType || "").trim(), actions: [...new Set(row.actions || [])] }))
+      .filter((row) => row.planType || row.actions.length);
+    if (configuredRows.some((row) => !row.planType || !row.actions.length)) {
+      setError("每个自动任务规则都需要填写 PlanType 并至少选择一个命令");
+      return;
+    }
+    const seen = new Set();
+    for (const row of configuredRows) {
+      const key = row.planType.toLowerCase();
+      if (seen.has(key)) {
+        setError("PlanType 自动任务规则不能重复");
+        return;
+      }
+      seen.add(key);
+    }
+    const autoActions = Object.fromEntries(configuredRows.map((row) => [row.planType, row.actions]));
     setSaving(true);
     setError("");
     try {
       const data = await apiFetch(token, "/api/task-settings", {
         method: "POST",
-        body: JSON.stringify({ maxActiveJobs: value }),
+        body: JSON.stringify({ maxActiveJobs: value, autoActions }),
       });
       onSaved(data.settings);
     } catch (requestError) {
@@ -3022,6 +3054,52 @@ function TaskSettingsDialog({ token, settings, returnFocusRef, onClose, onSaved 
         </label>
         <p id="task-settings-description" className="task-settings-help">可设置 {settings.min}–{settings.max} 条，默认 {settings.default} 条。超过上限的任务自动排队。并发越高，服务器和代理的负载越大。</p>
         <p className="task-settings-help">调高后立即启动排队任务；调低后等待当前任务完成，再按新上限调度。服务重启后保留此设置。</p>
+        <section className="task-auto-settings" aria-labelledby="task-auto-settings-title">
+          <div className="task-auto-settings-heading">
+            <div>
+              <h3 id="task-auto-settings-title">批量导入后的自动任务</h3>
+              <p className="task-settings-help">按授权完成后识别到的原始 PlanType 执行命令。没有规则的 PlanType 不会自动执行其它操作。</p>
+            </div>
+            <button type="button" className="secondary-button" onClick={() => setAutoRows((current) => [...current, { planType: "", actions: [] }])} disabled={saving}>
+              <Plus size={15} />添加规则
+            </button>
+          </div>
+          <datalist id="task-plan-type-suggestions">
+            {planTypeSuggestions.map((planType) => <option key={planType} value={planType}>{formatPlanTypeLabel(planType, planTypeMapping)}</option>)}
+          </datalist>
+          {autoRows.length === 0 && <div className="task-auto-empty">暂未配置自动任务</div>}
+          <div className="task-auto-rule-list">
+            {autoRows.map((row, index) => (
+              <div className="task-auto-rule" key={`${row.planType || "new"}-${index}`}>
+                <label className="settings-field task-auto-plan-field">
+                  <span>PlanType</span>
+                  <input list="task-plan-type-suggestions" value={row.planType} placeholder="例如 self_serve_business_prolite"
+                    onChange={(event) => setAutoRows((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, planType: event.target.value } : item))}
+                    disabled={saving} />
+                  {row.planType && <small>{formatPlanTypeLabel(row.planType, planTypeMapping)}</small>}
+                </label>
+                <div className="task-auto-action-options" aria-label={`${row.planType || "PlanType"} 自动命令`}>
+                  {actionOptions.map((option) => (
+                    <label key={option.value} className="task-auto-action-option">
+                      <input type="checkbox" checked={row.actions.includes(option.value)} disabled={saving}
+                        onChange={(event) => setAutoRows((current) => current.map((item, itemIndex) => {
+                          if (itemIndex !== index) return item;
+                          const next = new Set(item.actions);
+                          if (event.target.checked) next.add(option.value);
+                          else next.delete(option.value);
+                          return { ...item, actions: [...next] };
+                        }))} />
+                      <span>{option.label}</span>
+                    </label>
+                  ))}
+                </div>
+                <button type="button" className="icon-button danger" title="删除自动任务规则" aria-label="删除自动任务规则" onClick={() => setAutoRows((current) => current.filter((_, itemIndex) => itemIndex !== index))} disabled={saving}>
+                  <Trash2 size={15} />
+                </button>
+              </div>
+            ))}
+          </div>
+        </section>
         {error && <div className="dialog-error" role="alert"><CircleAlert size={15} />{error}</div>}
         <div className="dialog-footer">
           <button type="button" className="selection-text-button" onClick={() => setLimit(String(settings.default))} disabled={saving}>恢复默认</button>
@@ -3034,6 +3112,14 @@ function TaskSettingsDialog({ token, settings, returnFocusRef, onClose, onSaved 
       </form>
     </dialog>
   );
+}
+
+function taskAutoActionRows(autoActions) {
+  if (!autoActions || typeof autoActions !== "object" || Array.isArray(autoActions)) return [];
+  return Object.entries(autoActions).map(([planType, actions]) => ({
+    planType,
+    actions: Array.isArray(actions) ? [...new Set(actions)] : [],
+  }));
 }
 
 function JobLogs({ token, jobId }) {

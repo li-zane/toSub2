@@ -33,6 +33,13 @@ const DEFAULT_MAX_ACTIVE_JOBS = 4;
 const MAX_ACTIVE_JOBS_LIMIT = 20;
 const DEFAULT_TLS_PROFILE = "chrome146";
 const MAX_BATCH_JOBS = 500;
+const TASK_AUTO_PIPELINE_TIMEOUT_MS = 15 * 60_000;
+const TASK_AUTO_POLL_INTERVAL_MS = 900;
+const TASK_AUTO_ACTIONS = new Set(["upload", "rotate-logout-reauthorize-upload"]);
+const TASK_AUTO_ACTION_LABELS = {
+  upload: "上传到 Sub2API",
+  "rotate-logout-reauthorize-upload": "一键轮换并上传",
+};
 const MAX_PROXY_RISK_RETRIES = 10;
 const MAX_PROXY_CONNECTION_FAILURES = 20;
 const PROXY_CONNECTION_RETRY_BASE_MS = Math.max(1, Number(process.env.PROXY_CONNECTION_RETRY_BASE_MS || 1_000));
@@ -137,6 +144,7 @@ let lastOutputSyncAt = 0;
 let shuttingDown = false;
 let queueSchedulingPaused = false;
 let maxActiveJobs = initialMaxActiveJobs();
+let taskAutoActions = Object.create(null);
 let taskSettingsWritePromise = Promise.resolve();
 let shutdownPromise = null;
 let sub2ApiSettingsConfig = null;
@@ -203,6 +211,7 @@ await loadPlanTypeLabelMapping();
 await loadSub2ApiSettingsConfiguration();
 await loadSub2ApiMonitorConfiguration();
 await syncCompletedOutputs(true);
+resumePendingTaskAutoActions();
 scheduleQueuedJobs();
 scheduleSub2ApiMonitor();
 
@@ -330,7 +339,7 @@ async function handleApi(req, res, requestUrl) {
 
   if (req.method === "POST" && requestUrl.pathname === "/api/task-settings") {
     const body = await readJson(req);
-    const settings = await saveTaskSettings(body?.maxActiveJobs);
+    const settings = await saveTaskSettings(body);
     sendJson(res, 200, { settings });
     return;
   }
@@ -398,9 +407,19 @@ async function handleApi(req, res, requestUrl) {
       const existing = findJobByEmail(entry.email);
       if (existing) {
         await updateJobCredentials(existing, entry, { proxyUrl, hasProxyUpdate: true });
+        existing.autoTaskEligible = true;
+        existing.autoTaskActions = [];
+        existing.autoTaskStatus = "idle";
+        existing.autoTaskIndex = 0;
+        existing.autoTaskError = null;
+        await saveJobMetadata(existing);
+        if (existing.resultSaved && !isActive(existing.status)) await queueConfiguredTaskActions(existing);
         return { job: existing, updated: true };
       }
-      return { job: await startJob(entry.email, entry, proxyUrl), updated: false };
+      const job = await startJob(entry.email, entry, proxyUrl);
+      job.autoTaskEligible = true;
+      await saveJobMetadata(job);
+      return { job, updated: false };
     })));
     sendJson(res, 201, {
       jobs: results.map((item) => publicJob(item.job)),
@@ -552,95 +571,7 @@ async function handleApi(req, res, requestUrl) {
     const config = normalizeSub2ApiConfig(body.config);
     const requestProfileState = normalizeSub2ApiProfileState(body.config, config);
     const selected = resolveSelectedJobs(body.ids);
-    const downloadable = selected.filter((job) => job.resultSaved);
-    if (downloadable.length === 0) throw httpError(409, "选中的任务里没有已完成的导入文件");
-    const payload = await buildSub2ApiUploadPayload(downloadable);
-    const idempotencyKey = `tosub2-upload-${crypto.randomUUID()}`;
-
-    const accountsByProfile = new Map();
-    for (const account of payload.accounts) {
-      const accountConfig = await resolveSub2ApiWriteConfig(resolveSub2ApiConfigForAccount(config, account, requestProfileState));
-      const { proxy_key: _proxyKey, ...accountData } = account;
-      const credentials = { ...(account.credentials || {}) };
-      const extra = buildSub2ApiAccountExtra(account.extra, accountConfig);
-      const accountName = renderSub2ApiAccountName(accountConfig.accountNameTemplate, account);
-      if (accountConfig.modelWhitelist.length) {
-        credentials.model_mapping = Object.fromEntries(accountConfig.modelWhitelist.map((model) => [model, model]));
-      }
-      const prepared = {
-        ...accountData,
-        ...(accountName ? { name: accountName } : {}),
-        credentials,
-        extra,
-        status: "active",
-        schedulable: true,
-        group_ids: accountConfig.groupIds.length ? accountConfig.groupIds : (account.group_ids || []),
-        ...sub2ApiProxyFields(accountConfig),
-        ...(accountConfig.concurrency !== null ? { concurrency: accountConfig.concurrency } : {}),
-        ...(accountConfig.loadFactor !== null ? { load_factor: accountConfig.loadFactor } : {}),
-        ...(accountConfig.priority !== null ? { priority: accountConfig.priority } : {}),
-      };
-      const profileId = accountConfig.profileId || "default";
-      if (!accountsByProfile.has(profileId)) accountsByProfile.set(profileId, { config: accountConfig, accounts: [] });
-      accountsByProfile.get(profileId).accounts.push(prepared);
-    }
-    const results = [];
-    let profileBatchIndex = 0;
-    let createdCount = 0;
-    let updatedCount = 0;
-    const updatedAccountIds = [];
-    for (const { config: accountConfig, accounts } of accountsByProfile.values()) {
-      // Resolve the current pool before uploading. A workspace switch changes
-      // the OAuth account id but not the email, so an existing record must be
-      // updated by its remote id instead of being sent through batch import.
-      // Refuse to fall back to batch when the listing is incomplete; that is
-      // the only way to guarantee this upload cannot create a duplicate.
-      const listing = await listSub2ApiAccounts(accountConfig, { withMeta: true });
-      if (!listing.complete) throw new Error("Sub2API 账号列表不完整，已停止上传以避免创建重复账号");
-      const accountsToCreate = [];
-      for (const account of accounts) {
-        const email = sub2ApiAccountEmail(account);
-        const matches = email
-          ? listing.accounts.filter((remoteAccount) => sub2ApiAccountEmail(remoteAccount) === email)
-          : [];
-        if (!matches.length) {
-          accountsToCreate.push(account);
-          continue;
-        }
-        for (const remoteAccount of matches) {
-          const accountId = normalizeSub2ApiAccountId(remoteAccount?.id);
-          if (!accountId) continue;
-          const accountUpdate = buildSub2ApiAccountUpdate(account, accountConfig, remoteAccount);
-          await requestSub2Api(accountConfig, `/api/v1/admin/accounts/${encodeURIComponent(accountId)}`, {
-            method: "PUT",
-            body: JSON.stringify(accountUpdate),
-          });
-          updatedCount += 1;
-          updatedAccountIds.push(accountId);
-        }
-      }
-      if (accountsToCreate.length) {
-        createdCount += accountsToCreate.length;
-        results.push(await requestSub2Api(accountConfig, "/api/v1/admin/accounts/batch", {
-          method: "POST",
-          headers: { "Idempotency-Key": `${idempotencyKey}-${profileBatchIndex++}` },
-          body: JSON.stringify({ accounts: accountsToCreate }),
-        }));
-      }
-    }
-    const result = results.length === 1 ? results[0] : results;
-    invalidateSub2ApiAccountStatusCache();
-
-    sendJson(res, 200, {
-      selected: selected.length,
-      uploaded: downloadable.length,
-      skipped: selected.length - downloadable.length,
-      created: createdCount,
-      updated: updatedCount,
-      updatedAccountIds,
-      groupIds: config.groupIds,
-      result,
-    });
+    sendJson(res, 200, await uploadJobsToSub2Api(selected, config, requestProfileState));
     return;
   }
 
@@ -1217,6 +1148,11 @@ async function startJob(email, credentials = {}, proxyUrl = null) {
     autoRepairPendingAccountIds: [],
     autoRepairPendingBackend: null,
     autoRepairOperation: null,
+    autoTaskActions: [],
+    autoTaskStatus: "idle",
+    autoTaskIndex: 0,
+    autoTaskError: null,
+    autoTaskEligible: false,
     ...newSmsState(),
   };
   beginAuthorizationAutomationAttempt(job, "initial");
@@ -1412,6 +1348,7 @@ async function handleChildClose(job, { code, signal, mode, runId }) {
     touch(job);
     await saveJobMetadata(job);
     await finishSub2ApiAutoRepairSuccess(job);
+    await queueConfiguredTaskActions(job);
     scheduleQueuedJobs();
     return;
   }
@@ -2928,6 +2865,91 @@ async function buildSub2ApiUploadPayload(downloadable) {
   };
 }
 
+async function uploadJobsToSub2Api(selected, config, profileState = snapshotSub2ApiProfileState()) {
+  const downloadable = selected.filter((job) => job.resultSaved);
+  if (downloadable.length === 0) throw httpError(409, "选中的任务里没有已完成的导入文件");
+  const payload = await buildSub2ApiUploadPayload(downloadable);
+  const idempotencyKey = `tosub2-upload-${crypto.randomUUID()}`;
+  const accountsByProfile = new Map();
+  for (const account of payload.accounts) {
+    const accountConfig = await resolveSub2ApiWriteConfig(resolveSub2ApiConfigForAccount(config, account, profileState));
+    const { proxy_key: _proxyKey, ...accountData } = account;
+    const credentials = { ...(account.credentials || {}) };
+    const extra = buildSub2ApiAccountExtra(account.extra, accountConfig);
+    const accountName = renderSub2ApiAccountName(accountConfig.accountNameTemplate, account);
+    if (accountConfig.modelWhitelist.length) {
+      credentials.model_mapping = Object.fromEntries(accountConfig.modelWhitelist.map((model) => [model, model]));
+    }
+    const prepared = {
+      ...accountData,
+      ...(accountName ? { name: accountName } : {}),
+      credentials,
+      extra,
+      status: "active",
+      schedulable: true,
+      group_ids: accountConfig.groupIds.length ? accountConfig.groupIds : (account.group_ids || []),
+      ...sub2ApiProxyFields(accountConfig),
+      ...(accountConfig.concurrency !== null ? { concurrency: accountConfig.concurrency } : {}),
+      ...(accountConfig.loadFactor !== null ? { load_factor: accountConfig.loadFactor } : {}),
+      ...(accountConfig.priority !== null ? { priority: accountConfig.priority } : {}),
+    };
+    const profileId = accountConfig.profileId || "default";
+    if (!accountsByProfile.has(profileId)) accountsByProfile.set(profileId, { config: accountConfig, accounts: [] });
+    accountsByProfile.get(profileId).accounts.push(prepared);
+  }
+
+  const results = [];
+  let profileBatchIndex = 0;
+  let createdCount = 0;
+  let updatedCount = 0;
+  const updatedAccountIds = [];
+  for (const { config: accountConfig, accounts } of accountsByProfile.values()) {
+    const listing = await listSub2ApiAccounts(accountConfig, { withMeta: true });
+    if (!listing.complete) throw new Error("Sub2API 账号列表不完整，已停止上传以避免创建重复账号");
+    const accountsToCreate = [];
+    for (const account of accounts) {
+      const email = sub2ApiAccountEmail(account);
+      const matches = email
+        ? listing.accounts.filter((remoteAccount) => sub2ApiAccountEmail(remoteAccount) === email)
+        : [];
+      if (!matches.length) {
+        accountsToCreate.push(account);
+        continue;
+      }
+      for (const remoteAccount of matches) {
+        const accountId = normalizeSub2ApiAccountId(remoteAccount?.id);
+        if (!accountId) continue;
+        const accountUpdate = buildSub2ApiAccountUpdate(account, accountConfig, remoteAccount);
+        await requestSub2Api(accountConfig, `/api/v1/admin/accounts/${encodeURIComponent(accountId)}`, {
+          method: "PUT",
+          body: JSON.stringify(accountUpdate),
+        });
+        updatedCount += 1;
+        updatedAccountIds.push(accountId);
+      }
+    }
+    if (accountsToCreate.length) {
+      createdCount += accountsToCreate.length;
+      results.push(await requestSub2Api(accountConfig, "/api/v1/admin/accounts/batch", {
+        method: "POST",
+        headers: { "Idempotency-Key": `${idempotencyKey}-${profileBatchIndex++}` },
+        body: JSON.stringify({ accounts: accountsToCreate }),
+      }));
+    }
+  }
+  invalidateSub2ApiAccountStatusCache();
+  return {
+    selected: selected.length,
+    uploaded: downloadable.length,
+    skipped: selected.length - downloadable.length,
+    created: createdCount,
+    updated: updatedCount,
+    updatedAccountIds,
+    groupIds: config.groupIds,
+    result: results.length === 1 ? results[0] : results,
+  };
+}
+
 function normalizeSub2ApiConfig(value, options = {}) {
   const config = value && typeof value === "object" ? value : {};
   const fallback = sub2ApiSettingsConfig || sub2ApiMonitorConfig || {};
@@ -3238,28 +3260,71 @@ function validateMaxActiveJobs(value) {
   return value;
 }
 
+function normalizeTaskAutoActions(value) {
+  if (value === undefined) return Object.create(null);
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw httpError(400, "PlanType 自动任务配置必须是对象");
+  }
+  const normalized = Object.create(null);
+  for (const [rawPlanType, rawActions] of Object.entries(value).slice(0, 100)) {
+    const planType = normalizePlanType(rawPlanType);
+    if (!planType || ["__proto__", "constructor", "prototype"].includes(planType.toLowerCase())) continue;
+    if (!Array.isArray(rawActions)) throw httpError(400, `PlanType ${planType} 的自动任务必须是数组`);
+    const actions = [...new Set(rawActions.map((action) => String(action || "").trim()).filter(Boolean))];
+    if (actions.some((action) => !TASK_AUTO_ACTIONS.has(action))) {
+      throw httpError(400, `PlanType ${planType} 的自动任务包含不支持的命令`);
+    }
+    if (actions.length) normalized[planType] = actions;
+  }
+  return normalized;
+}
+
+function taskAutoActionsForPlanType(planType) {
+  const normalized = normalizePlanType(planType).toLowerCase();
+  if (!normalized) return [];
+  const match = Object.entries(taskAutoActions).find(([key]) => key.toLowerCase() === normalized);
+  return match ? [...match[1]] : [];
+}
+
 function publicTaskSettings() {
-  return { maxActiveJobs, min: 1, max: MAX_ACTIVE_JOBS_LIMIT, default: DEFAULT_MAX_ACTIVE_JOBS };
+  return {
+    maxActiveJobs,
+    min: 1,
+    max: MAX_ACTIVE_JOBS_LIMIT,
+    default: DEFAULT_MAX_ACTIVE_JOBS,
+    autoActions: Object.fromEntries(Object.entries(taskAutoActions).map(([key, actions]) => [key, [...actions]])),
+    autoActionOptions: Object.entries(TASK_AUTO_ACTION_LABELS).map(([value, label]) => ({ value, label })),
+  };
 }
 
 async function loadTaskSettings() {
   try {
     const saved = JSON.parse(await fs.readFile(TASK_SETTINGS_PATH, "utf8"));
     maxActiveJobs = validateMaxActiveJobs(saved.maxActiveJobs);
+    taskAutoActions = normalizeTaskAutoActions(saved.autoActions);
   } catch (error) {
     if (error?.code !== "ENOENT") {
       throw new Error(`任务设置读取失败：${error.message}`);
     }
+    taskAutoActions = Object.create(null);
   }
 }
 
-async function saveTaskSettings(value) {
-  const nextLimit = validateMaxActiveJobs(value);
+async function saveTaskSettings(body) {
+  const source = body && typeof body === "object" && !Array.isArray(body) ? body : {};
+  const nextLimit = validateMaxActiveJobs(source.maxActiveJobs);
+  const nextAutoActions = normalizeTaskAutoActions(
+    Object.hasOwn(source, "autoActions") ? source.autoActions : taskAutoActions,
+  );
   // Serialize writes so memory and the last persisted setting always agree.
   const operation = taskSettingsWritePromise.catch(() => {}).then(async () => {
     const tempPath = `${TASK_SETTINGS_PATH}.${process.pid}.${crypto.randomUUID()}.tmp`;
     try {
-      await fs.writeFile(tempPath, `${JSON.stringify({ version: 1, maxActiveJobs: nextLimit }, null, 2)}\n`, { mode: 0o600 });
+      await fs.writeFile(tempPath, `${JSON.stringify({
+        version: 2,
+        maxActiveJobs: nextLimit,
+        autoActions: Object.fromEntries(Object.entries(nextAutoActions).map(([key, actions]) => [key, [...actions]])),
+      }, null, 2)}\n`, { mode: 0o600 });
       await fs.rename(tempPath, TASK_SETTINGS_PATH);
     } finally {
       await fs.rm(tempPath, { force: true }).catch(() => {});
@@ -3268,6 +3333,7 @@ async function saveTaskSettings(value) {
     // Reducing the limit leaves running jobs alone; they drain before new work
     // starts. Increasing it immediately makes extra slots available.
     scheduleQueuedJobs();
+    taskAutoActions = nextAutoActions;
     return publicTaskSettings();
   });
   taskSettingsWritePromise = operation;
@@ -5001,6 +5067,11 @@ function publicJob(job) {
     autoRepairLastAttemptAt: job.autoRepairLastAttemptAt || null,
     autoRepairLastSuccessAt: job.autoRepairLastSuccessAt || null,
     autoRepairLastError: job.autoRepairLastError || null,
+    autoTaskActions: Array.isArray(job.autoTaskActions) ? [...job.autoTaskActions] : [],
+    autoTaskStatus: job.autoTaskStatus || "idle",
+    autoTaskIndex: Number(job.autoTaskIndex || 0),
+    autoTaskError: job.autoTaskError || null,
+    autoTaskEligible: job.autoTaskEligible === true,
     attempt: job.attempt,
     queuePosition: job.status === "queued" ? getQueuePosition(job) : 0,
   };
@@ -5595,6 +5666,7 @@ async function syncCompletedOutputs(force = false) {
           ...restoredTotpSetupState(metadata, storedCredentials),
           ...restoredProxyRiskState(metadata),
           ...restoredAutoRepairState(metadata),
+          ...restoredTaskAutoState(metadata),
           totpSetupError: restoredOperation.totpSetupError,
           passwordAddError: restoredOperation.passwordAddError,
           passwordAddedAt: metadata.password_added_at || passwordRecovery.addedAt || null,
@@ -5691,6 +5763,7 @@ async function syncCompletedOutputs(force = false) {
           ...restoredTotpSetupState(metadata, storedCredentials),
           ...restoredProxyRiskState(metadata),
           ...restoredAutoRepairState(metadata),
+          ...restoredTaskAutoState(metadata),
           totpSetupError: totpRecovery.error || null,
           passwordAddError: passwordRecovery.error || metadata.password_add_error || null,
           passwordAddedAt: metadata.password_added_at || passwordRecovery.addedAt || null,
@@ -5789,6 +5862,7 @@ async function syncCompletedOutputs(force = false) {
           ...restoredTotpSetupState(metadata, storedCredentials),
           ...restoredProxyRiskState(metadata),
           ...restoredAutoRepairState(metadata),
+          ...restoredTaskAutoState(metadata),
           passwordAddError: metadata.password_add_error || null,
           passwordAddedAt: metadata.password_added_at || null,
           pendingNewPassword: null,
@@ -6082,6 +6156,22 @@ function restoredAutoRepairState(metadata = {}) {
     autoRepairPendingAccountIds: [...new Set(pendingIds)],
     autoRepairPendingBackend: metadata.auto_repair_pending_backend || null,
     autoRepairOperation: null,
+  };
+}
+
+function restoredTaskAutoState(metadata = {}) {
+  const actions = Array.isArray(metadata.auto_task_actions)
+    ? metadata.auto_task_actions.filter((action) => TASK_AUTO_ACTIONS.has(action))
+    : [];
+  const status = ["idle", "pending", "running", "completed", "failed"].includes(metadata.auto_task_status)
+    ? metadata.auto_task_status
+    : "idle";
+  return {
+    autoTaskActions: actions,
+    autoTaskStatus: status,
+    autoTaskIndex: Math.max(0, Math.min(actions.length, Number(metadata.auto_task_index) || 0)),
+    autoTaskError: metadata.auto_task_error || null,
+    autoTaskEligible: metadata.auto_task_eligible === true,
   };
 }
 
@@ -6554,6 +6644,117 @@ function canReplaceTotp(job) {
   return Boolean(job.totpKnownEnabled || job.totpSecret || job.hasTotpCredential);
 }
 
+async function queueConfiguredTaskActions(job) {
+  if ((!job.autoTaskEligible && job.lastOperationType !== "initial_authorization") || !job.resultSaved || job.autoTaskStatus !== "idle") return;
+  const actions = taskAutoActionsForPlanType(job.planType || job.workspacePlanType);
+  job.autoTaskEligible = false;
+  if (!actions.length) return;
+  job.autoTaskActions = actions;
+  job.autoTaskStatus = "pending";
+  job.autoTaskIndex = 0;
+  job.autoTaskError = null;
+  job.prompt = `授权完成，正在准备自动任务：${formatTaskAutoActions(actions)}`;
+  appendJobLog(job, `[auto] ${formatTaskAutoActions(actions)} 已按 PlanType ${job.planType || "未知"} 排队执行。\n`);
+  touch(job);
+  await saveJobMetadata(job);
+  void runConfiguredTaskActions(job);
+}
+
+function resumePendingTaskAutoActions() {
+  for (const job of jobs.values()) {
+    if (!job.resultSaved || (!job.autoTaskEligible && job.lastOperationType !== "initial_authorization")) continue;
+    if (job.autoTaskStatus === "idle") {
+      void queueConfiguredTaskActions(job);
+      continue;
+    }
+    if (!Array.isArray(job.autoTaskActions) || !job.autoTaskActions.length) continue;
+    if (!["pending", "running"].includes(job.autoTaskStatus)) continue;
+    job.autoTaskStatus = "pending";
+    void runConfiguredTaskActions(job);
+  }
+}
+
+function formatTaskAutoActions(actions) {
+  return actions.map((action) => TASK_AUTO_ACTION_LABELS[action] || action).join("、");
+}
+
+async function runConfiguredTaskActions(job) {
+  if (job.autoTaskStatus !== "pending") return;
+  try {
+    job.autoTaskStatus = "running";
+    touch(job);
+    await saveJobMetadata(job);
+    for (let index = job.autoTaskIndex || 0; index < job.autoTaskActions.length; index += 1) {
+      const action = job.autoTaskActions[index];
+      job.autoTaskIndex = index;
+      touch(job);
+      await saveJobMetadata(job);
+      if (action === "upload") {
+        await runConfiguredUploadAction(job);
+      } else if (action === "rotate-logout-reauthorize-upload") {
+        await runConfiguredRotateAndUploadAction(job);
+      }
+      job.autoTaskIndex = index + 1;
+      touch(job);
+      await saveJobMetadata(job);
+    }
+    job.autoTaskStatus = "completed";
+    job.autoTaskError = null;
+    if (job.status === "completed") job.prompt = "授权完成，自动任务已完成";
+    appendJobLog(job, `[auto] 已完成：${formatTaskAutoActions(job.autoTaskActions)}。\n`);
+  } catch (error) {
+    job.autoTaskStatus = "failed";
+    job.autoTaskError = String(error?.message || error).slice(0, 500);
+    if (job.status === "completed") job.prompt = `授权完成，自动任务失败：${job.autoTaskError}`;
+    appendJobLog(job, `[auto] 自动任务失败：${job.autoTaskError}。可在任务列表中手动重试对应命令。\n`);
+  }
+  touch(job);
+  await saveJobMetadata(job);
+}
+
+async function runConfiguredUploadAction(job) {
+  const config = sub2ApiSettingsConfig;
+  if (!config?.baseUrl || !config?.adminApiKey) throw new Error("尚未配置 Sub2API 后端地址和管理员 API Key");
+  await uploadJobsToSub2Api([job], config, snapshotSub2ApiProfileState());
+}
+
+async function runConfiguredRotateAndUploadAction(job) {
+  const config = sub2ApiSettingsConfig;
+  if (!config?.baseUrl || !config?.adminApiKey) throw new Error("尚未配置 Sub2API 后端地址和管理员 API Key");
+  await withEmailJobLock(job.email, async () => {
+    if (!canReplaceTotp(job)) throw new Error("当前账号不满足自动轮换 2FA 条件");
+    await startTotpSetup(job, { replaceExisting: true });
+  });
+  await waitForConfiguredTaskJob(job, (current) => current.status === "completed"
+    && current.lastOperationType === "replace_2fa"
+    && current.hasTotpKey
+    && !current.totpRotationIncomplete, "2FA 轮换");
+  await withEmailJobLock(job.email, async () => {
+    await revokeAllAccountSessions(job);
+  });
+  await withEmailJobLock(job.email, async () => {
+    if (!canForceRelogin(job)) throw new Error("轮换 2FA 后账号当前不能重新授权");
+    await forceReloginJob(job, {});
+  });
+  await waitForConfiguredTaskJob(job, (current) => current.status === "completed"
+    && current.lastOperationType === "relogin"
+    && current.resultSaved, "重新授权");
+  await uploadJobsToSub2Api([job], config, snapshotSub2ApiProfileState());
+}
+
+async function waitForConfiguredTaskJob(job, predicate, label) {
+  const deadline = Date.now() + TASK_AUTO_PIPELINE_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    if (shuttingDown) throw new Error("服务正在关闭，已停止自动任务");
+    if (predicate(job)) return;
+    if (["failed", "mfa_failed", "banned", "canceled", "reauth_required", "resume_available"].includes(job.status)) {
+      throw new Error(`${label}未完成：${job.lastError || job.prompt || "任务失败"}`);
+    }
+    await delay(TASK_AUTO_POLL_INTERVAL_MS);
+  }
+  throw new Error(`${label}超时`);
+}
+
 async function updateStoredCredentialFields(job, body = {}) {
   if (isActive(job.status)) throw httpError(409, "任务正在运行，请等待完成后再修改凭据");
   const hasPassword = Object.hasOwn(body, "password");
@@ -6691,6 +6892,11 @@ async function saveJobMetadata(job) {
         auto_repair_last_error: job.autoRepairLastError || null,
         auto_repair_pending_account_ids: job.autoRepairPendingAccountIds || [],
         auto_repair_pending_backend: job.autoRepairPendingBackend || null,
+        auto_task_actions: Array.isArray(job.autoTaskActions) ? job.autoTaskActions : [],
+        auto_task_status: job.autoTaskStatus || "idle",
+        auto_task_index: Number(job.autoTaskIndex || 0),
+        auto_task_error: job.autoTaskError || null,
+        auto_task_eligible: job.autoTaskEligible === true,
         updated_at: new Date().toISOString(),
       };
       const tempPath = `${metadataPath}.${process.pid}.${crypto.randomUUID()}.tmp`;
