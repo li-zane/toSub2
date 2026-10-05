@@ -25,6 +25,7 @@ import {
   validateMailApiUrl,
 } from "./mail-otp.mjs";
 import { createSmsProvider, publicSmsProviderDefinitions } from "./sms-providers.mjs";
+import { hasJobTotpKey, isReauthorizationComplete, isTotpRotationComplete } from "./task-auto-state.mjs";
 import { DirectTlsProfileProbe, proxySupportsSessionRotation } from "./tls-transport.mjs";
 
 const DEFAULT_HOST = "127.0.0.1";
@@ -1560,7 +1561,7 @@ async function startTotpSetup(job, options = {}) {
     if (!canSetupTotp(job)) {
       throw httpError(409, "只能为已完成授权，或已保存邮箱登录检查点且尚未设置 2FA 的账号设置 2FA");
     }
-    if (job.totpSecret || job.hasTotpCredential) {
+    if (hasJobTotpKey(job)) {
       throw httpError(409, "该账号已经保存了 2FA 密钥，无需重复设置");
     }
     if (job.totpKnownEnabled) {
@@ -5030,7 +5031,7 @@ function publicJob(job) {
     lastError: job.lastError,
     canDownload: Boolean(job.resultSaved),
     loginMode: job.loginMode || (job.mailApiUrl ? "email_otp" : "manual"),
-    hasTotpKey: Boolean(job.totpSecret || job.hasTotpCredential),
+    hasTotpKey: hasJobTotpKey(job),
     autoEmailOtp: Boolean(job.mailApiUrl),
     mailStatus: job.mailStatus,
     mailApiError: job.mailApiError,
@@ -5221,7 +5222,7 @@ async function publicCredentialDetails(job, persisted = null) {
     password: job.password || "",
     totpSecret: job.totpSecret || "",
     hasPassword: Boolean(job.password || job.hasPasswordCredential),
-    hasTotpKey: Boolean(job.totpSecret || job.hasTotpCredential),
+    hasTotpKey: hasJobTotpKey(job),
     passwordAvailable: Boolean(job.password),
     totpSecretAvailable: Boolean(job.totpSecret),
     sub2apiJson,
@@ -5304,7 +5305,7 @@ function canForceRelogin(job) {
 }
 
 function canSetupTotp(job) {
-  if (job.totpSecret || job.hasTotpCredential || job.totpKnownEnabled) return false;
+  if (hasJobTotpKey(job) || job.totpKnownEnabled) return false;
   if (job.status === "completed" && job.resultSaved) return true;
   return Boolean(job.loginCheckpointAvailable)
     && ["phone", "phone_otp", "resume_available", "failed", "mfa_failed", "canceled", "reauth_required"].includes(job.status);
@@ -6641,7 +6642,7 @@ function canReplaceTotp(job) {
   if (isActive(job.status)) return false;
   if ((job.totpRotationIncomplete || job.totpRotationRemoteDisabled) && job.resultSaved) return true;
   if (!(job.status === "completed" && job.resultSaved)) return false;
-  return Boolean(job.totpKnownEnabled || job.totpSecret || job.hasTotpCredential);
+  return Boolean(job.totpKnownEnabled || hasJobTotpKey(job));
 }
 
 async function queueConfiguredTaskActions(job) {
@@ -6725,10 +6726,7 @@ async function runConfiguredRotateAndUploadAction(job) {
     if (!canReplaceTotp(job)) throw new Error("当前账号不满足自动轮换 2FA 条件");
     await startTotpSetup(job, { replaceExisting: true });
   });
-  await waitForConfiguredTaskJob(job, (current) => current.status === "completed"
-    && current.lastOperationType === "replace_2fa"
-    && current.hasTotpKey
-    && !current.totpRotationIncomplete, "2FA 轮换");
+  await waitForConfiguredTaskJob(job, isTotpRotationComplete, "2FA 轮换");
   await withEmailJobLock(job.email, async () => {
     await revokeAllAccountSessions(job);
   });
@@ -6736,9 +6734,7 @@ async function runConfiguredRotateAndUploadAction(job) {
     if (!canForceRelogin(job)) throw new Error("轮换 2FA 后账号当前不能重新授权");
     await forceReloginJob(job, {});
   });
-  await waitForConfiguredTaskJob(job, (current) => current.status === "completed"
-    && current.lastOperationType === "relogin"
-    && current.resultSaved, "重新授权");
+  await waitForConfiguredTaskJob(job, isReauthorizationComplete, "重新授权");
   await uploadJobsToSub2Api([job], config, snapshotSub2ApiProfileState());
 }
 
@@ -6860,9 +6856,9 @@ async function saveJobMetadata(job) {
         mail_request_body: job.mailRequestBody || null,
         has_stored_credentials: Boolean(job.password || job.totpSecret),
         has_password: Boolean(job.password || job.hasPasswordCredential),
-        has_totp_key: Boolean(job.totpSecret || job.hasTotpCredential),
+        has_totp_key: hasJobTotpKey(job),
         totp_known_enabled: Boolean(
-          !job.totpRotationRemoteDisabled && (job.totpKnownEnabled || job.totpSecret || job.hasTotpCredential),
+          !job.totpRotationRemoteDisabled && (job.totpKnownEnabled || hasJobTotpKey(job)),
         ),
         totp_setup_replace_existing: Boolean(job.totpSetupReplaceExisting),
         totp_rotation_remote_disabled: Boolean(job.totpRotationRemoteDisabled),
