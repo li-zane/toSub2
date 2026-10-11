@@ -1308,6 +1308,39 @@ function App() {
     }
   }
 
+  async function deleteAccount(job) {
+    if (!token || batchAction) return;
+    if (!window.confirm(`确定删除账号 ${job.email} 吗？对应的本地授权文件、保存的凭据也会被删除；如已配置 Sub2API，还会同步删除该邮箱对应的号池账号。此操作不可恢复。`)) return;
+    setBatchAction(`delete:${job.id}`);
+    try {
+      const result = await apiFetch(token, "/api/jobs/delete-batch", {
+        method: "POST",
+        body: JSON.stringify({ ids: [job.id] }),
+      });
+      const email = job.email.toLowerCase();
+      const deletedIds = new Set([...jobs, ...jobSelectionIndex]
+        .filter((item) => item.email.toLowerCase() === email)
+        .map((item) => item.id));
+      deletedIds.add(job.id);
+      setJobs((current) => current.filter((item) => item.email.toLowerCase() !== email));
+      setJobSelectionIndex((current) => current.filter((item) => item.email.toLowerCase() !== email));
+      setSelectedJobIds((current) => new Set([...current].filter((id) => !deletedIds.has(id))));
+      setExpandedJobId((current) => deletedIds.has(current) ? null : current);
+      setCredentialJob((current) => current?.email.toLowerCase() === email ? null : current);
+      setSessionJob((current) => current?.email.toLowerCase() === email ? null : current);
+      setWorkspaceJob((current) => current?.email.toLowerCase() === email ? null : current);
+      setError("");
+      const synchronized = Number(result?.sub2api?.deleted || 0);
+      setUploadNotice(synchronized
+        ? `已删除账号 ${job.email}，并同步删除 ${synchronized} 个号池账号`
+        : `已删除账号 ${job.email}`);
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally {
+      setBatchAction("");
+    }
+  }
+
   async function deleteSelected() {
     if (!selectedJobIds.size || batchAction) return;
     if (!window.confirm(`确定删除选中的 ${selectedJobIds.size} 条任务吗？对应的本地授权文件也会被删除。`)) return;
@@ -1738,6 +1771,10 @@ function App() {
                     onError={setError}
                     selected={selectedJobIds.has(job.id)}
                     onToggleSelected={() => toggleJobSelection(job.id)}
+                    onDelete={() => deleteAccount(job)}
+                    deleteAvailable={Boolean(features.bulkActions)}
+                    deleteDisabled={!token || Boolean(batchAction)}
+                    deleteBusy={batchAction === `delete:${job.id}`}
                     selectionSupported={Boolean(features.bulkActions && !batchAction)}
                     smsProviderAvailable={smsProviderDefinitions.length > 0}
                     smsProvider={activeSmsProvider}
@@ -2536,7 +2573,7 @@ function OperationDetailDialog({ detail, onClose }) {
   );
 }
 
-function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggleSelected, selectionSupported, smsProviderAvailable, smsProvider, onUpload, sub2apiUploadAvailable, sub2apiToggleAvailable, sub2apiToggleBusy, onToggleSub2Api, sub2apiPriorityAvailable, sub2apiPriorityBusy, onUpdateSub2ApiPriority, totpSetupAvailable, passwordAddAvailable, forceReloginAvailable, accountProxyUrl, planTypeMapping, accountUsage, accountUsageAvailable, onRefreshUsage, credentialsAvailable, onOpenCredentials, sessionsAvailable, onOpenSessions, workspacesAvailable, onOpenWorkspaces, onOpenOperationDetail }) {
+function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggleSelected, onDelete, deleteAvailable, deleteDisabled, deleteBusy, selectionSupported, smsProviderAvailable, smsProvider, onUpload, sub2apiUploadAvailable, sub2apiToggleAvailable, sub2apiToggleBusy, onToggleSub2Api, sub2apiPriorityAvailable, sub2apiPriorityBusy, onUpdateSub2ApiPriority, totpSetupAvailable, passwordAddAvailable, forceReloginAvailable, accountProxyUrl, planTypeMapping, accountUsage, accountUsageAvailable, onRefreshUsage, credentialsAvailable, onOpenCredentials, sessionsAvailable, onOpenSessions, workspacesAvailable, onOpenWorkspaces, onOpenOperationDetail }) {
   const [value, setValue] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [priorityValue, setPriorityValue] = useState(() => job.sub2apiPriority === null || job.sub2apiPriority === undefined ? "" : String(job.sub2apiPriority));
@@ -2954,6 +2991,11 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
           {!terminal && (
             <button type="button" className="icon-button danger" onClick={cancel} disabled={submitting} title="取消任务">
               <Ban size={17} />
+            </button>
+          )}
+          {deleteAvailable && (
+            <button type="button" className="icon-button danger" onClick={onDelete} disabled={submitting || deleteDisabled} title="删除账号" aria-label="删除账号">
+              {deleteBusy ? <LoaderCircle className="spin" size={17} aria-hidden="true" /> : <Trash2 size={17} aria-hidden="true" />}
             </button>
           )}
         </div>
