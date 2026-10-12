@@ -348,6 +348,7 @@ async function handleApi(req, res, requestUrl) {
   if (req.method === "GET" && requestUrl.pathname === "/api/jobs") {
     const requestedPage = Math.max(1, Number.parseInt(requestUrl.searchParams.get("page") || "1", 10) || 1);
     await sendJobsPage(res, requestedPage, null, normalizeJobFilters({
+      accountType: requestUrl.searchParams.get("accountType"),
       status: requestUrl.searchParams.get("status"),
       planType: requestUrl.searchParams.get("planType"),
       sub2apiPool: requestUrl.searchParams.get("sub2apiPool"),
@@ -976,7 +977,8 @@ async function sendJobsPage(res, requestedPage, emailFilter = null, filters = {}
     selection: visibleJobs.map(publicSelectionJob),
     pagination: { page, pageSize: PAGE_SIZE, total, totalPages, totalAll: allJobs.length },
     filter: {
-      active: Boolean(emailSet || filters.status || filters.planType || filters.sub2apiPool || filters.sub2apiEnabled),
+      active: Boolean(emailSet || filters.accountType || filters.status || filters.planType || filters.sub2apiPool || filters.sub2apiEnabled),
+      accountType: filters.accountType || "",
       requested: emailFilter?.length || 0,
       matched: total,
       status: filters.status || "",
@@ -1002,6 +1004,7 @@ async function sendJobsPage(res, requestedPage, emailFilter = null, filters = {}
 
 function normalizeJobFilters(value) {
   const source = value && typeof value === "object" ? value : {};
+  const accountTypeValue = String(source.accountType || "").trim().toLowerCase();
   const statusValue = String(source.status || "").trim().toLowerCase();
   const planTypeValue = String(source.planType || "").trim();
   const sub2apiPoolValue = String(source.sub2apiPool || "").trim().toLowerCase();
@@ -1009,6 +1012,7 @@ function normalizeJobFilters(value) {
   const allowedPoolValues = new Set(["added", "not_added", "unknown"]);
   const allowedEnabledValues = new Set(["enabled", "disabled", "unknown"]);
   return {
+    accountType: ["password_totp", "pool_only"].includes(accountTypeValue) ? accountTypeValue : null,
     status: JOB_STATUS_FILTER_VALUES.includes(statusValue) ? statusValue : null,
     planType: planTypeValue || null,
     sub2apiPool: allowedPoolValues.has(sub2apiPoolValue) ? sub2apiPoolValue : null,
@@ -1017,6 +1021,9 @@ function normalizeJobFilters(value) {
 }
 
 function matchesJobFilters(job, filters) {
+  if (filters.accountType === "pool_only" && !job.poolOnly) return false;
+  if (filters.accountType === "password_totp"
+    && (job.poolOnly || job.loginMode !== "password" || !hasJobTotpKey(job))) return false;
   if (filters.status && job.status !== filters.status) return false;
   if (filters.planType) {
     const actualPlanType = getJobPlanType(job) || "__unknown__";

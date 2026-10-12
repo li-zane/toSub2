@@ -1129,6 +1129,26 @@ try {
   assert.ok(addedFilter.jobs.every((item) => item.sub2apiInPool === true));
   const poolOnlyJobs = addedFilter.jobs.filter((item) => item.poolOnly);
   assert.deepEqual(poolOnlyJobs.map((item) => item.email).sort(), ["empty-usage@example.com", "legacy-usage@example.com"]);
+  const poolOnlyFilter = await (await fetch(`${baseUrl}/api/jobs?accountType=pool_only&page=999`, { headers })).json();
+  assert.equal(poolOnlyFilter.pagination.total, 2);
+  assert.equal(poolOnlyFilter.pagination.page, 1);
+  assert.equal(poolOnlyFilter.filter.active, true);
+  assert.equal(poolOnlyFilter.filter.accountType, "pool_only");
+  assert.ok(poolOnlyFilter.jobs.every((item) => item.poolOnly));
+  assert.deepEqual(new Set(poolOnlyFilter.selection.map((item) => item.id)), new Set(poolOnlyJobs.map((item) => item.id)));
+  const passwordTotpFilter = await (await fetch(`${baseUrl}/api/jobs?accountType=password_totp`, { headers })).json();
+  assert.ok(passwordTotpFilter.pagination.total > 0);
+  assert.ok(passwordTotpFilter.jobs.every((item) => !item.poolOnly && item.loginMode === "password" && item.hasTotpKey));
+  assert.ok(passwordTotpFilter.selection.every((item) => !poolOnlyJobs.some((pool) => pool.id === item.id)));
+  const combinedFilter = await (await fetch(`${baseUrl}/api/jobs/query`, {
+    method: "POST", headers,
+    body: JSON.stringify({ accountType: "pool_only", sub2apiEnabled: "enabled", emails: [poolOnlyJobs[0].email, profileJob.email] }),
+  })).json();
+  assert.equal(combinedFilter.pagination.total, 1);
+  assert.equal(combinedFilter.jobs[0].email, poolOnlyJobs[0].email);
+  const invalidAccountType = await (await fetch(`${baseUrl}/api/jobs?accountType=invalid`, { headers })).json();
+  assert.equal(invalidAccountType.filter.accountType, "");
+  assert.equal(invalidAccountType.pagination.total, statusPage.pagination.total);
   const disabledFilter = await (await fetch(`${baseUrl}/api/jobs?sub2apiEnabled=disabled`, { headers })).json();
   assert.equal(disabledFilter.pagination.total, 1);
   const notAddedFilter = await (await fetch(`${baseUrl}/api/jobs?sub2apiPool=not_added`, { headers })).json();

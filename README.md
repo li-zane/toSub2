@@ -229,6 +229,8 @@ API Key 只会随取号请求临时发送给本地服务，不会写入任务元
 
 状态同步还会把仅存在于 Sub2API 的 OpenAI OAuth 账号按邮箱导入本地列表，账号下方标记“仅号池”。同邮箱已有本地账号时保留本地资料，不重复创建；API Key 账号和其他平台账号不导入。同步记录在重启后保留。如果远端返回 OAuth 令牌，会保存为本地受保护的导入文件；未返回令牌时只同步账号资料和号池状态。后续为该账号补充本地登录资料后，标签恢复显示实际登录方式。
 
+账号列表的“账号”表头提供“全部”“密码 + 2FA”和“仅号池”筛选；“密码 + 2FA”仅匹配密码登录且已记录 2FA 密钥的本地账号。“仅号池”匹配从号池同步且尚未补充本地登录资料的账号。筛选在服务端分页前执行，支持与邮箱、PlanType、状态和号池筛选组合；切换筛选时清空勾选并返回第一页。
+
 生产部署建议让 x1 直接运行个人 GitHub 仓库的 `feature/account-credentials-plan-2fa` 分支。应用代码位于 `/opt/tosub2/app`，运行数据和敏感凭据位于独立的 `/var/lib/tosub2`，不会随 Git 提交、拉取或更新覆盖。更新时先在本地提交并推送，再在 x1 执行 `git pull --ff-only origin feature/account-credentials-plan-2fa`，确认 `node --check src/console-server.mjs` 后执行 `systemctl restart tosub2.service`；更新前应保留 `/var/lib/tosub2` 备份。
 
 上传选项的非敏感界面缓存仍会保存在当前浏览器的 `localStorage`（本地存储），服务端配置以设置文件为准。批量上传时，未完成的任务会自动跳过；服务端返回的各方案创建失败数量会汇总显示在控制台中。

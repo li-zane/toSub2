@@ -132,6 +132,7 @@ function App() {
   const [filterText, setFilterText] = useState("");
   const [filterError, setFilterError] = useState("");
   const [emailFilter, setEmailFilter] = useState([]);
+  const [accountTypeFilter, setAccountTypeFilter] = useState("");
   const [statusFilter, setStatusFilter] = useState("");
   const [planTypeFilter, setPlanTypeFilter] = useState("");
   const [sub2apiPoolFilter, setSub2apiPoolFilter] = useState("");
@@ -278,6 +279,7 @@ function App() {
     const poll = async () => {
       try {
         const filters = {
+          accountType: accountTypeFilter || undefined,
           status: statusFilter || undefined,
           planType: planTypeFilter || undefined,
           sub2apiPool: sub2apiPoolFilter || undefined,
@@ -290,6 +292,7 @@ function App() {
             })
           : await apiFetch(token, `/api/jobs?${new URLSearchParams({
               page: String(page),
+              ...(filters.accountType ? { accountType: filters.accountType } : {}),
               ...(filters.status ? { status: filters.status } : {}),
               ...(filters.planType ? { planType: filters.planType } : {}),
               ...(filters.sub2apiPool ? { sub2apiPool: filters.sub2apiPool } : {}),
@@ -339,7 +342,7 @@ function App() {
       stopped = true;
       window.clearTimeout(timer);
     };
-  }, [token, page, emailFilter, statusFilter, planTypeFilter, sub2apiPoolFilter, sub2apiEnabledFilter]);
+  }, [token, page, emailFilter, accountTypeFilter, statusFilter, planTypeFilter, sub2apiPoolFilter, sub2apiEnabledFilter]);
 
   useEffect(() => {
     if (!token || !features.sub2apiMonitor) return undefined;
@@ -453,7 +456,7 @@ function App() {
   const passwordAddSelectedCount = selectedJobs.filter((job) => job.canAddPassword).length;
   const canAddPasswordSelected = selectedJobs.length > 0 && selectedJobs.length === selectedJobIds.size
     && passwordAddSelectedCount > 0;
-  const hasJobFilters = Boolean(emailFilter.length || statusFilter || planTypeFilter || sub2apiPoolFilter || sub2apiEnabledFilter);
+  const hasJobFilters = Boolean(emailFilter.length || accountTypeFilter || statusFilter || planTypeFilter || sub2apiPoolFilter || sub2apiEnabledFilter);
   const availablePlanTypes = [...new Set([
     ...planTypeOptions,
     ...jobs.map((job) => job.planType).filter(Boolean),
@@ -1154,6 +1157,7 @@ function App() {
 
   function clearEmailFilter() {
     setEmailFilter([]);
+    setAccountTypeFilter("");
     setFilterText("");
     setPlanTypeFilter("");
     setSub2apiPoolFilter("");
@@ -1692,7 +1696,20 @@ function App() {
                     aria-label="选择当前页全部任务"
                   />
                 </th>
-                <th className="account-heading">账号</th>
+                <th className="account-heading">
+                  <div className="column-filter-heading">
+                    <span>账号</span>
+                    <select
+                      value={accountTypeFilter}
+                      onChange={(event) => applyColumnFilter(setAccountTypeFilter, event.target.value)}
+                      aria-label="筛选账号类型"
+                    >
+                      <option value="">全部</option>
+                      <option value="password_totp">密码 + 2FA</option>
+                      <option value="pool_only">仅号池</option>
+                    </select>
+                  </div>
+                </th>
                 <th>
                   <div className="column-filter-heading">
                     <span>Plan type</span>
