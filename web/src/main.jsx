@@ -10,6 +10,7 @@ import {
   CircleAlert,
   Copy,
   Download,
+  Database,
   Eye,
   EyeOff,
   ExternalLink,
@@ -4027,6 +4028,9 @@ function Sub2ApiEnabledToggle({ inPool, enabled, available, busy, onChange }) {
 }
 
 function LoginMethodBadge({ job }) {
+  if (job.poolOnly) {
+    return <span className="mail-mode unknown-mode"><Database size={12} />仅号池</span>;
+  }
   if (job.loginMode === "password") {
     const methods = ["密码", job.autoEmailOtp ? "自动收码" : "", job.hasTotpKey ? "2FA" : ""].filter(Boolean);
     return (

@@ -1125,8 +1125,10 @@ try {
   assert.deepEqual([...statusPage.filterOptions.sub2apiEnabled].sort(), expectedEnabledOptions);
   assert.equal(statusPage.filterOptions.planTypeUnknown, statusPage.selection.some((item) => !item.planType));
   const addedFilter = await (await fetch(`${baseUrl}/api/jobs?sub2apiPool=added`, { headers })).json();
-  assert.equal(addedFilter.pagination.total, 1);
-  assert.equal(addedFilter.jobs[0].sub2apiInPool, true);
+  assert.equal(addedFilter.pagination.total, 3);
+  assert.ok(addedFilter.jobs.every((item) => item.sub2apiInPool === true));
+  const poolOnlyJobs = addedFilter.jobs.filter((item) => item.poolOnly);
+  assert.deepEqual(poolOnlyJobs.map((item) => item.email).sort(), ["empty-usage@example.com", "legacy-usage@example.com"]);
   const disabledFilter = await (await fetch(`${baseUrl}/api/jobs?sub2apiEnabled=disabled`, { headers })).json();
   assert.equal(disabledFilter.pagination.total, 1);
   const notAddedFilter = await (await fetch(`${baseUrl}/api/jobs?sub2apiPool=not_added`, { headers })).json();
@@ -1141,7 +1143,7 @@ try {
   assert.equal(JSON.parse(toggleStatusText).status.enabled, true);
   assert.equal(scheduledRemoteAccounts.get(101), true);
   const enabledFilter = await (await fetch(`${baseUrl}/api/jobs?sub2apiEnabled=enabled`, { headers })).json();
-  assert.equal(enabledFilter.pagination.total, 1);
+  assert.equal(enabledFilter.pagination.total, 3);
 
   const priorityUpdateResponse = await fetch(`${baseUrl}/api/sub2api/accounts/${profileJob.id}/priority`, {
     method: "POST",
@@ -2015,13 +2017,14 @@ try {
       incompleteAuthorizationId,
       incompleteTotpId,
       planFilterCreated.job.id,
+      ...poolOnlyJobs.map((item) => item.id),
     ] }),
   });
   if (!deleteResponse.ok) {
     throw new Error(`delete request failed with HTTP ${deleteResponse.status}: ${await deleteResponse.text()}`);
   }
   const deleted = await deleteResponse.json();
-  assert.equal(deleted.deleted, 29);
+  assert.equal(deleted.deleted, 31);
   assert.equal(deleted.sub2api.configured, true);
   assert.equal(deleted.sub2api.deleted, 2);
   assert.deepEqual(new Set(deleted.sub2api.accountIds), new Set(["101", "102"]));

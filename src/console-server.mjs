@@ -4356,6 +4356,7 @@ async function loadSub2ApiAccountStatus({ forceRefresh = false } = {}) {
   if (sub2ApiAccountStatusPromise) return sub2ApiAccountStatusPromise;
   sub2ApiAccountStatusPromise = (async () => {
     const remoteAccounts = await listSub2ApiAccounts(config);
+    await importSub2ApiPoolOnlyAccounts(remoteAccounts);
     const accounts = new Map();
     const fetchedAt = new Date().toISOString();
     const previousAccounts = sub2ApiAccountStatusCache.backend === backend
@@ -4403,6 +4404,48 @@ async function loadSub2ApiAccountStatus({ forceRefresh = false } = {}) {
 
 function invalidateSub2ApiAccountStatusCache() {
   sub2ApiAccountStatusCache = { backend: null, fetchedAt: null, accounts: new Map() };
+}
+
+async function importSub2ApiPoolOnlyAccounts(remoteAccounts) {
+  await syncCompletedOutputs();
+  const knownEmails = new Set([...jobs.values()].map((job) => job.email.toLowerCase()));
+  for (const account of remoteAccounts) {
+    if (account?.platform !== "openai" || account?.type !== "oauth") continue;
+    const email = sub2ApiAccountEmail(account);
+    if (!email || knownEmails.has(email) || !normalizeSub2ApiAccountId(account.id)) continue;
+    await withEmailJobLock(email, async () => {
+      if (findJobByEmail(email)) return false;
+      const id = crypto.randomUUID();
+      const outputDir = path.join(OUTPUT_ROOT, id);
+      const createdAt = new Date().toISOString();
+      const planType = extractPlanTypeFromAccount(account, { preferJwt: false }) || null;
+      await fs.mkdir(outputDir, { recursive: true });
+      // OAuth tokens stay in the protected export file; status APIs expose only metadata.
+      if (account.credentials?.access_token || account.credentials?.refresh_token) {
+        const { id: remoteId, ...oauthAccount } = account;
+        await fs.writeFile(path.join(outputDir, "sub2api-import-oauth.json"), `${JSON.stringify({
+          type: "sub2api-data",
+          accounts: [{ ...oauthAccount, credentials: { ...account.credentials, email } }],
+        }, null, 2)}\n`, { mode: 0o600 });
+      }
+      await fs.writeFile(path.join(outputDir, JOB_META_FILENAME), `${JSON.stringify({
+        version: 1,
+        email,
+        pool_only: true,
+        status: "completed",
+        prompt: "已从 Sub2API 号池同步",
+        plan_type: planType,
+        login_mode: "manual",
+        created_at: createdAt,
+        completed_at: createdAt,
+        last_operation_at: createdAt,
+        last_operation_type: "sub2api_sync",
+      }, null, 2)}\n`, { mode: 0o600 });
+      await syncCompletedOutputs(true);
+      knownEmails.add(email);
+      return true;
+    });
+  }
 }
 
 function publicSub2ApiAccountStatusState(state = sub2ApiAccountStatusCache) {
@@ -5030,6 +5073,7 @@ function publicJob(job) {
     sub2apiUsage: publicSub2ApiUsage(sub2ApiStatus.usage),
     lastError: job.lastError,
     canDownload: Boolean(job.resultSaved),
+    poolOnly: Boolean(job.poolOnly),
     loginMode: job.loginMode || (job.mailApiUrl ? "email_otp" : "manual"),
     hasTotpKey: hasJobTotpKey(job),
     autoEmailOtp: Boolean(job.mailApiUrl),
@@ -5642,6 +5686,7 @@ async function syncCompletedOutputs(force = false) {
           child: null,
           parserTail: "",
           resultSaved: true,
+          poolOnly: Boolean(metadata.pool_only),
           planType: extractPlanTypeFromAccount(account) || normalizePlanType(metadata.plan_type),
           workspacePlanType: normalizePlanType(metadata.workspace_plan_type),
           loginMode: metadata.login_mode === "password" || storedCredentials.password ? "password" : (mailApiUrl ? "email_otp" : metadata.login_mode || "manual"),
@@ -5739,6 +5784,7 @@ async function syncCompletedOutputs(force = false) {
           child: null,
           parserTail: "",
           resultSaved: false,
+          poolOnly: Boolean(metadata.pool_only),
           planType: normalizePlanType(metadata.plan_type),
           workspacePlanType: normalizePlanType(metadata.workspace_plan_type),
           loginMode: metadata.login_mode === "password" || storedCredentials.password ? "password" : (mailApiUrl ? "email_otp" : metadata.login_mode || "manual"),
@@ -5834,6 +5880,7 @@ async function syncCompletedOutputs(force = false) {
           parserTail: "",
           resultSaved: false,
           planType: normalizePlanType(metadata.plan_type),
+          poolOnly: Boolean(metadata.pool_only),
           workspacePlanType: normalizePlanType(metadata.workspace_plan_type),
           loginMode: metadata.login_mode === "password" || storedCredentials.password ? "password" : (mailApiUrl ? "email_otp" : metadata.login_mode || "manual"),
           password: storedCredentials.password,
@@ -6608,6 +6655,7 @@ async function updateJobCredentials(job, credentials, options = {}) {
     : normalizeLoginCredentials(credentials);
   const nextProxyUrl = options.hasProxyUpdate ? normalizeProxyUrl(options.proxyUrl) : job.proxyUrl;
   const changed = job.loginMode !== normalized.loginMode
+    || (job.poolOnly && Boolean(normalized.password || normalized.totpSecret || normalized.mailApiUrl))
     || job.mailApiUrl !== normalized.mailApiUrl
     || job.mailRequestBody !== normalized.mailRequestBody
     || job.password !== normalized.password
@@ -6623,6 +6671,7 @@ async function updateJobCredentials(job, credentials, options = {}) {
   job.totpSecret = normalized.totpSecret;
   job.hasPasswordCredential = Boolean(normalized.password);
   job.hasTotpCredential = Boolean(normalized.totpSecret);
+  if (normalized.password || normalized.totpSecret || normalized.mailApiUrl) job.poolOnly = false;
   job.proxyUrl = nextProxyUrl;
   job.mailSeenCandidateKeys.clear();
   job.mailCandidateCounts.clear();
@@ -6786,6 +6835,7 @@ async function updateStoredCredentialFields(job, body = {}) {
     job.hasTotpCredential = Boolean(totpSecret);
     if (totpSecret) job.totpKnownEnabled = true;
   }
+  if (password || totpSecret) job.poolOnly = false;
   recordJobOperation(job, "credential_update");
   appendJobLog(job, "[account] 登录凭据已更新，敏感字段未写入日志。\n");
   touch(job);
@@ -6840,6 +6890,7 @@ async function saveJobMetadata(job) {
         prompt: job.prompt || null,
         last_error: job.lastError || null,
         result_saved: Boolean(job.resultSaved),
+        pool_only: Boolean(job.poolOnly),
         plan_type: job.planType || null,
         workspace_plan_type: job.workspacePlanType || null,
         completed_at: job.completedAt || null,
