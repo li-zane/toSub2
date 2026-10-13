@@ -619,6 +619,7 @@ tbody tr:last-child td { border-bottom: 0; }
 }
 .pool-badge::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
 .pool-badge.added { color: var(--green-strong); background: var(--green-soft); border-color: var(--green-line); }
+.pool-badge.error { color: var(--danger); background: var(--danger-soft); border-color: var(--danger-line); }
 .pool-badge.not-added { color: #69716f; background: #f0f2f1; border-color: var(--line); }
 .pool-badge.unknown { padding: 0; color: var(--subtle); background: transparent; font-size: 12px; font-weight: 500; }
 .pool-badge.unknown::before { display: none; }

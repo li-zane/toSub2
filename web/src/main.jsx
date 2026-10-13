@@ -87,6 +87,7 @@ const JOB_STATUS_LABELS = {
 };
 const SUB2API_POOL_FILTER_LABELS = {
   added: "已加入",
+  error: "错误",
   not_added: "未加入",
   unknown: "未同步",
 };
@@ -2859,7 +2860,7 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
         <AccountUsageCell usage={accountUsage} available={job.canDownload} enabled={accountUsageAvailable} onRefresh={onRefreshUsage} />
       </td>
       <td className="pool-status-cell">
-        <Sub2ApiPoolBadge inPool={job.sub2apiInPool} />
+        <Sub2ApiPoolBadge inPool={job.sub2apiInPool} remoteStatus={job.sub2apiRemoteStatus} />
       </td>
       <td className="pool-enabled-cell">
         <Sub2ApiEnabledToggle
@@ -4070,10 +4071,11 @@ function formatUsageResetAt(value) {
   return seconds <= 86_400 ? `${formatUsageDuration(seconds)}后` : formatDateTime(value);
 }
 
-function Sub2ApiPoolBadge({ inPool }) {
-  const state = inPool === true ? "added" : inPool === false ? "not-added" : "unknown";
-  const label = inPool === true ? "已加入" : inPool === false ? "未加入" : "未同步";
-  return <span className={`pool-badge ${state}`}>{label}</span>;
+function Sub2ApiPoolBadge({ inPool, remoteStatus }) {
+  const hasError = inPool === true && remoteStatus === "error";
+  const state = hasError ? "error" : inPool === true ? "added" : inPool === false ? "not-added" : "unknown";
+  const label = hasError ? "错误" : inPool === true ? "已加入" : inPool === false ? "未加入" : "未同步";
+  return <span className={`pool-badge ${state}`} title={hasError ? "已加入号池，但 Sub2API 中账号状态为错误" : undefined}>{label}</span>;
 }
 
 function Sub2ApiEnabledToggle({ inPool, enabled, available, busy, onChange }) {

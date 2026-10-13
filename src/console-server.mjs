@@ -1029,7 +1029,7 @@ function normalizeJobFilters(value) {
   const planTypeValue = String(source.planType || "").trim();
   const sub2apiPoolValue = String(source.sub2apiPool || "").trim().toLowerCase();
   const sub2apiEnabledValue = String(source.sub2apiEnabled || "").trim().toLowerCase();
-  const allowedPoolValues = new Set(["added", "not_added", "unknown"]);
+  const allowedPoolValues = new Set(["added", "error", "not_added", "unknown"]);
   const allowedEnabledValues = new Set(["enabled", "disabled", "unknown"]);
   return {
     accountType: ["password_totp", "pool_only"].includes(accountTypeValue) ? accountTypeValue : null,
@@ -1050,17 +1050,16 @@ function matchesJobFilters(job, filters) {
     if (actualPlanType !== filters.planType) return false;
   }
   const sub2ApiStatus = getSub2ApiAccountStatusForJob(job);
-  if (filters.sub2apiPool === "added" && sub2ApiStatus.inPool !== true) return false;
-  if (filters.sub2apiPool === "not_added" && sub2ApiStatus.inPool !== false) return false;
-  if (filters.sub2apiPool === "unknown" && sub2ApiStatus.inPool !== null) return false;
+  if (filters.sub2apiPool && getSub2ApiPoolFilterValue(job, sub2ApiStatus) !== filters.sub2apiPool) return false;
   if (filters.sub2apiEnabled === "enabled" && sub2ApiStatus.enabled !== true) return false;
   if (filters.sub2apiEnabled === "disabled" && sub2ApiStatus.enabled !== false) return false;
   if (filters.sub2apiEnabled === "unknown" && sub2ApiStatus.enabled !== null) return false;
   return true;
 }
 
-function getSub2ApiPoolFilterValue(job) {
-  const value = getSub2ApiAccountStatusForJob(job).inPool;
+function getSub2ApiPoolFilterValue(job, status = getSub2ApiAccountStatusForJob(job)) {
+  const value = status.inPool;
+  if (value === true && status.remoteStatus === "error") return "error";
   return value === true ? "added" : value === false ? "not_added" : "unknown";
 }
 
@@ -4467,6 +4466,7 @@ async function loadSub2ApiAccountStatus({ forceRefresh = false } = {}) {
       const enabled = sub2ApiAccountSchedulable(remoteAccount);
       const priority = sub2ApiAccountPriority(remoteAccount);
       const usage = normalizeSub2ApiUsage(remoteAccount, fetchedAt);
+      const remoteStatus = String(remoteAccount?.status || "").trim().toLowerCase() || null;
       const current = accounts.get(email);
       const previous = previousAccounts.get(email);
       if (!current) {
@@ -4477,7 +4477,7 @@ async function loadSub2ApiAccountStatus({ forceRefresh = false } = {}) {
           enabled,
           priority,
           planType: extractPlanTypeFromAccount(remoteAccount, { preferJwt: false }) || null,
-          remoteStatus: String(remoteAccount?.status || "").trim() || null,
+          remoteStatus,
           usage: mergeSub2ApiUsage(previous?.usage || null, usage),
           fetchedAt,
         });
@@ -4488,7 +4488,8 @@ async function loadSub2ApiAccountStatus({ forceRefresh = false } = {}) {
       current.enabled = mergeSub2ApiBoolean(current.enabled, enabled);
       current.priority = mergeSub2ApiPriority(current.priority, priority);
       current.planType ||= extractPlanTypeFromAccount(remoteAccount, { preferJwt: false }) || null;
-      current.remoteStatus ||= String(remoteAccount?.status || "").trim() || null;
+      if (remoteStatus === "error") current.remoteStatus = "error";
+      else current.remoteStatus ||= remoteStatus;
       current.usage = mergeSub2ApiUsage(current.usage, usage);
     }
     sub2ApiAccountStatusCache = { backend, fetchedAt, accounts };

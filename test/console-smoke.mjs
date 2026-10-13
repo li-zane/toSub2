@@ -1153,6 +1153,29 @@ try {
   assert.equal(disabledFilter.pagination.total, 1);
   const notAddedFilter = await (await fetch(`${baseUrl}/api/jobs?sub2apiPool=not_added`, { headers })).json();
   assert.ok(notAddedFilter.pagination.total > 1);
+  const originalPoolAccounts = structuredClone(remoteErrorAccounts);
+  remoteErrorAccounts.push({ ...structuredClone(remoteErrorAccounts[0]), id: 102, status: "error" });
+  const mixedPoolStatus = await (await fetch(`${baseUrl}/api/sub2api/account-status?refresh=1`, { headers })).json();
+  assert.equal(mixedPoolStatus.accounts[profileJob.email].inPool, true);
+  assert.equal(mixedPoolStatus.accounts[profileJob.email].remoteStatus, "error", "any error record wins over an earlier active record for the same email");
+  const errorPoolFilter = await (await fetch(`${baseUrl}/api/jobs?sub2apiPool=error&page=999`, { headers })).json();
+  assert.equal(errorPoolFilter.filter.sub2apiPool, "error");
+  assert.equal(errorPoolFilter.pagination.total, 1);
+  assert.equal(errorPoolFilter.pagination.page, 1);
+  assert.equal(errorPoolFilter.jobs[0].email, profileJob.email);
+  assert.equal(errorPoolFilter.jobs[0].sub2apiRemoteStatus, "error");
+  assert.ok(errorPoolFilter.filterOptions.sub2apiPools.includes("error"));
+  const healthyPoolFilter = await (await fetch(`${baseUrl}/api/jobs?sub2apiPool=added`, { headers })).json();
+  assert.equal(healthyPoolFilter.pagination.total, 2);
+  assert.equal(healthyPoolFilter.jobs.some(item => item.email === profileJob.email), false);
+  remoteErrorAccounts.reverse();
+  const reorderedPoolStatus = await (await fetch(`${baseUrl}/api/sub2api/account-status?refresh=1`, { headers })).json();
+  assert.equal(reorderedPoolStatus.accounts[profileJob.email].remoteStatus, "error", "error aggregation is independent of record order");
+  remoteErrorAccounts = originalPoolAccounts;
+  await fetch(`${baseUrl}/api/sub2api/account-status?refresh=1`, { headers });
+  const recoveredPoolFilter = await (await fetch(`${baseUrl}/api/jobs?sub2apiPool=error`, { headers })).json();
+  assert.equal(recoveredPoolFilter.pagination.total, 0, "recovered accounts leave the error filter");
+  assert.equal(recoveredPoolFilter.filterOptions.sub2apiPools.includes("error"), false);
   const toggleStatusResponse = await fetch(`${baseUrl}/api/sub2api/accounts/${profileJob.id}/schedulable`, {
     method: "POST",
     headers,
