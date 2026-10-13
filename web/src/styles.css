@@ -178,6 +178,8 @@ button:focus-visible, a:focus-visible, select:focus-visible { outline: 2px solid
 .provider-ready { max-width: 100%; display: inline-flex; align-items: flex-start; gap: 5px; color: var(--green-strong); font-size: 12px; font-weight: 600; line-height: 1.4; }
 .provider-ready svg { flex: 0 0 auto; margin-top: 1px; }
 .provider-ready.incomplete { color: var(--amber); }
+.proxy-fallback-option { display: flex; align-items: center; gap: 7px; min-height: 32px; font-size: 12px; line-height: 1.5; }
+.proxy-fallback-option input { flex: 0 0 auto; width: 16px; height: 16px; }
 .provider-field {
   width: 100%;
   height: 34px;

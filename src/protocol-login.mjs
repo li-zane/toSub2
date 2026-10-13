@@ -302,9 +302,19 @@ async function run() {
     maxProxySessionAttempts: process.env.CHATGPT_PROXY_MAX_ATTEMPTS || 10,
     sameProxyRiskRetryDelayMs: process.env.CHATGPT_SAME_PROXY_RISK_RETRY_DELAY_MS,
   });
+  async function prepareLoginProxy(url) {
+    try {
+      await transport.prepareProxy(proxyTemplate, url);
+    } catch (error) {
+      if (proxyTemplate && !/PROXY_(RISK_CONTROL|CONNECTION_RETRY)/.test(error.message)) {
+        throw new Error(`PROXY_RISK_CONTROL: ${error.message}`);
+      }
+      throw error;
+    }
+  }
   try {
     if (args.refreshSub2api) {
-      if (proxyTemplate) await transport.prepareProxy(proxyTemplate, `${authBase}/`);
+      if (proxyTemplate) await prepareLoginProxy(`${authBase}/`);
       else await transport.configure(null, { force: true });
       const sourcePath = path.resolve(args.refreshSub2api);
       const targetPath = path.resolve(args.sub2apiOut || sourcePath);
@@ -319,7 +329,7 @@ async function run() {
       console.log(`[ok] Refreshed OAuth account: ${refreshed.email || "<unknown>"}`);
       return;
     }
-    await transport.prepareProxy(proxyTemplate, `${chatgptBase}/`);
+    await prepareLoginProxy(`${chatgptBase}/`);
     if (args.addPassword) {
       const resultPath = path.resolve(args.passwordAddResult || DEFAULT_PASSWORD_ADD_RESULT);
       const newPassword = validateNewAccountPassword(process.env.CHATGPT_NEW_PASSWORD || "");
@@ -550,7 +560,7 @@ async function run() {
         checkpoint = null;
           client = null;
           codex = null;
-          await transport.prepareProxy(proxyTemplate, `${chatgptBase}/`);
+          await prepareLoginProxy(`${chatgptBase}/`);
           }
     }
 
@@ -599,7 +609,7 @@ async function run() {
           client = null;
           web = null;
           codex = null;
-          await transport.prepareProxy(proxyTemplate, `${chatgptBase}/`);
+          await prepareLoginProxy(`${chatgptBase}/`);
           continue;
         }
       }

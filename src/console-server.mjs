@@ -146,6 +146,8 @@ let shuttingDown = false;
 let queueSchedulingPaused = false;
 let maxActiveJobs = initialMaxActiveJobs();
 let taskAutoActions = Object.create(null);
+let globalProxyUrl = null;
+let allowDirectFallback = false;
 let taskSettingsWritePromise = Promise.resolve();
 let shutdownPromise = null;
 let sub2ApiSettingsConfig = null;
@@ -294,7 +296,7 @@ async function handleApi(req, res, requestUrl) {
   if (req.method === "GET" && requestUrl.pathname === "/api/bootstrap") {
     sendJson(res, 200, {
       token: consoleToken,
-      taskSettings: publicTaskSettings(),
+      taskSettings: publicTaskSettings(false),
       features: {
         retry: true,
         regenerate: true,
@@ -335,6 +337,20 @@ async function handleApi(req, res, requestUrl) {
 
   if (req.method === "GET" && requestUrl.pathname === "/api/task-settings") {
     sendJson(res, 200, { settings: publicTaskSettings() });
+    return;
+  }
+
+  if (requestUrl.pathname === "/api/account-proxy-settings") {
+    if (req.method === "POST") {
+      const body = await readJson(req);
+      if (typeof body.proxyUrl !== "string" || typeof body.allowDirectFallback !== "boolean") {
+        throw httpError(400, "代理地址必须是字符串，回退开关必须是布尔值");
+      }
+      await saveTaskSettings({ proxyUrl: body.proxyUrl, allowDirectFallback: body.allowDirectFallback });
+    } else if (req.method !== "GET") {
+      throw httpError(405, "Method not allowed");
+    }
+    sendJson(res, 200, { settings: { proxyUrl: globalProxyUrl || "", allowDirectFallback } });
     return;
   }
 
@@ -387,14 +403,18 @@ async function handleApi(req, res, requestUrl) {
     const hasCredentialUpdate = ["password", "mailApiUrl", "mailRequestBody", "totpSecret"].some((key) => Object.hasOwn(body, key));
     const credentials = normalizeLoginCredentials(body);
     const hasProxyUpdate = Object.hasOwn(body, "proxyUrl");
-    const proxyUrl = hasProxyUpdate ? normalizeProxyUrl(body.proxyUrl) : null;
+    const requestedProxyUrl = hasProxyUpdate && String(body.proxyUrl || "").trim()
+      ? normalizeProxyUrl(body.proxyUrl)
+      : null;
     const result = await withEmailJobLock(email, async () => {
       const existing = findJobByEmail(email);
       if (existing) {
-        if (hasCredentialUpdate) await updateJobCredentials(existing, credentials, { proxyUrl, hasProxyUpdate });
+        const proxyUrl = globalProxyUrl || requestedProxyUrl || existing.proxyUrl;
+        if (hasCredentialUpdate) await updateJobCredentials(existing, credentials, { proxyUrl, hasProxyUpdate: true });
         else if (hasProxyUpdate) await updateJobProxy(existing, proxyUrl);
         return { job: existing, created: false, updated: hasCredentialUpdate || hasProxyUpdate };
       }
+      const proxyUrl = globalProxyUrl || requestedProxyUrl;
       return { job: await startJob(email, credentials, proxyUrl), created: true, updated: false };
     });
     sendJson(res, result.created ? 201 : 200, { ...result, job: publicJob(result.job) });
@@ -404,11 +424,11 @@ async function handleApi(req, res, requestUrl) {
   if (req.method === "POST" && requestUrl.pathname === "/api/jobs/batch") {
     const body = await readJson(req);
     const entries = parseBatchEntries(body.text, mailRequestConfig);
-    const proxyUrl = normalizeProxyUrl(body.proxyUrl);
+    const proxyUrl = globalProxyUrl || (String(body.proxyUrl || "").trim() ? normalizeProxyUrl(body.proxyUrl) : null);
     const results = await Promise.all(entries.map((entry) => withEmailJobLock(entry.email, async () => {
       const existing = findJobByEmail(entry.email);
       if (existing) {
-        await updateJobCredentials(existing, entry, { proxyUrl, hasProxyUpdate: true });
+        await updateJobCredentials(existing, entry, { proxyUrl: proxyUrl || existing.proxyUrl, hasProxyUpdate: true });
         existing.autoTaskEligible = true;
         existing.autoTaskActions = [];
         existing.autoTaskStatus = "idle";
@@ -1062,6 +1082,7 @@ function normalizeEmailFilter(value) {
 }
 
 async function startJob(email, credentials = {}, proxyUrl = null) {
+  proxyUrl = globalProxyUrl || proxyUrl;
   const { loginMode, mailApiUrl, mailRequestBody, password, totpSecret } = normalizeLoginCredentials(credentials);
   await saveStoredLoginCredentials(email, { password, totpSecret, proxyUrl });
   const id = crypto.randomUUID();
@@ -1138,6 +1159,8 @@ async function startJob(email, credentials = {}, proxyUrl = null) {
     proxyRiskRetryCount: 0,
     proxyConnectionFailureCount: 0,
     proxyRiskRestarting: false,
+    proxyFallbackAttempted: false,
+    proxyFallbackActive: false,
     proxySessionAttemptIds: new Set(),
     proxyAttemptParserTail: "",
     queueRunId: null,
@@ -1235,6 +1258,7 @@ function enqueueJob(job, mode, startPrompt) {
 }
 
 function launchJob(job, options = {}) {
+  if (globalProxyUrl && !job.proxyFallbackActive) job.proxyUrl = globalProxyUrl;
   const mode = options.mode || "full";
   if (mode === "full" && !job.authAutomationAttempt) {
     beginAuthorizationAutomationAttempt(job, "login");
@@ -1295,7 +1319,7 @@ function launchJob(job, options = {}) {
       CHATGPT_LOGIN_PASSWORD: job.password || "",
       CHATGPT_TOTP_SECRET: job.totpSecret || "",
       CHATGPT_NEW_PASSWORD: mode === "password_add" ? job.pendingNewPassword || "" : "",
-      CHATGPT_PROXY_URL: job.proxyUrl || "",
+      CHATGPT_PROXY_URL: job.proxyFallbackActive ? "" : (job.proxyUrl || ""),
       CHATGPT_PROXY_MAX_ATTEMPTS: String(Math.max(0, MAX_PROXY_RISK_RETRIES - (job.proxyRiskRetryCount || 0))),
       TOSUB2_TLS_PROFILE:
         String(process.env.TOSUB2_TLS_PROFILE || "").trim()
@@ -1406,8 +1430,11 @@ async function retryJob(job, options = {}) {
     throw httpError(409, "当前任务不需要重新授权");
   }
   const retryingSecurityCheck = Boolean(job.securityCheckRequired);
+  job.proxyUrl = globalProxyUrl || job.proxyUrl;
+  job.proxyFallbackAttempted = false;
+  job.proxyFallbackActive = false;
   if (Object.hasOwn(options, "proxyUrl")) {
-    job.proxyUrl = normalizeProxyUrl(options.proxyUrl);
+    job.proxyUrl = globalProxyUrl || (String(options.proxyUrl || "").trim() ? normalizeProxyUrl(options.proxyUrl) : job.proxyUrl);
     const persisted = await saveStoredLoginCredentials(job.email, job);
   }
   const resumingCheckpoint = job.status === "resume_available"
@@ -1455,10 +1482,13 @@ async function regenerateJob(job, options = {}) {
   if (job.status !== "completed" || !job.resultSaved) {
     throw httpError(409, "只能为已经完成的任务重新生成授权");
   }
+  job.proxyUrl = globalProxyUrl || job.proxyUrl;
   if (Object.hasOwn(options, "proxyUrl")) {
-    job.proxyUrl = normalizeProxyUrl(options.proxyUrl);
+    job.proxyUrl = globalProxyUrl || (String(options.proxyUrl || "").trim() ? normalizeProxyUrl(options.proxyUrl) : job.proxyUrl);
     await saveStoredLoginCredentials(job.email, job);
   }
+  job.proxyFallbackAttempted = false;
+  job.proxyFallbackActive = false;
   job.lastError = null;
   job.parserTail = "";
   job.currentPhone = null;
@@ -1483,13 +1513,16 @@ async function forceReloginJob(job, options = {}, context = {}) {
     throw httpError(409, "当前任务正在进行中，不能重新登录");
   }
   await reloadMissingJobCredentials(job);
+  if (globalProxyUrl) job.proxyUrl = globalProxyUrl;
   if (!canForceRelogin(job)) {
     throw httpError(409, "当前任务正在进行中，不能重新登录");
   }
   if (Object.hasOwn(options, "proxyUrl")) {
-    job.proxyUrl = normalizeProxyUrl(options.proxyUrl);
+    job.proxyUrl = globalProxyUrl || (String(options.proxyUrl || "").trim() ? normalizeProxyUrl(options.proxyUrl) : job.proxyUrl);
     await saveStoredLoginCredentials(job.email, job);
   }
+  job.proxyFallbackAttempted = false;
+  job.proxyFallbackActive = false;
   stopMailPolling(job);
   releaseSmsNumber(job, "idle");
   job.queueRunId = null;
@@ -1549,7 +1582,7 @@ async function reloadMissingJobCredentials(job) {
   const stored = await loadStoredLoginCredentials(job.email);
   job.password ||= stored.password;
   job.totpSecret ||= stored.totpSecret;
-  job.proxyUrl ||= stored.proxyUrl;
+  job.proxyUrl ||= stored.proxyUrl || globalProxyUrl;
   if (job.password) job.hasPasswordCredential = true;
   if (job.totpSecret) job.hasTotpCredential = true;
   if (stored.password || stored.totpSecret || stored.proxyUrl) {
@@ -1558,6 +1591,9 @@ async function reloadMissingJobCredentials(job) {
 }
 
 async function startTotpSetup(job, options = {}) {
+  job.proxyFallbackAttempted = false;
+  job.proxyFallbackActive = false;
+  job.proxyUrl = globalProxyUrl || job.proxyUrl;
   const replaceExisting = Boolean(options.replaceExisting);
   await reloadMissingJobCredentials(job);
   if (replaceExisting) {
@@ -1581,7 +1617,7 @@ async function startTotpSetup(job, options = {}) {
     throw httpError(409, "邮箱登录检查点已丢失，请先重新登录");
   }
   if (Object.hasOwn(options, "proxyUrl")) {
-    job.proxyUrl = normalizeProxyUrl(options.proxyUrl);
+    job.proxyUrl = globalProxyUrl || (String(options.proxyUrl || "").trim() ? normalizeProxyUrl(options.proxyUrl) : job.proxyUrl);
     await saveStoredLoginCredentials(job.email, job);
   }
   stopMailPolling(job);
@@ -1636,6 +1672,9 @@ async function hasIncompleteRemoteTotpRotation(resultPath, metadataFlag = false)
 }
 
 async function startPasswordAdd(job, options = {}) {
+  job.proxyFallbackAttempted = false;
+  job.proxyFallbackActive = false;
+  job.proxyUrl = globalProxyUrl || job.proxyUrl;
   if (!canAddPassword(job)) {
     throw httpError(409, "只能为已完成授权，或已保存邮箱登录检查点且尚未保存密码的账号添加密码");
   }
@@ -1645,7 +1684,7 @@ async function startPasswordAdd(job, options = {}) {
     throw httpError(409, "邮箱登录检查点已丢失，请先重新登录");
   }
   if (Object.hasOwn(options, "proxyUrl")) {
-    job.proxyUrl = normalizeProxyUrl(options.proxyUrl);
+    job.proxyUrl = globalProxyUrl || (String(options.proxyUrl || "").trim() ? normalizeProxyUrl(options.proxyUrl) : job.proxyUrl);
     await saveStoredLoginCredentials(job.email, job);
   }
   stopMailPolling(job);
@@ -2185,7 +2224,7 @@ async function restartAfterProxyRisk(job, options = {}) {
   job.proxyRiskRestarting = true;
   const mode = job.runMode || job.queuedMode || "full";
   try {
-    if (!job.proxyUrl) {
+    if (!job.proxyUrl || job.proxyFallbackActive) {
       if (job.directTlsFallbackAttempted) {
         finishProxyRiskRetries(job, "Cloudflare 安全校验未能完成，直连 TLS 指纹筛选已经使用过，请稍后重试");
         return;
@@ -2263,6 +2302,12 @@ async function restartAfterProxyRisk(job, options = {}) {
 
 function finishProxyRiskRetries(job, message) {
   job.proxyRiskRestarting = false;
+  if (allowDirectFallback && job.proxyUrl && !job.proxyFallbackAttempted) {
+    void fallbackToDirectIp(job, message).catch((error) => {
+      finishProxyRiskRetries(job, `本地出口回退失败：${error.message}`);
+    });
+    return;
+  }
   if (job.runMode === "totp_setup" || job.queuedMode === "totp_setup") {
     restoreTotpSetupFailure(job, message);
     return;
@@ -2288,6 +2333,33 @@ function finishProxyRiskRetries(job, message) {
   job.child?.kill("SIGTERM");
   job.child = null;
   scheduleQueuedJobs();
+}
+
+async function fallbackToDirectIp(job, reason) {
+  job.proxyFallbackAttempted = true;
+  job.proxyFallbackActive = true;
+  const mode = job.runMode || job.queuedMode || "full";
+  stopMailPolling(job);
+  stopSmsPolling(job);
+  releaseSmsNumber(job, "idle");
+  job.queueRunId = null;
+  job.runId = crypto.randomUUID();
+  const runId = job.runId;
+  job.child?.kill("SIGTERM");
+  job.child = null;
+  if (mode === "full") await removePrivateFile(job.checkpointPath);
+  if (job.runId !== runId || isTerminalStatus(job.status)) return;
+  job.proxyRiskRetryCount = 0;
+  job.proxyConnectionFailureCount = 0;
+  job.directTlsFallbackAttempted = false;
+  job.parserTail = "";
+  job.lastError = null;
+  job.currentPhone = null;
+  job.phoneError = null;
+  job.securityCheckRequired = false;
+  job.restartRequired = false;
+  appendJobLog(job, `[proxy] ${reason}；按配置回退本地出口 IP，本次任务仅回退一次。\n`);
+  enqueueJob(job, mode, "代理不可用，正在回退本地出口 IP");
 }
 
 function requireReauthorization(job, message) {
@@ -3294,9 +3366,11 @@ function taskAutoActionsForPlanType(planType) {
   return match ? [...match[1]] : [];
 }
 
-function publicTaskSettings() {
+function publicTaskSettings(includeProxy = true) {
   return {
     maxActiveJobs,
+    ...(includeProxy ? { proxyUrl: globalProxyUrl || "" } : {}),
+    allowDirectFallback,
     min: 1,
     max: MAX_ACTIVE_JOBS_LIMIT,
     default: DEFAULT_MAX_ACTIVE_JOBS,
@@ -3310,6 +3384,8 @@ async function loadTaskSettings() {
     const saved = JSON.parse(await fs.readFile(TASK_SETTINGS_PATH, "utf8"));
     maxActiveJobs = validateMaxActiveJobs(saved.maxActiveJobs);
     taskAutoActions = normalizeTaskAutoActions(saved.autoActions);
+    globalProxyUrl = saved.proxyUrl ? normalizeProxyUrl(saved.proxyUrl) : null;
+    allowDirectFallback = saved.allowDirectFallback === true;
   } catch (error) {
     if (error?.code !== "ENOENT") {
       throw new Error(`任务设置读取失败：${error.message}`);
@@ -3320,28 +3396,42 @@ async function loadTaskSettings() {
 
 async function saveTaskSettings(body) {
   const source = body && typeof body === "object" && !Array.isArray(body) ? body : {};
-  const nextLimit = validateMaxActiveJobs(source.maxActiveJobs);
+  const nextLimit = Object.hasOwn(source, "maxActiveJobs") ? validateMaxActiveJobs(source.maxActiveJobs) : maxActiveJobs;
   const nextAutoActions = normalizeTaskAutoActions(
     Object.hasOwn(source, "autoActions") ? source.autoActions : taskAutoActions,
   );
+  const nextProxyUrl = Object.hasOwn(source, "proxyUrl")
+    ? (String(source.proxyUrl || "").trim() ? normalizeProxyUrl(source.proxyUrl) : null)
+    : globalProxyUrl;
+  const nextAllowDirectFallback = Object.hasOwn(source, "allowDirectFallback")
+    ? source.allowDirectFallback === true
+    : allowDirectFallback;
   // Serialize writes so memory and the last persisted setting always agree.
   const operation = taskSettingsWritePromise.catch(() => {}).then(async () => {
+    const effectiveLimit = Object.hasOwn(source, "maxActiveJobs") ? nextLimit : maxActiveJobs;
+    const effectiveAutoActions = Object.hasOwn(source, "autoActions") ? nextAutoActions : taskAutoActions;
+    const effectiveProxyUrl = Object.hasOwn(source, "proxyUrl") ? nextProxyUrl : globalProxyUrl;
+    const effectiveFallback = Object.hasOwn(source, "allowDirectFallback") ? nextAllowDirectFallback : allowDirectFallback;
     const tempPath = `${TASK_SETTINGS_PATH}.${process.pid}.${crypto.randomUUID()}.tmp`;
     try {
       await fs.writeFile(tempPath, `${JSON.stringify({
         version: 2,
-        maxActiveJobs: nextLimit,
-        autoActions: Object.fromEntries(Object.entries(nextAutoActions).map(([key, actions]) => [key, [...actions]])),
+        maxActiveJobs: effectiveLimit,
+        autoActions: Object.fromEntries(Object.entries(effectiveAutoActions).map(([key, actions]) => [key, [...actions]])),
+        proxyUrl: effectiveProxyUrl || "",
+        allowDirectFallback: effectiveFallback,
       }, null, 2)}\n`, { mode: 0o600 });
       await fs.rename(tempPath, TASK_SETTINGS_PATH);
     } finally {
       await fs.rm(tempPath, { force: true }).catch(() => {});
     }
-    maxActiveJobs = nextLimit;
+    maxActiveJobs = effectiveLimit;
+    taskAutoActions = effectiveAutoActions;
+    globalProxyUrl = effectiveProxyUrl;
+    allowDirectFallback = effectiveFallback;
     // Reducing the limit leaves running jobs alone; they drain before new work
     // starts. Increasing it immediately makes extra slots available.
     scheduleQueuedJobs();
-    taskAutoActions = nextAutoActions;
     return publicTaskSettings();
   });
   taskSettingsWritePromise = operation;
@@ -6865,6 +6955,8 @@ async function updateJobProxy(job, proxyUrl) {
 }
 
 function restartJobAfterConfigurationUpdate(job) {
+  job.proxyFallbackAttempted = false;
+  job.proxyFallbackActive = false;
   stopMailPolling(job);
   releaseSmsNumber(job, "idle");
   job.queueRunId = null;

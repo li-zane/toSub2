@@ -54,6 +54,8 @@ try {
   assert.deepEqual(JSON.parse(await fs.readFile(settingsPath, "utf8")), {
     version: 2,
     maxActiveJobs: 6,
+    proxyUrl: "",
+    allowDirectFallback: false,
     autoActions: {
       self_serve_business_prolite: ["upload", "rotate-logout-reauthorize-upload"],
       SELF_SERVE_PRO: ["upload"],

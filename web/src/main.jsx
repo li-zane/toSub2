@@ -47,7 +47,6 @@ const LUBAN_SERVICE_ID_STORAGE_KEY = "chatgpt-onboarding.luban-service-id";
 const SMS_PROVIDER_SETTINGS_KEY = "chatgpt-onboarding.sms-provider-settings-v1";
 const MAIL_REQUEST_SETTINGS_KEY = "chatgpt-onboarding.mail-request-settings-v1";
 const SUB2API_UPLOAD_SETTINGS_KEY = "chatgpt-onboarding.sub2api-upload-settings-v1";
-const ACCOUNT_PROXY_STORAGE_KEY = "chatgpt-onboarding.account-proxy-v1";
 const PLAN_TYPE_MAPPING_STORAGE_KEY = "chatgpt-onboarding.plan-type-mapping-v1";
 const DEFAULT_PLAN_TYPE_MAPPING = {
   free: "Free",
@@ -186,7 +185,12 @@ function App() {
     intervalMinutes: 5,
   });
   const [uploadNotice, setUploadNotice] = useState("");
-  const [accountProxyUrl, setAccountProxyUrl] = useState(() => readLocalTextSetting(ACCOUNT_PROXY_STORAGE_KEY));
+  const [accountProxyUrl, setAccountProxyUrl] = useState("");
+  const [allowDirectFallback, setAllowDirectFallback] = useState(false);
+  const [proxySettingsLoaded, setProxySettingsLoaded] = useState(false);
+  const [proxySettingsDirty, setProxySettingsDirty] = useState(false);
+  const [proxySettingsSaving, setProxySettingsSaving] = useState(false);
+  const [proxySettingsError, setProxySettingsError] = useState("");
   const [planTypeMapping, setPlanTypeMapping] = useState(readPlanTypeMapping);
   const [planTypeMappingOpen, setPlanTypeMappingOpen] = useState(false);
   const [planTypeMappingDraft, setPlanTypeMappingDraft] = useState(() => planTypeMappingRows(readPlanTypeMapping()));
@@ -213,7 +217,6 @@ function App() {
     browserSettings.adminApiKey = "";
     writeLocalJson(SUB2API_UPLOAD_SETTINGS_KEY, browserSettings);
   }, [sub2apiSettings]);
-  useEffect(() => writeLocalTextSetting(ACCOUNT_PROXY_STORAGE_KEY, accountProxyUrl.trim()), [accountProxyUrl]);
   useEffect(() => writeLocalJson(PLAN_TYPE_MAPPING_STORAGE_KEY, planTypeMapping), [planTypeMapping]);
 
   useEffect(() => {
@@ -232,6 +235,47 @@ function App() {
       stopped = true;
     };
   }, []);
+
+  useEffect(() => {
+    if (!token) return undefined;
+    let stopped = false;
+    async function refreshProxySettings() {
+      try {
+        const data = await apiFetch(token, "/api/account-proxy-settings");
+        if (stopped) return;
+        if (!proxySettingsDirty) {
+          setAccountProxyUrl(data.settings.proxyUrl || "");
+          setAllowDirectFallback(data.settings.allowDirectFallback === true);
+        }
+        setProxySettingsLoaded(true);
+      } catch (requestError) {
+        if (!stopped) setProxySettingsError(requestError.message);
+      }
+    }
+    void refreshProxySettings();
+    const timer = window.setInterval(refreshProxySettings, 15_000);
+    return () => { stopped = true; window.clearInterval(timer); };
+  }, [token, proxySettingsDirty]);
+
+  async function saveAccountProxySettings() {
+    if (proxySettingsSaving) return;
+    setProxySettingsSaving(true);
+    setProxySettingsError("");
+    try {
+      const data = await apiFetch(token, "/api/account-proxy-settings", {
+        method: "POST",
+        body: JSON.stringify({ proxyUrl: String(accountProxyUrl).trim(), allowDirectFallback }),
+      });
+      setAccountProxyUrl(data.settings.proxyUrl || "");
+      setAllowDirectFallback(data.settings.allowDirectFallback === true);
+      setProxySettingsDirty(false);
+      setProxySettingsLoaded(true);
+    } catch (requestError) {
+      setProxySettingsError(requestError.message);
+    } finally {
+      setProxySettingsSaving(false);
+    }
+  }
 
   useEffect(() => {
     if (!token) return undefined;
@@ -909,7 +953,7 @@ function App() {
       }
       const rotationResults = await Promise.allSettled(ids.map((id) => apiFetch(token, `/api/jobs/${id}/replace-2fa`, {
         method: "POST",
-        body: JSON.stringify({ proxyUrl: accountProxyUrl.trim() }),
+        body: JSON.stringify({}),
       })));
       const rotationError = rotationResults.find((result) => result.status === "rejected");
       if (rotationError) throw new Error(`启动 2FA 轮换失败：${rotationError.reason?.message || "请求失败"}`);
@@ -940,7 +984,7 @@ function App() {
       // credential-backed login instead of the refresh-token regeneration path.
       const reauthorize = await apiFetch(token, "/api/jobs/relogin-batch", {
         method: "POST",
-        body: JSON.stringify({ ids, proxyUrl: accountProxyUrl.trim() }),
+        body: JSON.stringify({ ids }),
       });
       if (reauthorize.started !== count) {
         throw new Error(`重新授权只启动了 ${reauthorize.started || 0}/${count} 个账号`);
@@ -1105,7 +1149,7 @@ function App() {
     try {
       const data = await apiFetch(token, "/api/jobs", {
         method: "POST",
-        body: JSON.stringify({ email: email.trim(), proxyUrl: accountProxyUrl.trim() }),
+        body: JSON.stringify({ email: email.trim() }),
       });
       setPage(1);
       if (page === 1) setJobs((current) => mergeJobs([data.job], current).slice(0, 20));
@@ -1125,7 +1169,7 @@ function App() {
     try {
       const data = await apiFetch(token, "/api/jobs/batch", {
         method: "POST",
-        body: JSON.stringify({ text: batchText, proxyUrl: accountProxyUrl.trim() }),
+        body: JSON.stringify({ text: batchText }),
       });
       setPage(1);
       if (page === 1) setJobs((current) => mergeJobs(data.jobs, current).slice(0, 20));
@@ -1220,7 +1264,7 @@ function App() {
     try {
       await apiFetch(token, "/api/jobs/reauthorize-batch", {
         method: "POST",
-        body: JSON.stringify({ ids: [...selectedJobIds], proxyUrl: accountProxyUrl.trim() }),
+        body: JSON.stringify({ ids: [...selectedJobIds] }),
       });
       setSelectedJobIds(new Set());
       setError("");
@@ -1240,7 +1284,7 @@ function App() {
     try {
       const data = await apiFetch(token, "/api/jobs/setup-2fa-batch", {
         method: "POST",
-        body: JSON.stringify({ ids: [...selectedJobIds], proxyUrl: accountProxyUrl.trim() }),
+        body: JSON.stringify({ ids: [...selectedJobIds] }),
       });
       setUploadNotice(`已开始为 ${data.started} 个账号设置 2FA${data.skipped ? `，跳过 ${data.skipped} 个` : ""}`);
       setSelectedJobIds(new Set());
@@ -1261,7 +1305,7 @@ function App() {
     try {
       const data = await apiFetch(token, "/api/jobs/add-password-batch", {
         method: "POST",
-        body: JSON.stringify({ ids: [...selectedJobIds], proxyUrl: accountProxyUrl.trim() }),
+        body: JSON.stringify({ ids: [...selectedJobIds] }),
       });
       setUploadNotice(`已开始为 ${data.started} 个账号添加密码${data.skipped ? `，跳过 ${data.skipped} 个` : ""}`);
       setSelectedJobIds(new Set());
@@ -1282,7 +1326,7 @@ function App() {
     try {
       const data = await apiFetch(token, "/api/jobs/relogin-batch", {
         method: "POST",
-        body: JSON.stringify({ ids: [...selectedJobIds], proxyUrl: accountProxyUrl.trim() }),
+        body: JSON.stringify({ ids: [...selectedJobIds] }),
       });
       setUploadNotice(`已开始重新登录并授权 ${data.started} 个账号${data.skipped ? `，跳过 ${data.skipped} 个` : ""}`);
       setSelectedJobIds(new Set());
@@ -1554,7 +1598,8 @@ function App() {
                 <Globe2 size={15} aria-hidden="true" />
                 <input
                   value={accountProxyUrl}
-                  onChange={(event) => setAccountProxyUrl(event.target.value)}
+                  onChange={(event) => { setAccountProxyUrl(event.target.value); setProxySettingsDirty(true); }}
+                  disabled={!proxySettingsLoaded || proxySettingsSaving}
                   placeholder="socks5h://用户名:密码@主机:端口"
                   spellCheck="false"
                   aria-label="代理 IP 地址"
@@ -1562,8 +1607,19 @@ function App() {
               </label>
               <span className={`provider-ready ${accountProxyUrl.trim() ? "" : "incomplete"}`}>
                 {accountProxyUrl.trim() ? <Check size={14} /> : <CircleAlert size={14} />}
-                {accountProxyUrl.trim() ? "已配置，按账号检测出口" : "未配置，使用本地 IP"}
+                {!proxySettingsLoaded ? "正在读取服务端配置" : proxySettingsDirty ? "尚未保存，任务仍使用已保存配置" : accountProxyUrl.trim() ? "已保存到服务端，所有浏览器共用" : "未配置全局代理，保留账号代理或使用服务器出口"}
               </span>
+              <label className="proxy-fallback-option">
+                <input type="checkbox" checked={allowDirectFallback}
+                  onChange={(event) => { setAllowDirectFallback(event.target.checked); setProxySettingsDirty(true); }}
+                  disabled={!proxySettingsLoaded || proxySettingsSaving} />
+                代理失败时允许回退本地出口 IP
+              </label>
+              <button type="button" className="secondary-button" onClick={saveAccountProxySettings}
+                disabled={!proxySettingsLoaded || proxySettingsSaving || !proxySettingsDirty}>
+                {proxySettingsSaving ? "保存中…" : "保存代理配置"}
+              </button>
+              {proxySettingsError && <span role="alert">{proxySettingsError}</span>}
             </div>
           </section>
         </div>
@@ -2639,7 +2695,7 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
     try {
       await apiFetch(token, `/api/jobs/${job.id}/retry`, {
         method: "POST",
-        body: JSON.stringify({ proxyUrl: accountProxyUrl.trim() }),
+        body: JSON.stringify({}),
       });
       onError("");
     } catch (requestError) {
@@ -2654,7 +2710,7 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
     try {
       await apiFetch(token, `/api/jobs/${job.id}/regenerate`, {
         method: "POST",
-        body: JSON.stringify({ proxyUrl: accountProxyUrl.trim() }),
+        body: JSON.stringify({}),
       });
       onError("");
     } catch (requestError) {
@@ -2669,7 +2725,7 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
     try {
       await apiFetch(token, `/api/jobs/${job.id}/relogin`, {
         method: "POST",
-        body: JSON.stringify({ proxyUrl: accountProxyUrl.trim() }),
+        body: JSON.stringify({}),
       });
       onError("");
     } catch (requestError) {
@@ -2684,7 +2740,7 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
     try {
       await apiFetch(token, `/api/jobs/${job.id}/setup-2fa`, {
         method: "POST",
-        body: JSON.stringify({ proxyUrl: accountProxyUrl.trim() }),
+        body: JSON.stringify({}),
       });
       onError("");
     } catch (requestError) {
@@ -2700,7 +2756,7 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
     try {
       await apiFetch(token, `/api/jobs/${job.id}/add-password`, {
         method: "POST",
-        body: JSON.stringify({ proxyUrl: accountProxyUrl.trim() }),
+        body: JSON.stringify({}),
       });
       onError("");
     } catch (requestError) {
@@ -3363,8 +3419,7 @@ function CredentialDialog({ token, job, accountProxyUrl, totpReplaceAvailable, o
     setNotice("");
     try {
       const body = {};
-      const proxyUrl = accountProxyUrl.trim();
-      if (proxyUrl) body.proxyUrl = proxyUrl;
+
       await apiFetch(token, `/api/jobs/${job.id}/replace-2fa`, {
         method: "POST",
         body: JSON.stringify(body),
