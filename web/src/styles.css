@@ -382,6 +382,22 @@ button:disabled { cursor: not-allowed; opacity: .5; box-shadow: none; }
 table { width: max-content; min-width: 100%; border-collapse: separate; border-spacing: 0; table-layout: fixed; }
 col.select-column { width: 48px; }
 col.account-column { width: 360px; }
+.account-remark-button { display: flex; align-items: center; gap: 5px; max-width: 100%; min-height: 24px; padding: 2px 0; border: 0; background: transparent; color: var(--muted); font-size: 12px; text-align: left; cursor: pointer; }
+.account-remark-button svg { flex-shrink: 0; }
+.account-remark-button span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.account-remark-button:hover { color: var(--ink); }
+.account-remark-button:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; border-radius: 3px; }
+.remark-dialog { max-width: 560px; }
+.import-date-priority-section { padding: 14px; border: 1px solid var(--line); border-radius: var(--radius); }
+.sub2api-profile-manager > .import-date-priority-section { min-width: 0; margin: 16px 0 0; background: var(--surface); }
+.import-date-priority-toggle { display: flex; align-items: center; gap: 8px; cursor: pointer; min-height: 32px; }
+.settings-field .import-date-priority-toggle input[type="checkbox"] { width: 16px; height: 16px; flex: 0 0 16px; margin: 0; }
+.settings-field > .import-date-priority-range { height: auto; padding: 0; border: 0; border-radius: 0; background: transparent; display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); align-items: end; gap: 12px; margin: 12px 0; }
+.settings-field > .import-date-priority-range:focus-within { box-shadow: none; }
+.import-date-priority-range .settings-field:first-child { grid-column: auto; }
+.import-date-priority-range > span { padding-bottom: 12px; color: var(--muted); }
+.batch-dialog textarea.remark-input { width: 100%; min-height: 96px; height: 110px; padding: 11px 12px; border: 1px solid var(--line-strong); border-radius: var(--radius); font: inherit; }
+.remark-input:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
 col:nth-child(3) { width: 140px; }
 col:nth-child(4) { width: 240px; }
 col:nth-child(5) { width: 120px; }

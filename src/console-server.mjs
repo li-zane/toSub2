@@ -87,6 +87,7 @@ const SUB2API_PROFILE_FIELDS = [
   "concurrency",
   "loadFactor",
   "priority",
+  "importDatePriority",
   "accountNameTemplate",
   "modelWhitelist",
   "codexFingerprintMode",
@@ -325,6 +326,7 @@ async function handleApi(req, res, requestUrl) {
         sub2apiAccountStatus: true,
         sub2apiAccountToggle: true,
         sub2apiAccountPriority: true,
+        accountRemarks: true,
       },
     });
     return;
@@ -402,6 +404,7 @@ async function handleApi(req, res, requestUrl) {
     }
     const hasCredentialUpdate = ["password", "mailApiUrl", "mailRequestBody", "totpSecret"].some((key) => Object.hasOwn(body, key));
     const credentials = normalizeLoginCredentials(body);
+    if (Object.hasOwn(body, "remark")) normalizeAccountRemark(body.remark);
     const hasProxyUpdate = Object.hasOwn(body, "proxyUrl");
     const requestedProxyUrl = hasProxyUpdate && String(body.proxyUrl || "").trim()
       ? normalizeProxyUrl(body.proxyUrl)
@@ -412,10 +415,13 @@ async function handleApi(req, res, requestUrl) {
         const proxyUrl = globalProxyUrl || requestedProxyUrl || existing.proxyUrl;
         if (hasCredentialUpdate) await updateJobCredentials(existing, credentials, { proxyUrl, hasProxyUpdate: true });
         else if (hasProxyUpdate) await updateJobProxy(existing, proxyUrl);
-        return { job: existing, created: false, updated: hasCredentialUpdate || hasProxyUpdate };
+        if (Object.hasOwn(body, "remark")) await updateJobRemark(existing, body.remark);
+        return { job: existing, created: false, updated: hasCredentialUpdate || hasProxyUpdate || Object.hasOwn(body, "remark") };
       }
       const proxyUrl = globalProxyUrl || requestedProxyUrl;
-      return { job: await startJob(email, credentials, proxyUrl), created: true, updated: false };
+      const job = await startJob(email, { ...credentials, ...(Object.hasOwn(body, "remark") ? { remark: normalizeAccountRemark(body.remark) } : {}) }, proxyUrl);
+      if (Object.hasOwn(body, "remark")) await synchronizeSub2ApiRemark(job);
+      return { job, created: true, updated: false };
     });
     sendJson(res, result.created ? 201 : 200, { ...result, job: publicJob(result.job) });
     return;
@@ -429,6 +435,7 @@ async function handleApi(req, res, requestUrl) {
       const existing = findJobByEmail(entry.email);
       if (existing) {
         await updateJobCredentials(existing, entry, { proxyUrl: proxyUrl || existing.proxyUrl, hasProxyUpdate: true });
+        const sub2api = Object.hasOwn(entry, "remark") ? await updateJobRemark(existing, entry.remark) : null;
         existing.autoTaskEligible = true;
         existing.autoTaskActions = [];
         existing.autoTaskStatus = "idle";
@@ -436,17 +443,19 @@ async function handleApi(req, res, requestUrl) {
         existing.autoTaskError = null;
         await saveJobMetadata(existing);
         if (existing.resultSaved && !isActive(existing.status)) await queueConfiguredTaskActions(existing);
-        return { job: existing, updated: true };
+        return { job: existing, updated: true, sub2api };
       }
       const job = await startJob(entry.email, entry, proxyUrl);
+      const sub2api = Object.hasOwn(entry, "remark") ? await synchronizeSub2ApiRemark(job) : null;
       job.autoTaskEligible = true;
       await saveJobMetadata(job);
-      return { job, updated: false };
+      return { job, updated: false, sub2api };
     })));
     sendJson(res, 201, {
       jobs: results.map((item) => publicJob(item.job)),
       created: results.filter((item) => !item.updated).length,
       updated: results.filter((item) => item.updated).length,
+      remarkSync: results.reduce((total, item) => ({ updated: total.updated + (item.sub2api?.updated || 0), failed: total.failed + (item.sub2api?.failed || 0), error: total.error || item.sub2api?.error || null }), { updated: 0, failed: 0, error: null }),
     });
     return;
   }
@@ -604,6 +613,17 @@ async function handleApi(req, res, requestUrl) {
     return;
   }
 
+  const remarkMatch = /^\/api\/jobs\/([a-f0-9-]+)\/remark$/.exec(requestUrl.pathname);
+  if ((req.method === "POST" || req.method === "PUT") && remarkMatch) {
+    const body = await readJson(req);
+    const job = jobs.get(remarkMatch[1]);
+    if (!job) throw httpError(404, "Login flow not found");
+    if (!Object.hasOwn(body, "remark")) throw httpError(400, "请提供备注内容");
+    const sub2api = await withEmailJobLock(job.email, () => updateJobRemark(job, body.remark));
+    sendJson(res, 200, { job: publicJob(job), sub2api });
+    return;
+  }
+
   const sub2ApiSchedulableMatch = /^\/api\/sub2api\/accounts\/([a-f0-9-]+)\/schedulable$/.exec(requestUrl.pathname);
   if (req.method === "POST" && sub2ApiSchedulableMatch) {
     const body = await readJson(req);
@@ -720,7 +740,8 @@ async function handleApi(req, res, requestUrl) {
     invalidateSub2ApiAccountStatusCache();
     await persistSub2ApiSettingsConfiguration();
     const profileSync = await syncSub2ApiProfileChanges(config, profileSyncTargets, snapshotSub2ApiProfileState());
-    sendJson(res, 200, { ...publicSub2ApiSettingsState(), profileSync });
+    const datePrioritySync = await refreshImportDatePriorities(config);
+    sendJson(res, 200, { ...publicSub2ApiSettingsState(), profileSync, datePrioritySync });
     return;
   }
 
@@ -742,7 +763,8 @@ async function handleApi(req, res, requestUrl) {
     await persistSub2ApiMonitorConfiguration();
     scheduleSub2ApiMonitor();
     const profileSync = await syncSub2ApiProfileChanges(config, profileSyncTargets, snapshotSub2ApiProfileState());
-    sendJson(res, 200, { ...publicSub2ApiMonitorState(), profileSync });
+    const datePrioritySync = await refreshImportDatePriorities(config);
+    sendJson(res, 200, { ...publicSub2ApiMonitorState(), profileSync, datePrioritySync });
     return;
   }
 
@@ -1116,6 +1138,9 @@ async function startJob(email, credentials = {}, proxyUrl = null) {
     loginMode,
     password,
     totpSecret,
+    remark: normalizeAccountRemark(credentials.remark || ""),
+    remarkSyncPending: Object.hasOwn(credentials, "remark"),
+    remarkRevision: crypto.randomUUID(),
     hasPasswordCredential: Boolean(password),
     hasTotpCredential: Boolean(totpSecret),
     proxyUrl,
@@ -2871,7 +2896,9 @@ async function downloadResult(res, job) {
     return;
   }
   const safeEmail = job.email.replace(/[^a-zA-Z0-9@._+-]/g, "_");
-  const data = await fs.readFile(job.outputPath);
+  const payload = JSON.parse(await fs.readFile(job.outputPath, "utf8"));
+  payload.accounts = payload.accounts.map((account) => accountWithRemark(account, job));
+  const data = Buffer.from(`${JSON.stringify(payload, null, 2)}\n`);
   res.writeHead(200, {
     "content-type": "application/json; charset=utf-8",
     "content-disposition": `attachment; filename="${safeEmail}-sub2api-import-oauth-${downloadTimestamp()}.json"`,
@@ -2902,7 +2929,7 @@ async function downloadBatchResult(res, ids) {
     if (data.type !== "sub2api-data" || !Array.isArray(data.accounts)) {
       throw httpError(409, `${job.email} 的导入文件格式不正确`);
     }
-    accounts.push(...data.accounts);
+    accounts.push(...data.accounts.map((account) => accountWithRemark(account, job)));
     if (Array.isArray(data.proxies)) proxies.push(...data.proxies);
   }
 
@@ -2932,7 +2959,7 @@ async function buildSub2ApiUploadPayload(downloadable) {
     if (data.type !== "sub2api-data" || !Array.isArray(data.accounts)) {
       throw httpError(409, `${job.email} 的导入文件格式不正确`);
     }
-    accounts.push(...data.accounts);
+    accounts.push(...data.accounts.map((account) => accountWithRemark(account, job)));
     if (Array.isArray(data.proxies)) proxies.push(...data.proxies);
   }
   return {
@@ -2970,7 +2997,7 @@ async function uploadJobsToSub2Api(selected, config, profileState = snapshotSub2
       ...sub2ApiProxyFields(accountConfig),
       ...(accountConfig.concurrency !== null ? { concurrency: accountConfig.concurrency } : {}),
       ...(accountConfig.loadFactor !== null ? { load_factor: accountConfig.loadFactor } : {}),
-      ...(accountConfig.priority !== null ? { priority: accountConfig.priority } : {}),
+      ...(accountConfig.priority !== null && !accountConfig.importDatePriority?.enabled ? { priority: accountConfig.priority } : {}),
     };
     const profileId = accountConfig.profileId || "default";
     if (!accountsByProfile.has(profileId)) accountsByProfile.set(profileId, { config: accountConfig, accounts: [] });
@@ -2985,6 +3012,14 @@ async function uploadJobsToSub2Api(selected, config, profileState = snapshotSub2
   for (const { config: accountConfig, accounts } of accountsByProfile.values()) {
     const listing = await listSub2ApiAccounts(accountConfig, { withMeta: true });
     if (!listing.complete) throw new Error("Sub2API 账号列表不完整，已停止上传以避免创建重复账号");
+    // Replace each existing row's PlanType with the uploaded workspace PlanType
+    // but keep its original pool import date. New rows join the same day ranks.
+    const effective = listing.accounts.map((remote) => {
+      const local = accounts.find((account) => sub2ApiAccountEmail(account) === sub2ApiAccountEmail(remote));
+      return local ? { ...remote, ...local, id: remote.id, created_at: remote.created_at } : remote;
+    });
+    const newAccounts = accounts.filter((account) => !listing.accounts.some((remote) => sub2ApiAccountEmail(account) === sub2ApiAccountEmail(remote)));
+    const dayPriorities = importDatePriorities([...effective, ...newAccounts], config, profileState);
     const accountsToCreate = [];
     for (const account of accounts) {
       const email = sub2ApiAccountEmail(account);
@@ -2992,6 +3027,7 @@ async function uploadJobsToSub2Api(selected, config, profileState = snapshotSub2
         ? listing.accounts.filter((remoteAccount) => sub2ApiAccountEmail(remoteAccount) === email)
         : [];
       if (!matches.length) {
+        if (dayPriorities.has(account)) account.priority = dayPriorities.get(account);
         accountsToCreate.push(account);
         continue;
       }
@@ -2999,6 +3035,8 @@ async function uploadJobsToSub2Api(selected, config, profileState = snapshotSub2
         const accountId = normalizeSub2ApiAccountId(remoteAccount?.id);
         if (!accountId) continue;
         const accountUpdate = buildSub2ApiAccountUpdate(account, accountConfig, remoteAccount);
+        const dated = effective.find((item) => item.id === remoteAccount.id);
+        if (dayPriorities.has(dated)) accountUpdate.priority = dayPriorities.get(dated);
         await requestSub2Api(accountConfig, `/api/v1/admin/accounts/${encodeURIComponent(accountId)}`, {
           method: "PUT",
           body: JSON.stringify(accountUpdate),
@@ -3016,6 +3054,7 @@ async function uploadJobsToSub2Api(selected, config, profileState = snapshotSub2
       }));
     }
   }
+  const datePrioritySync = await refreshImportDatePriorities(config, profileState);
   invalidateSub2ApiAccountStatusCache();
   return {
     selected: selected.length,
@@ -3024,6 +3063,7 @@ async function uploadJobsToSub2Api(selected, config, profileState = snapshotSub2
     created: createdCount,
     updated: updatedCount,
     updatedAccountIds,
+    datePrioritySync,
     groupIds: config.groupIds,
     result: results.length === 1 ? results[0] : results,
   };
@@ -3108,7 +3148,83 @@ function normalizeSub2ApiConfig(value, options = {}) {
       ?? stored.wsMode
       ?? "off",
   );
-  return { baseUrl, adminApiKey, groupIds, proxyId, concurrency, loadFactor, priority, accountNameTemplate, modelWhitelist, codexFingerprintMode, wsMode, profileId: String(config.profileId || stored.profileId || "default") };
+  const importDatePriority = normalizeImportDatePriority(config.importDatePriority ?? stored.importDatePriority);
+  return { baseUrl, adminApiKey, groupIds, proxyId, concurrency, loadFactor, priority, importDatePriority, accountNameTemplate, modelWhitelist, codexFingerprintMode, wsMode, profileId: String(config.profileId || stored.profileId || "default") };
+}
+
+function normalizeImportDatePriority(value) {
+  if (value === undefined || value === null) return { enabled: false, min: 2, max: 5 };
+  if (typeof value !== "object" || Array.isArray(value) || typeof value.enabled !== "boolean") throw httpError(400, "导入日期优先级开关必须是布尔值");
+  const min = parseOptionalSub2ApiInteger(value.min, "日期优先级下限", 0, 10000);
+  const max = parseOptionalSub2ApiInteger(value.max, "日期优先级上限", 0, 10000);
+  if (min === null || max === null || min > max) throw httpError(400, "日期优先级范围必须是 0–10000 的整数，且下限不能大于上限");
+  return { enabled: value.enabled, min, max };
+}
+
+const importDayFormatter = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit" });
+function accountImportDay(account) {
+  const remoteTimestamp = account.created_at ? Date.parse(account.created_at) : Number.NaN;
+  if (Number.isFinite(remoteTimestamp)) return importDayFormatter.format(new Date(remoteTimestamp));
+  const local = findJobByEmail(sub2ApiAccountEmail(account));
+  for (const value of [local?.poolOnly ? null : local?.createdAt]) {
+    if (!value) continue;
+    const timestamp = Date.parse(value);
+    if (Number.isFinite(timestamp)) return importDayFormatter.format(new Date(timestamp));
+  }
+  return null;
+}
+
+function importDatePriorities(accounts, config, profileState) {
+  const groups = new Map();
+  for (const account of accounts) {
+    if (account.platform && account.platform !== "openai" || account.type && account.type !== "oauth") continue;
+    const accountConfig = resolveSub2ApiConfigForAccount(config, account, profileState);
+    const profileId = accountConfig.profileId || "default";
+    const rule = accountConfig.importDatePriority;
+    const day = accountImportDay(account);
+    if (!rule?.enabled || !day) continue;
+    if (!groups.has(profileId)) groups.set(profileId, []);
+    groups.get(profileId).push({ account, day, rule });
+  }
+  const priorities = new Map();
+  for (const entries of groups.values()) {
+    const days = [...new Set(entries.map((entry) => entry.day))].sort();
+    const ranks = new Map(days.map((day, index) => [day, index]));
+    for (const { account, day, rule } of entries) priorities.set(account, Math.min(rule.max, rule.min + ranks.get(day)));
+  }
+  return priorities;
+}
+
+async function syncImportDatePriorities(config, listing, profileState = snapshotSub2ApiProfileState()) {
+  const result = { updated: 0, failed: 0, incomplete: !listing.complete, error: null };
+  if (!listing.complete) return { ...result, error: "账号列表不完整，已停止日期优先级同步" };
+  const priorities = importDatePriorities(listing.accounts, config, profileState);
+  for (const [account, priority] of priorities) {
+    const id = normalizeSub2ApiAccountId(account.id);
+    if (!id || sub2ApiAccountPriority(account) === priority) continue;
+    try {
+      await requestSub2Api(config, `/api/v1/admin/accounts/${encodeURIComponent(id)}`, { method: "PUT", body: JSON.stringify({ priority }) });
+      account.priority = priority;
+      result.updated += 1;
+    } catch (error) {
+      result.failed += 1;
+      result.error ||= String(error?.message || error).slice(0, 500);
+    }
+  }
+  return result;
+}
+
+async function refreshImportDatePriorities(config, profileState = snapshotSub2ApiProfileState()) {
+  profileState ||= snapshotSub2ApiProfileState();
+  if (!config.importDatePriority?.enabled && ![...profileState.profiles.values()].some((profile) => profile.importDatePriority?.enabled)) return null;
+  try {
+    const listing = await listSub2ApiAccounts(config, { withMeta: true });
+    const result = await syncImportDatePriorities(config, listing, profileState);
+    if (result.updated) invalidateSub2ApiAccountStatusCache();
+    return result;
+  } catch (error) {
+    return { updated: 0, failed: 0, error: String(error?.message || error).slice(0, 500) };
+  }
 }
 
 function normalizeSub2ApiProxyId(stored = {}) {
@@ -3524,6 +3640,7 @@ function serializeSub2ApiConfig(config) {
     concurrency: config.concurrency,
     loadFactor: config.loadFactor,
     priority: config.priority,
+    importDatePriority: config.importDatePriority,
     accountNameTemplate: config.accountNameTemplate,
     modelWhitelist: config.modelWhitelist,
     codexFingerprintMode: config.codexFingerprintMode,
@@ -3805,6 +3922,7 @@ async function runSub2ApiMonitor(trigger = "scheduled") {
       const accountListing = await listSub2ApiAccounts(config, { withMeta: true });
       const allRemoteAccounts = accountListing.accounts;
       if (accountListing.complete) {
+        summary.datePrioritySync = await syncImportDatePriorities(config, accountListing, profileState);
         await fallBackExpiredSub2ApiProxies(config, profileState, allRemoteAccounts, summary);
         const previousPlanTypes = sub2ApiMonitorState.planTypesBackend === backend
           ? normalizeSub2ApiPlanTypeState(sub2ApiMonitorState.planTypes)
@@ -3928,6 +4046,7 @@ const SUB2API_PROFILE_FIELD_LABELS = {
   concurrency: "并发数",
   loadFactor: "负载因子",
   priority: "优先级",
+  importDatePriority: "按导入日期设置优先级",
   accountNameTemplate: "账号命名模板",
   modelWhitelist: "模型白名单",
   codexFingerprintMode: "Codex 指纹模式",
@@ -4084,7 +4203,8 @@ function buildSub2ApiProfileSyncUpdate(remoteAccount, accountConfig, fields) {
   if (changed.has("proxyId")) Object.assign(body, sub2ApiProxyFields(accountConfig));
   if (changed.has("concurrency")) body.concurrency = accountConfig.concurrency;
   if (changed.has("loadFactor")) body.load_factor = accountConfig.loadFactor;
-  if (changed.has("priority")) body.priority = accountConfig.priority;
+  if (changed.has("priority") && !accountConfig.importDatePriority?.enabled) body.priority = accountConfig.priority;
+  if (changed.has("importDatePriority") && !accountConfig.importDatePriority?.enabled && accountConfig.priority !== null) body.priority = accountConfig.priority;
   if (changed.has("accountNameTemplate")) {
     const accountName = renderSub2ApiAccountName(accountConfig.accountNameTemplate, remoteAccount);
     if (accountName) body.name = accountName;
@@ -4190,7 +4310,7 @@ async function updateSub2ApiAccountFromProfile(globalConfig, remoteAccount, prof
   Object.assign(body, sub2ApiProxyFields(accountConfig));
   if (accountConfig.concurrency !== null) body.concurrency = accountConfig.concurrency;
   if (accountConfig.loadFactor !== null) body.load_factor = accountConfig.loadFactor;
-  if (accountConfig.priority !== null) body.priority = accountConfig.priority;
+  if (accountConfig.priority !== null && !accountConfig.importDatePriority?.enabled) body.priority = accountConfig.priority;
   const accountName = renderSub2ApiAccountName(accountConfig.accountNameTemplate, remoteAccount);
   if (accountName) body.name = accountName;
   body.extra = buildSub2ApiAccountExtra(remoteAccount.extra, accountConfig);
@@ -4208,6 +4328,10 @@ async function updateSub2ApiAccountFromProfile(globalConfig, remoteAccount, prof
 }
 
 function buildSub2ApiAccountUpdate(localAccount, accountConfig, remoteAccount = {}) {
+  const remarkJob = findJobByEmail(sub2ApiAccountEmail(localAccount));
+  // Routine uploads/workspace changes must not overwrite a newer pool edit.
+  // Explicit local changes remain pending until their notes write succeeds.
+  const remark = remarkJob ? (remarkJob.remarkSyncPending ? remarkJob.remark || "" : undefined) : localAccount.notes;
   const remoteCredentials = remoteAccount?.credentials && typeof remoteAccount.credentials === "object"
     ? remoteAccount.credentials
     : {};
@@ -4248,6 +4372,7 @@ function buildSub2ApiAccountUpdate(localAccount, accountConfig, remoteAccount = 
   return {
     credentials,
     extra,
+    ...(remark !== undefined ? { notes: remark } : {}),
     ...(targetPlanType ? { plan_type: targetPlanType } : {}),
     ...(accountName ? { name: accountName } : {}),
     ...(accountConfig.groupIds.length
@@ -4256,17 +4381,134 @@ function buildSub2ApiAccountUpdate(localAccount, accountConfig, remoteAccount = 
     ...sub2ApiProxyFields(accountConfig),
     ...(accountConfig.concurrency !== null ? { concurrency: accountConfig.concurrency } : {}),
     ...(accountConfig.loadFactor !== null ? { load_factor: accountConfig.loadFactor } : {}),
-    ...(accountConfig.priority !== null ? { priority: accountConfig.priority } : {}),
+    ...(accountConfig.priority !== null && !accountConfig.importDatePriority?.enabled ? { priority: accountConfig.priority } : {}),
   };
 }
 
+function normalizeAccountRemark(value) {
+  if (typeof value !== "string") throw httpError(400, "备注必须是文本");
+  if (value.length > 2000 || value.includes("\u0000")) throw httpError(400, "备注最多 2000 字，不能包含空字符");
+  return value;
+}
+
+function accountWithRemark(account, job) {
+  return { ...account, notes: job.remark || "" };
+}
+
+function restoredRemarkState(metadata) {
+  return {
+    remarkSyncPending: metadata.remark_sync_pending === true,
+    remarkSyncBackend: typeof metadata.remark_sync_backend === "string" ? metadata.remark_sync_backend : null,
+    remarkRemoteSnapshot: metadata.remark_remote_snapshot && typeof metadata.remark_remote_snapshot === "object" ? metadata.remark_remote_snapshot : {},
+    remarkRevision: metadata.remark_revision || null,
+  };
+}
+
+async function updateJobRemark(job, value) {
+  const remark = normalizeAccountRemark(value);
+  const matching = [...jobs.values()].filter((item) => item.email.toLowerCase() === job.email.toLowerCase());
+  await Promise.all(matching.map(async (item) => {
+    item.remark = remark;
+    item.remarkRevision = crypto.randomUUID();
+    item.remarkSyncPending = true;
+    touch(item);
+    await saveJobMetadata(item);
+  }));
+  return synchronizeSub2ApiRemark(job);
+}
+
+async function synchronizeSub2ApiRemark(job, context = {}) {
+  const config = context.config || sub2ApiSettingsConfig || sub2ApiMonitorConfig;
+  const result = { configured: Boolean(config?.baseUrl && config?.adminApiKey), matched: 0, updated: 0, failed: 0, error: null };
+  if (!result.configured) return result;
+  const remark = job.remark || "";
+  const revision = job.remarkRevision;
+  try {
+    const listing = context.listing || await listSub2ApiAccounts(config, { withMeta: true });
+    if (!listing.complete) throw new Error("Sub2API 账号列表不完整，备注已保存在本地，请重试同步");
+    const matching = new Map(listing.accounts
+      .filter((account) => sub2ApiAccountEmail(account) === job.email.toLowerCase())
+      .map((account) => [normalizeSub2ApiAccountId(account.id), account])
+      .filter(([id]) => id));
+    result.matched = matching.size;
+    for (const [id, account] of matching) {
+      const notes = remark;
+      if (notes === account.notes) continue;
+      try {
+        await requestSub2Api(config, `/api/v1/admin/accounts/${encodeURIComponent(id)}`, {
+          method: "PUT", body: JSON.stringify({ notes }),
+        });
+        result.updated += 1;
+        account.notes = notes;
+      } catch (error) {
+        result.failed += 1;
+        result.error ||= String(error?.message || error).slice(0, 500);
+      }
+    }
+    if (result.matched && !result.failed && job.remarkRevision === revision) {
+      const backend = monitorBackendIdentity(config);
+      await Promise.all([...jobs.values()].filter((item) => item.email.toLowerCase() === job.email.toLowerCase()).map(async (item) => {
+        item.remarkSyncPending = false;
+        item.remarkSyncBackend = backend;
+        item.remarkRemoteSnapshot = Object.fromEntries([...matching].map(([id, account]) => [id, account.notes ?? ""]));
+        await saveJobMetadata(item);
+      }));
+    }
+    if (result.updated) invalidateSub2ApiAccountStatusCache();
+  } catch (error) {
+    result.error = String(error?.message || error).slice(0, 500);
+  }
+  return result;
+}
+
+async function pullSub2ApiRemarks(listing, config, versions) {
+  const backend = monitorBackendIdentity(config);
+  const grouped = new Map();
+  for (const account of listing.accounts) {
+    const email = sub2ApiAccountEmail(account);
+    if (!email || !normalizeSub2ApiAccountId(account.id)) continue;
+    if (!grouped.has(email)) grouped.set(email, []);
+    grouped.get(email).push(account);
+  }
+  for (const [email, remote] of grouped) {
+    // Status refresh can run inside a workspace/delete operation holding this
+    // same lock. Defer busy accounts until the next refresh instead of nesting.
+    if (emailJobLocks.has(email)) continue;
+    await withEmailJobLock(email, async () => {
+      const job = findJobByEmail(email);
+      if (!job || job.remarkRevision !== versions.get(job.id)) return;
+      if (job.remarkSyncPending) {
+        await synchronizeSub2ApiRemark(job, { listing, config });
+        return;
+      }
+      const candidates = remote.filter((account) => Object.hasOwn(account, "notes") && (typeof account.notes === "string" || account.notes === null));
+      if (!candidates.length) return;
+      const snapshot = job.remarkSyncBackend === backend ? job.remarkRemoteSnapshot || {} : {};
+      const changed = candidates.filter((account) => snapshot[account.id] !== (account.notes ?? ""));
+      // Prefer records changed since the last snapshot, then the latest remote
+      // timestamp; ID makes conflicts deterministic when timestamps are absent.
+      const source = (changed.length ? changed : candidates).sort((left, right) =>
+        (Date.parse(right.updated_at || "") || 0) - (Date.parse(left.updated_at || "") || 0)
+        || String(left.id).localeCompare(String(right.id), "en", { numeric: true })
+      )[0];
+      const remark = !changed.length && Object.keys(snapshot).length ? job.remark || "" : source.notes ?? "";
+      const nextSnapshot = Object.fromEntries(candidates.map((account) => [account.id, account.notes ?? ""]));
+      const matching = [...jobs.values()].filter((item) => item.email.toLowerCase() === email);
+      await Promise.all(matching.map(async (item) => {
+        if (item.remark === remark && item.remarkSyncBackend === backend && JSON.stringify(item.remarkRemoteSnapshot) === JSON.stringify(nextSnapshot)) return;
+        item.remark = remark;
+        item.remarkSyncBackend = backend;
+        item.remarkRemoteSnapshot = nextSnapshot;
+        touch(item);
+        await saveJobMetadata(item);
+      }));
+    });
+  }
+}
+
 /**
- * Update the existing Sub2API account records after a ChatGPT workspace
- * switch. The remote account id is deliberately retained; matching by email
- * prevents the normal batch-import endpoint from creating a duplicate record
- * every time the account changes between a personal and an organization
- * workspace. When a historical duplicate already exists, update every record
- * with the same email so their credentials and PlanType converge.
+ * Update existing pool records after a workspace switch, retaining remote
+ * IDs and updating historical duplicates matched by email without creation.
  */
 async function synchronizeSub2ApiWorkspaceAccount(job) {
   const config = sub2ApiSettingsConfig || sub2ApiMonitorConfig;
@@ -4451,8 +4693,13 @@ async function loadSub2ApiAccountStatus({ forceRefresh = false } = {}) {
   }
   if (sub2ApiAccountStatusPromise) return sub2ApiAccountStatusPromise;
   sub2ApiAccountStatusPromise = (async () => {
-    const remoteAccounts = await listSub2ApiAccounts(config);
+    const versions = new Map([...jobs.values()].map((job) => [job.id, job.remarkRevision]));
+    const listing = await listSub2ApiAccounts(config, { withMeta: true });
+    if (!listing.complete) throw new Error("Sub2API 账号列表不完整，已保留本地备注和状态");
+    await syncImportDatePriorities(config, listing);
+    const remoteAccounts = listing.accounts;
     await importSub2ApiPoolOnlyAccounts(remoteAccounts);
+    await pullSub2ApiRemarks(listing, config, versions);
     const accounts = new Map();
     const fetchedAt = new Date().toISOString();
     const previousAccounts = sub2ApiAccountStatusCache.backend === backend
@@ -4472,6 +4719,7 @@ async function loadSub2ApiAccountStatus({ forceRefresh = false } = {}) {
       if (!current) {
         accounts.set(email, {
           email,
+          remark: findJobByEmail(email)?.remark ?? null,
           accountIds: [accountId],
           groupIds,
           enabled,
@@ -4529,6 +4777,7 @@ async function importSub2ApiPoolOnlyAccounts(remoteAccounts) {
       await fs.writeFile(path.join(outputDir, JOB_META_FILENAME), `${JSON.stringify({
         version: 1,
         email,
+        remark: typeof account.notes === "string" ? account.notes : "",
         pool_only: true,
         status: "completed",
         prompt: "已从 Sub2API 号池同步",
@@ -4559,6 +4808,7 @@ function publicSub2ApiAccountStatusState(state = sub2ApiAccountStatusCache) {
 function publicSub2ApiAccountStatusEntry(entry) {
   return {
     email: entry.email,
+    remark: entry.remark ?? null,
     accountId: entry.accountIds?.[0] || null,
     accountIds: [...(entry.accountIds || [])],
     inPool: true,
@@ -5028,12 +5278,13 @@ async function performSub2ApiAutoRepairSuccess(job) {
       const accountUpdate = {
         credentials,
         extra,
+        ...(job.remarkSyncPending ? { notes: job.remark || "" } : {}),
         ...(accountName ? { name: accountName } : {}),
         ...(accountConfig.groupIds.length ? { group_ids: accountConfig.groupIds } : {}),
         ...sub2ApiProxyFields(accountConfig),
         ...(accountConfig.concurrency !== null ? { concurrency: accountConfig.concurrency } : {}),
         ...(accountConfig.loadFactor !== null ? { load_factor: accountConfig.loadFactor } : {}),
-        ...(accountConfig.priority !== null ? { priority: accountConfig.priority } : {}),
+        ...(accountConfig.priority !== null && !accountConfig.importDatePriority?.enabled ? { priority: accountConfig.priority } : {}),
       };
       await requestSub2Api(operation.config, `/api/v1/admin/accounts/${accountId}`, {
         method: "PUT",
@@ -5106,6 +5357,10 @@ async function exportSourceAccounts(res, ids) {
     if (job.hasTotpCredential && !totpSecret) {
       throw httpError(409, `${job.email} 的 2FA 密钥未能从系统安全凭据存储读取，请重新导入该账号资料`);
     }
+    if (totpSecret && job.remark) {
+      if (/[\r\n]/.test(job.remark)) throw httpError(409, `${job.email} 的备注包含换行，请使用 JSON 下载保留完整备注`);
+      totpSecret += `(${job.remark})`;
+    }
     if (password) {
       const parts = [job.email, password];
       if (job.mailRequestBody) parts.push(job.mailRequestBody);
@@ -5148,6 +5403,8 @@ function publicJob(job) {
   return {
     id: job.id,
     email: job.email,
+    remark: job.remark || "",
+    remarkSyncPending: Boolean(job.remarkSyncPending),
     status: job.status,
     prompt: job.status === "queued"
       ? `排队中，前方还有 ${Math.max(0, getQueuePosition(job) - 1)} 条任务`
@@ -5785,6 +6042,8 @@ async function syncCompletedOutputs(force = false) {
           parserTail: "",
           resultSaved: true,
           poolOnly: Boolean(metadata.pool_only),
+          remark: typeof metadata.remark === "string" ? metadata.remark : "",
+          ...restoredRemarkState(metadata),
           planType: extractPlanTypeFromAccount(account) || normalizePlanType(metadata.plan_type),
           workspacePlanType: normalizePlanType(metadata.workspace_plan_type),
           loginMode: metadata.login_mode === "password" || storedCredentials.password ? "password" : (mailApiUrl ? "email_otp" : metadata.login_mode || "manual"),
@@ -5883,6 +6142,8 @@ async function syncCompletedOutputs(force = false) {
           parserTail: "",
           resultSaved: false,
           poolOnly: Boolean(metadata.pool_only),
+          remark: typeof metadata.remark === "string" ? metadata.remark : "",
+          ...restoredRemarkState(metadata),
           planType: normalizePlanType(metadata.plan_type),
           workspacePlanType: normalizePlanType(metadata.workspace_plan_type),
           loginMode: metadata.login_mode === "password" || storedCredentials.password ? "password" : (mailApiUrl ? "email_otp" : metadata.login_mode || "manual"),
@@ -5979,6 +6240,8 @@ async function syncCompletedOutputs(force = false) {
           resultSaved: false,
           planType: normalizePlanType(metadata.plan_type),
           poolOnly: Boolean(metadata.pool_only),
+          remark: typeof metadata.remark === "string" ? metadata.remark : "",
+          ...restoredRemarkState(metadata),
           workspacePlanType: normalizePlanType(metadata.workspace_plan_type),
           loginMode: metadata.login_mode === "password" || storedCredentials.password ? "password" : (mailApiUrl ? "email_otp" : metadata.login_mode || "manual"),
           password: storedCredentials.password,
@@ -6352,11 +6615,20 @@ function parseBatchEntries(value, requestConfig = {}) {
   if (!lines.length) throw httpError(400, "请至少输入一行账号信息");
   if (lines.length > MAX_BATCH_JOBS) throw httpError(400, `一次最多添加 ${MAX_BATCH_JOBS} 条任务`);
 
-  const entries = lines.map((line, index) => (
-    requestConfig.method === "POST" && !isEmail(line)
-      ? parsePostMailAccountLine(line, index + 1, requestConfig)
-      : parseSmartAccountLine(line, index + 1)
-  ));
+  const entries = lines.map((line, index) => {
+    // Only a parenthesized suffix attached to a 2FA field is a remark;
+    // parentheses inside passwords and mail request bodies remain literal.
+    const match = /----([A-Z2-7][A-Z2-7=\s]{15,127})(?:\((.*)\)|（(.*)）)$/i.exec(line);
+    const accountLine = match ? line.slice(0, match.index) + `----${match[1].trim()}` : line;
+    const entry = requestConfig.method === "POST" && !isEmail(accountLine)
+      ? parsePostMailAccountLine(accountLine, index + 1, requestConfig)
+      : parseSmartAccountLine(accountLine, index + 1);
+    if (match) {
+      if (!entry.totpSecret) throw httpError(400, `第 ${index + 1} 行备注必须放在 2FA 密钥后`);
+      entry.remark = normalizeAccountRemark(match[2] ?? match[3]);
+    }
+    return entry;
+  });
 
   const unique = new Map();
   entries.forEach((entry) => unique.set(entry.email.toLowerCase(), entry));
@@ -6986,6 +7258,11 @@ async function saveJobMetadata(job) {
       const data = {
         version: 1,
         email: job.email,
+        remark: job.remark || "",
+        remark_sync_pending: Boolean(job.remarkSyncPending),
+        remark_sync_backend: job.remarkSyncBackend || null,
+        remark_remote_snapshot: job.remarkRemoteSnapshot || {},
+        remark_revision: job.remarkRevision || null,
         status: job.status,
         prompt: job.prompt || null,
         last_error: job.lastError || null,

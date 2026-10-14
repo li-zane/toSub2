@@ -198,6 +198,7 @@ function App() {
   const [planTypeMappingError, setPlanTypeMappingError] = useState("");
   const [planTypeMappingSaving, setPlanTypeMappingSaving] = useState(false);
   const [credentialJob, setCredentialJob] = useState(null);
+  const [remarkJob, setRemarkJob] = useState(null);
   const [sessionJob, setSessionJob] = useState(null);
   const [workspaceJob, setWorkspaceJob] = useState(null);
   const [operationDetail, setOperationDetail] = useState(null);
@@ -698,6 +699,13 @@ function App() {
       setSub2apiSettingsError("请输入 Sub2API 管理员 API Key");
       return;
     }
+    for (const profile of sub2apiSettingsDraft.profiles) {
+      const rule = profile.importDatePriority;
+      if (!/^\d+$/.test(String(rule.min)) || !/^\d+$/.test(String(rule.max)) || Number(rule.min) > Number(rule.max) || Number(rule.max) > 10000) {
+        setSub2apiSettingsError(`方案“${profile.name}”的日期优先级范围必须为 0–10000 的整数，且下限不能大于上限`);
+        return;
+      }
+    }
     const nextSettings = {
       ...readSub2ApiSettings(sub2apiSettingsDraft),
       baseUrl: baseUrl.replace(/\/+$/, ""),
@@ -727,6 +735,9 @@ function App() {
         if (profileSync.failed || (profileSync.error && !profileSync.updated)) setError(notice);
         else setUploadNotice(notice);
       }
+      const dateSync = savedSettings.datePrioritySync || monitor.datePrioritySync;
+      if (dateSync?.error || dateSync?.failed) setError(`配置已保存，日期优先级同步未完成：${dateSync.error || `${dateSync.failed} 条更新失败`}`);
+      else if (dateSync) setUploadNotice(`配置已保存，按导入日期更新了 ${dateSync.updated} 条账号的优先级`);
     } catch (requestError) {
       setSub2apiSettingsError(requestError.message);
     } finally {
@@ -1178,6 +1189,8 @@ function App() {
       setBatchError("");
       setBatchOpen(false);
       setError("");
+      if (data.remarkSync?.error) setUploadNotice(`账号已导入，备注已保存在本地；号池同步未完成：${data.remarkSync.error}`);
+      else if (data.remarkSync?.updated) setUploadNotice(`账号已导入，已同步 ${data.remarkSync.updated} 条号池记录的备注`);
     } catch (requestError) {
       setBatchError(requestError.message);
     } finally {
@@ -1871,6 +1884,8 @@ function App() {
                     onRefreshUsage={() => refreshAccountUsage(job.id)}
                     credentialsAvailable={Boolean(features.credentialDetails)}
                     onOpenCredentials={() => setCredentialJob(job)}
+                    remarksAvailable={Boolean(features.accountRemarks)}
+                    onOpenRemark={() => setRemarkJob(job)}
                     sessionsAvailable={Boolean(features.accountSessions)}
                     onOpenSessions={() => setSessionJob(job)}
                     workspacesAvailable={Boolean(features.accountWorkspaces)}
@@ -1899,6 +1914,25 @@ function App() {
           </nav>
         )}
       </section>
+      {remarkJob && (
+        <RemarkDialog
+          token={token}
+          job={remarkJob}
+          onClose={() => setRemarkJob(null)}
+          onSaved={(data) => {
+            const email = data.job.email.toLowerCase();
+            const merge = (current) => current.map((item) => item.email.toLowerCase() === email ? { ...item, remark: data.job.remark, remarkSyncPending: data.job.remarkSyncPending, updatedAt: data.job.updatedAt } : item);
+            setJobs(merge);
+            setJobSelectionIndex(merge);
+            setUploadNotice(data.sub2api?.error
+              ? `备注已保存在本地；号池同步未完成：${data.sub2api.error}`
+              : data.sub2api?.matched
+                ? `备注已${data.job.remark ? "保存" : "清空"}，已同步同邮箱的 ${data.sub2api.matched} 条号池记录`
+                : `本地备注已${data.job.remark ? "保存" : "清空"}，上传账号时会同步到号池`);
+            setRemarkJob(null);
+          }}
+        />
+      )}
       {activeCredentialJob && (
           <CredentialDialog
           key={activeCredentialJob.id}
@@ -2266,6 +2300,19 @@ function App() {
                     <button type="button" className="secondary-button" onClick={addSub2ApiPlanTypeBinding} disabled={!sub2apiPlanTypeDraft.trim()}><Plus size={14} />绑定</button>
                   </div>
                 </div>
+              <fieldset className="settings-field wide-settings-field import-date-priority-section">
+                <legend>按导入日期设置优先级（当前方案）</legend>
+                <label className="import-date-priority-toggle">
+                  <input type="checkbox" checked={sub2apiSettingsDraft.importDatePriority.enabled} onChange={(event) => updateSub2ApiDraftProfile({ importDatePriority: { ...sub2apiSettingsDraft.importDatePriority, enabled: event.target.checked } })} />
+                  <span>开启日期优先级</span>
+                </label>
+                <div className="import-date-priority-range">
+                  <label className="settings-field"><span>优先级下限</span><input type="number" min="0" max="10000" step="1" disabled={!sub2apiSettingsDraft.importDatePriority.enabled} value={sub2apiSettingsDraft.importDatePriority.min} onChange={(event) => updateSub2ApiDraftProfile({ importDatePriority: { ...sub2apiSettingsDraft.importDatePriority, min: event.target.value } })} /></label>
+                  <span aria-hidden="true">—</span>
+                  <label className="settings-field"><span>优先级上限</span><input type="number" min="0" max="10000" step="1" disabled={!sub2apiSettingsDraft.importDatePriority.enabled} value={sub2apiSettingsDraft.importDatePriority.max} onChange={(event) => updateSub2ApiDraftProfile({ importDatePriority: { ...sub2apiSettingsDraft.importDatePriority, max: event.target.value } })} /></label>
+                </div>
+                <small className="settings-field-hint">此设置绑定当前配置方案，该方案服务的所有 PlanType 共用同一套日期排序。按上海时区的导入日期从早到晚分组，同日同级，超出范围统一使用上限。例如 2–5：13 日 → 2，14 日 → 3，第 4 个日期及以后 → 5。开启后优先于固定优先级；保存、上传与号池同步时自动计算。</small>
+              </fieldset>
               </section>
               <fieldset className="settings-field wide-settings-field sub2api-group-field">
                 <legend>目标号池（可多选）</legend>
@@ -2367,6 +2414,7 @@ function App() {
                   max="10000"
                   step="1"
                   value={sub2apiSettingsDraft.priority}
+                  disabled={sub2apiSettingsDraft.importDatePriority.enabled}
                   onChange={(event) => updateSub2ApiDraftProfile({ priority: event.target.value })}
                   placeholder="留空使用账号原值"
                 />
@@ -2523,7 +2571,7 @@ function App() {
             <label className="batch-label" htmlFor="batch-input">
               {mailRequestSettings.method === "POST"
                 ? "每行：邮箱----编码请求体，或 邮箱----密码----编码请求体；邮箱及可识别字段顺序不限"
-                : "每行一个账号：自动识别邮箱、密码、邮件 API 和 2FA，字段顺序不限"}
+                : "每行一个账号：账号----密码----2FA(备注)，括号内默认为备注；原有格式仍可使用"}
             </label>
             <textarea
               id="batch-input"
@@ -2531,7 +2579,7 @@ function App() {
               onChange={(event) => setBatchText(event.target.value)}
               placeholder={mailRequestSettings.method === "POST"
                 ? "a@example.com----eyJtYWlsYm94X2lkIjoiaWQtYSJ9\nb@example.com----账号密码----mailbox_id%3Did-b"
-                : "name@icloud.com----https://mail.example/messages/name\nhttps://mail.example/messages/name2|账号密码|name2@example.co.uk|BASE32二步验证密钥\nBASE32二步验证密钥::name3@example.dev::账号密码"}
+                : "name@example.com----账号密码----JBSWY3DPEHPK3PXP(首批账号)\nname2@icloud.com----https://mail.example/messages/name2\nBASE32二步验证密钥::name3@example.dev::账号密码"}
               spellCheck="false"
               autoFocus
             />
@@ -2623,6 +2671,57 @@ function OperationDetailText({ text, className, onOpen }) {
   );
 }
 
+function RemarkDialog({ token, job, onClose, onSaved }) {
+  const [remark, setRemark] = useState(job.remark || "");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  useEffect(() => {
+    const previousFocus = document.activeElement;
+    return () => previousFocus?.focus();
+  }, []);
+  async function save(event) {
+    event.preventDefault();
+    if (saving) return;
+    setSaving(true);
+    setError("");
+    try {
+      const data = await apiFetch(token, `/api/jobs/${job.id}/remark`, { method: "POST", body: JSON.stringify({ remark }) });
+      onSaved(data);
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally {
+      setSaving(false);
+    }
+  }
+  return (
+    <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !saving) onClose(); }}>
+      <form className="batch-dialog remark-dialog" role="dialog" aria-modal="true" aria-labelledby="remark-title" onSubmit={save} onKeyDown={(event) => {
+        if (event.key === "Escape" && !saving) onClose();
+        if (event.key === "Tab") {
+          const controls = [...event.currentTarget.querySelectorAll("button:not(:disabled), input:not(:disabled), textarea:not(:disabled)")];
+          const first = controls[0];
+          const last = controls.at(-1);
+          if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
+          else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
+        }
+      }}>
+        <div className="dialog-header">
+          <div><h2 id="remark-title">账号备注</h2><span>{job.email}</span></div>
+          <button type="button" className="icon-button" onClick={onClose} disabled={saving} aria-label="关闭备注"><X size={18} /></button>
+        </div>
+        <label className="batch-label" htmlFor="account-remark">备注内容</label>
+        <textarea id="account-remark" className="remark-input" value={remark} onChange={(event) => setRemark(event.target.value)} maxLength={2000} disabled={saving} autoFocus placeholder="例如：首批账号、到期时间、用途" />
+        <p className="dialog-hint">与号池备注双向同步：保存会更新同邮箱账号的完整备注，清空也会同步。号池修改会在下一次同步时回显，编辑中的内容会保留。</p>
+        {error && <div className="dialog-error" role="alert">{error}</div>}
+        <div className="dialog-footer">
+          <button type="button" className="cancel-button" onClick={onClose} disabled={saving}>取消</button>
+          <button type="submit" className="primary-button" disabled={saving}>{saving ? <LoaderCircle className="spin" size={16} /> : <Check size={16} />}保存备注</button>
+        </div>
+      </form>
+    </div>
+  );
+}
+
 function OperationDetailDialog({ detail, onClose }) {
   return (
     <div className="modal-backdrop operation-detail-backdrop" role="presentation" onMouseDown={(event) => {
@@ -2648,7 +2747,7 @@ function OperationDetailDialog({ detail, onClose }) {
   );
 }
 
-function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggleSelected, onDelete, deleteAvailable, deleteDisabled, deleteBusy, selectionSupported, smsProviderAvailable, smsProvider, onUpload, sub2apiUploadAvailable, sub2apiToggleAvailable, sub2apiToggleBusy, onToggleSub2Api, sub2apiPriorityAvailable, sub2apiPriorityBusy, onUpdateSub2ApiPriority, totpSetupAvailable, passwordAddAvailable, forceReloginAvailable, accountProxyUrl, planTypeMapping, accountUsage, accountUsageAvailable, onRefreshUsage, credentialsAvailable, onOpenCredentials, sessionsAvailable, onOpenSessions, workspacesAvailable, onOpenWorkspaces, onOpenOperationDetail }) {
+function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggleSelected, onDelete, deleteAvailable, deleteDisabled, deleteBusy, selectionSupported, smsProviderAvailable, smsProvider, onUpload, sub2apiUploadAvailable, sub2apiToggleAvailable, sub2apiToggleBusy, onToggleSub2Api, sub2apiPriorityAvailable, sub2apiPriorityBusy, onUpdateSub2ApiPriority, totpSetupAvailable, passwordAddAvailable, forceReloginAvailable, accountProxyUrl, planTypeMapping, accountUsage, accountUsageAvailable, onRefreshUsage, credentialsAvailable, onOpenCredentials, remarksAvailable, onOpenRemark, sessionsAvailable, onOpenSessions, workspacesAvailable, onOpenWorkspaces, onOpenOperationDetail }) {
   const [value, setValue] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [priorityValue, setPriorityValue] = useState(() => job.sub2apiPriority === null || job.sub2apiPriority === undefined ? "" : String(job.sub2apiPriority));
@@ -2840,6 +2939,12 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
               <span className="account-id">{shortId(job.id)}</span>
               <LoginMethodBadge job={job} />
             </div>
+            {remarksAvailable && (
+              <button type="button" className="account-remark-button" onClick={onOpenRemark} title={job.remark || "添加备注"} aria-label={`编辑 ${job.email} 的备注`}>
+                <FileText size={13} aria-hidden="true" />
+                <span>{job.remark || "添加备注"}</span>
+              </button>
+            )}
           </div>
         </div>
       </td>
@@ -4565,6 +4670,7 @@ function normalizeSub2ApiSettings(value) {
     concurrency: String(stored.concurrency ?? ""),
     loadFactor: String(stored.loadFactor ?? ""),
     priority: String(stored.priority ?? ""),
+    importDatePriority: normalizeImportDatePrioritySettings(stored.importDatePriority),
     accountNameTemplate: String(stored.accountNameTemplate || ""),
     modelWhitelist: String(stored.modelWhitelist || ""),
     codexFingerprintMode: ["off", "device", "session", "full"].includes(stored.codexFingerprintMode)
@@ -4611,6 +4717,7 @@ function normalizeSub2ApiProfile(value, index = 0, fallback = {}) {
     concurrency: String(stored.concurrency ?? fallbackProfile.concurrency ?? ""),
     loadFactor: String(stored.loadFactor ?? fallbackProfile.loadFactor ?? ""),
     priority: String(stored.priority ?? fallbackProfile.priority ?? ""),
+    importDatePriority: normalizeImportDatePrioritySettings(stored.importDatePriority ?? fallbackProfile.importDatePriority),
     accountNameTemplate: String(stored.accountNameTemplate ?? fallbackProfile.accountNameTemplate ?? ""),
     modelWhitelist: String(stored.modelWhitelist ?? fallbackProfile.modelWhitelist ?? ""),
     codexFingerprintMode: ["off", "device", "session", "full"].includes(stored.codexFingerprintMode)
@@ -4618,6 +4725,10 @@ function normalizeSub2ApiProfile(value, index = 0, fallback = {}) {
       : fallbackProfile.codexFingerprintMode || "session",
     wsMode: SUB2API_WS_MODES.has(wsMode) ? wsMode : "off",
   };
+}
+
+function normalizeImportDatePrioritySettings(value) {
+  return { enabled: value?.enabled === true, min: String(value?.min ?? 2), max: String(value?.max ?? 5) };
 }
 
 function hasUsableSub2ApiSettings(settings) {
@@ -4794,6 +4905,7 @@ function sub2ApiStatusJobFields(status) {
     // oscillate on every 15-second status refresh.
     sub2apiPlanType: String(status?.sub2apiPlanType || status?.planType || "").trim() || null,
   };
+  if (typeof status?.remark === "string") fields.remark = status.remark;
   return fields;
 }
 
@@ -4803,6 +4915,7 @@ function mergeSub2ApiStatusIntoJob(job, state) {
   const status = state.accounts?.[key];
   if (!status) return { ...job, ...sub2ApiStatusJobFields({ inPool: false }), sub2apiPlanType: null };
   const fields = sub2ApiStatusJobFields(status);
+  if (Date.parse(state.fetchedAt) < Date.parse(job.updatedAt || "")) delete fields.remark;
   // `planType` is the account's currently selected workspace and is supplied
   // by the completed local OAuth output. Only use the remote value as a
   // fallback for legacy jobs that never persisted a local PlanType.

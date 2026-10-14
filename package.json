@@ -6,6 +6,8 @@
   "scripts": {
     "dev": "node src/console-server.mjs",
     "start": "node src/console-server.mjs",
+    "test:remarks": "node test/console-remarks-smoke.mjs",
+    "test:date-priority": "node test/console-import-date-priority-smoke.mjs",
     "daemon:start": "pm2 start ecosystem.config.cjs",
     "daemon:restart": "pm2 restart tosub2 --update-env",
     "daemon:stop": "pm2 stop tosub2",
