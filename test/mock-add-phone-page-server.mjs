@@ -6,6 +6,8 @@ const base = `http://127.0.0.1:${port}`;
 const publicBase = process.argv[3] || base;
 
 let lastLoginHint = "";
+let oauthState = "";
+let oauthRedirectUri = "";
 let addPasswordMode = false;
 
 const server = http.createServer(async (req, res) => {
@@ -158,6 +160,8 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "GET" && url.pathname === "/api/auth/callback/openai") return redirect(res, `${publicBase}/`);
   if (req.method === "GET" && url.pathname === "/web-callback") return redirect(res, `${publicBase}/`);
   if (req.method === "GET" && url.pathname === "/oauth/authorize") {
+    oauthState = url.searchParams.get("state");
+    oauthRedirectUri = url.searchParams.get("redirect_uri");
     return redirect(res, `${publicBase}/choose-an-account`);
   }
   if (req.method === "GET" && url.pathname === "/choose-an-account") {
@@ -228,9 +232,9 @@ const server = http.createServer(async (req, res) => {
     });
   }
   if (req.method === "POST" && url.pathname === "/api/accounts/workspace/select") {
-    const callback = new URL("http://localhost:1455/auth/callback");
+    const callback = new URL(oauthRedirectUri);
     callback.searchParams.set("code", "mock-authorization-code");
-    callback.searchParams.set("state", "mock-state");
+    callback.searchParams.set("state", oauthState);
     return sendJson(res, 200, { continue_url: callback.toString() });
   }
   if (req.method === "POST" && url.pathname === "/oauth/token") {

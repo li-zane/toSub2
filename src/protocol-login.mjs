@@ -2,6 +2,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import readline from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 import {
@@ -13,7 +14,9 @@ import {
 const DEFAULT_CHATGPT_BASE = "https://chatgpt.com";
 const DEFAULT_AUTH_BASE = "https://auth.openai.com";
 const DEFAULT_CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
-const DEFAULT_CODEX_REDIRECT_URI = "http://localhost:1455/auth/callback";
+const DEFAULT_CODEX_REDIRECT_URI = "http://127.0.0.1:1455/auth/callback";
+const DEFAULT_CODEX_ORIGINATOR = "codex_cli_rs";
+const CODEX_OAUTH_SCOPE = "openid profile email offline_access api.connectors.read api.connectors.invoke";
 const DEFAULT_OUT = "tmp/chatgpt-protocol-session.json";
 const DEFAULT_SUB2API_OUT = "tmp/sub2api-import-oauth.json";
 const DEFAULT_TOTP_RESULT = "tmp/chatgpt-totp-setup.json";
@@ -70,6 +73,35 @@ function browserHeadersForTransport(transport) {
     headers["sec-ch-ua-mobile"] = identity.secChUaMobile;
     headers["sec-ch-ua-platform"] = identity.secChUaPlatform;
   }
+  return headers;
+}
+
+function browserRequestContext(url, { referer, navigation = false } = {}) {
+  const target = new URL(url);
+  let source;
+  try { source = referer ? new URL(referer) : null; } catch { source = null; }
+  let site = "none";
+  const headers = {};
+  if (source && ["http:", "https:"].includes(source.protocol)) {
+    const sameOrigin = source.origin === target.origin;
+    const sameSite = source.protocol === target.protocol && (
+      source.hostname === target.hostname || ["openai.com", "chatgpt.com"].some((domain) => (
+        [source.hostname, target.hostname].every((host) => host === domain || host.endsWith(`.${domain}`))
+      ))
+    );
+    site = sameOrigin ? "same-origin" : sameSite ? "same-site" : "cross-site";
+    // Match strict-origin-when-cross-origin, including HTTPS downgrade protection.
+    if (!(source.protocol === "https:" && target.protocol === "http:")) {
+      source.username = "";
+      source.password = "";
+      source.hash = "";
+      headers.referer = sameOrigin ? source.href : `${source.origin}/`;
+    }
+  }
+  headers["sec-fetch-site"] = site;
+  headers["sec-fetch-mode"] = navigation ? "navigate" : "cors";
+  headers["sec-fetch-dest"] = navigation ? "document" : "empty";
+  if (navigation) headers["upgrade-insecure-requests"] = "1";
   return headers;
 }
 
@@ -157,6 +189,7 @@ class ProtocolClient {
     this.verbose = Boolean(options.verbose);
     this.debugAuth = Boolean(options.debugAuth);
     this.transport = options.transport || null;
+    this.documentUrl = null;
   }
 
   async rawFetch(url, options = {}) {
@@ -175,7 +208,11 @@ class ProtocolClient {
     if (!headers.has("accept")) {
       headers.set("accept", options.accept || "application/json, text/plain, */*");
     }
-    if (options.referer) headers.set("referer", options.referer);
+    const context = browserRequestContext(url, {
+      referer: options.referer || this.documentUrl,
+      navigation: Boolean(options.navigation),
+    });
+    for (const [name, value] of Object.entries(context)) headers.set(name, value);
     if (options.origin) headers.set("origin", options.origin);
 
     const cookie = this.jar.headerFor(url);
@@ -186,9 +223,6 @@ class ProtocolClient {
       (targetUrl.hostname === "auth.openai.com" || targetUrl.pathname.startsWith("/api/accounts/"))
     ) {
       headers.set("x-access-flow-invocation-id", crypto.randomUUID());
-      headers.set("sec-fetch-site", "same-origin");
-      headers.set("sec-fetch-mode", "cors");
-      headers.set("sec-fetch-dest", "empty");
       headers.set("priority", "u=1, i");
       if (options.json) headers.set("accept", "application/json");
     }
@@ -249,15 +283,18 @@ class ProtocolClient {
   async follow(url, options = {}) {
     let current = url;
     let last = null;
+    const referer = options.referer || this.documentUrl;
     for (let i = 0; i < (options.maxRedirects || 12); i += 1) {
       if (isLocalCallback(current)) return { finalUrl: current, last };
       last = await this.request("GET", current, {
         accept:
           "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        referer: options.referer,
+        referer,
+        navigation: true,
       });
       if (last.res.status >= 400) assertOk(last, `GET ${current}`);
       if (![301, 302, 303, 307, 308].includes(last.res.status) || !last.location) {
+        this.documentUrl = current;
         return { finalUrl: current, last };
       }
       current = last.location;
@@ -523,6 +560,12 @@ async function run() {
       phone: args.phone,
       codexClientId: args.codexClientId || DEFAULT_CODEX_CLIENT_ID,
       codexRedirectUri: args.codexRedirectUri || DEFAULT_CODEX_REDIRECT_URI,
+      legacyCodexRedirectUri: args.codexRedirectUri,
+      codexOriginator: args.codexOriginator,
+      allowedWorkspaceIds: args.allowedWorkspaceIds,
+      currentWorkspaceId: args.currentWorkspaceId,
+      loginHint: args.codexLoginHint,
+      connection: args.codexConnection,
       debugAuth: Boolean(args.debugAuth),
     };
     let checkpoint = null;
@@ -631,7 +674,7 @@ async function run() {
 
     if (codex?.callbackUrl) {
       console.log("[ok] Codex callback URL:");
-      console.log(codex.callbackUrl);
+      console.log(safeUrl(codex.callbackUrl));
     }
     if (codex?.callbackUrl && codex?.codeVerifier && !args.noSub2apiExport && outputMode !== "session") {
       console.log("[6/6] Convert OAuth callback to sub2api import");
@@ -640,13 +683,13 @@ async function run() {
         callbackUrl: codex.callbackUrl,
         codeVerifier: codex.codeVerifier,
         clientId: args.codexClientId || DEFAULT_CODEX_CLIENT_ID,
-        redirectUri: args.codexRedirectUri || DEFAULT_CODEX_REDIRECT_URI,
+        redirectUri: codex.redirectUri || args.codexRedirectUri || DEFAULT_CODEX_REDIRECT_URI,
+        expectedState: codex.state,
         accountName: args.sub2apiName,
         concurrency: args.concurrency,
         priority: args.priority,
         rateMultiplier: args.rateMultiplier,
         transport,
-        cookie: client.jar.headerFor(authBase),
       });
       await writeJsonAtomic(sub2apiOutPath, sub2apiExport.data);
       await removeProtocolCheckpoint(checkpointPath);
@@ -1534,23 +1577,32 @@ async function runCodexOauth(client, options) {
   const codeVerifier = base64Url(crypto.randomBytes(48));
   const codeChallenge = base64Url(crypto.createHash("sha256").update(codeVerifier).digest());
   const state = base64Url(crypto.randomBytes(24));
-  const authUrl =
-    `${options.authBase}/oauth/authorize?` +
-    new URLSearchParams({
-      client_id: options.codexClientId,
-      code_challenge: codeChallenge,
-      code_challenge_method: "S256",
-      codex_cli_simplified_flow: "true",
-      id_token_add_organizations: "true",
-      redirect_uri: options.codexRedirectUri,
-      response_type: "code",
-      scope: "openid profile email offline_access",
-      state,
-    }).toString();
+  const parameters = new URLSearchParams({
+    client_id: options.codexClientId,
+    code_challenge: codeChallenge,
+    code_challenge_method: "S256",
+    codex_cli_simplified_flow: "true",
+    id_token_add_organizations: "true",
+    redirect_uri: options.codexRedirectUri,
+    response_type: "code",
+    scope: CODEX_OAUTH_SCOPE,
+    originator: process.env.CODEX_INTERNAL_ORIGINATOR_OVERRIDE || options.codexOriginator || DEFAULT_CODEX_ORIGINATOR,
+    state,
+  });
+  if (options.allowedWorkspaceIds?.length) {
+    parameters.set("allowed_workspace_id", options.allowedWorkspaceIds.join(","));
+  }
+  if (options.currentWorkspaceId) {
+    parameters.set("current_workspace_id", options.currentWorkspaceId);
+    if (options.loginHint) parameters.set("login_hint", options.loginHint);
+    if (options.connection) parameters.set("connection", options.connection);
+  }
+  const authUrl = `${options.authBase}/oauth/authorize?${parameters}`;
 
   const authorized = await client.follow(authUrl);
   if (isLocalCallback(authorized.finalUrl)) {
-    const result = { callbackUrl: authorized.finalUrl, codeVerifier, state };
+    validateCodexCallback(authorized.finalUrl, { redirectUri: options.codexRedirectUri, expectedState: state });
+    const result = { callbackUrl: authorized.finalUrl, codeVerifier, state, redirectUri: options.codexRedirectUri };
     await options.saveCheckpoint?.("callback_ready", { oauth: result });
     return result;
   }
@@ -1577,7 +1629,7 @@ async function runCodexOauth(client, options) {
   }, { referer: `${options.authBase}/choose-an-account` });
   let current = selected;
   const addPhoneUrl = getContinueUrl(selected);
-  const oauth = { codeVerifier, state, sessionId, addPhoneUrl };
+  const oauth = { codeVerifier, state, sessionId, addPhoneUrl, redirectUri: options.codexRedirectUri };
   if (options.debugAuth) {
     logAuthSnapshot(client, "session/select", `${options.authBase}/api/accounts/session/select`, HAR_ADD_PHONE_COOKIE_NAMES);
     console.log(`[debug] session/select continue_url: ${addPhoneUrl || "<none>"}`);
@@ -1606,11 +1658,20 @@ async function resumeCodexOauth(client, options, checkpoint) {
 
   const oauth = checkpoint.oauth || {};
   if (!oauth.codeVerifier || !oauth.state) throw new Error("CHECKPOINT_INVALID: missing OAuth PKCE state");
+  // Before redirectUri was recorded, the protocol's fixed default was localhost.
+  if (!oauth.redirectUri) {
+    oauth.redirectUri = isLocalCallback(oauth.callbackUrl)
+      ? new URL(oauth.callbackUrl).origin + new URL(oauth.callbackUrl).pathname
+      : options.legacyCodexRedirectUri || "http://localhost:1455/auth/callback";
+  }
   if (checkpoint.stage === "callback_ready" && oauth.callbackUrl) {
+    const redirectUri = oauth.redirectUri;
+    validateCodexCallback(oauth.callbackUrl, { redirectUri, expectedState: oauth.state });
     return {
       callbackUrl: oauth.callbackUrl,
       codeVerifier: oauth.codeVerifier,
       state: oauth.state,
+      redirectUri,
       workspaceId: oauth.workspaceId || null,
     };
   }
@@ -1662,8 +1723,10 @@ async function finishCodexOauth(client, options, initial, oauth) {
     callbackUrl: continued?.finalUrl || current?.continue_url || null,
     codeVerifier: oauth.codeVerifier,
     state: oauth.state,
+    redirectUri: oauth.redirectUri || options.codexRedirectUri,
     workspaceId: workspaceId || null,
   };
+  validateCodexCallback(result.callbackUrl, { redirectUri: result.redirectUri, expectedState: result.state });
   await options.saveCheckpoint?.("callback_ready", { oauth: result });
   return result;
 }
@@ -1816,16 +1879,14 @@ async function buildSub2apiOauthExport({
   codeVerifier,
   clientId,
   redirectUri,
+  expectedState,
   accountName,
   concurrency,
   priority,
   rateMultiplier,
   transport,
-  cookie,
 }) {
-  const callback = new URL(callbackUrl);
-  const code = callback.searchParams.get("code");
-  if (!code) throw new Error("Codex callback URL does not contain OAuth code.");
+  const code = validateCodexCallback(callbackUrl, { redirectUri, expectedState });
 
   const tokenSet = await exchangeOAuthCode({
     authBase,
@@ -1834,7 +1895,6 @@ async function buildSub2apiOauthExport({
     codeVerifier,
     redirectUri,
     transport,
-    cookie,
   });
 
   const claims = decodeJwtPayload(tokenSet.id_token);
@@ -1885,38 +1945,60 @@ async function buildSub2apiOauthExport({
   };
 }
 
-async function exchangeOAuthCode({ authBase, clientId, code, codeVerifier, redirectUri, transport, cookie }) {
-  const res = await (transport ? transport.fetch(`${authBase}/oauth/token`, {
+function validateCodexCallback(callbackUrl, { redirectUri, expectedState }) {
+  const callback = new URL(callbackUrl);
+  const expected = new URL(redirectUri);
+  if (callback.origin !== expected.origin || callback.pathname !== expected.pathname
+      || callback.username || callback.password || callback.hash) {
+    throw new Error("OAUTH_CALLBACK_INVALID: Unexpected OAuth callback endpoint.");
+  }
+  const states = callback.searchParams.getAll("state");
+  const actual = Buffer.from(states[0] || "");
+  const wanted = Buffer.from(expectedState || "");
+  if (states.length !== 1 || !wanted.length || actual.length !== wanted.length
+      || !crypto.timingSafeEqual(actual, wanted)) {
+    throw new Error("OAUTH_STATE_MISMATCH: OAuth callback state did not match this login.");
+  }
+  if (callback.searchParams.has("error")) {
+    throw new Error("OAUTH_AUTHORIZATION_REJECTED: Authorization was not granted.");
+  }
+  const codes = callback.searchParams.getAll("code");
+  if (codes.length !== 1 || !codes[0]) throw new Error("OAUTH_CODE_MISSING: Missing OAuth authorization code.");
+  return codes[0];
+}
+
+async function postOAuthToken(authBase, transport, body) {
+  const options = {
     method: "POST",
     headers: {
       accept: "application/json",
-      "content-type": "application/x-www-form-urlencoded",
-      ...browserHeadersForTransport(transport),
-      ...(cookie ? { cookie } : {}),
+      "content-type": body instanceof URLSearchParams ? "application/x-www-form-urlencoded" : "application/json",
+      "user-agent": "toSub2",
     },
-    body: new URLSearchParams({
-      grant_type: "authorization_code",
-      client_id: clientId,
-      code,
-      redirect_uri: redirectUri,
-      code_verifier: codeVerifier,
-    }),
+    body: body instanceof URLSearchParams ? body : JSON.stringify(body),
+    redirect: "error",
+    signal: AbortSignal.timeout(DEFAULT_TIMEOUT_MS),
     timeoutMs: DEFAULT_TIMEOUT_MS,
-    retryRiskControl: true,
-  }) : fetch(`${authBase}/oauth/token`, {
-    method: "POST",
-    headers: {
-      accept: "application/json",
-      "content-type": "application/x-www-form-urlencoded",
-      ...browserHeadersForTransport(transport),
-    },
-    body: new URLSearchParams({
-      grant_type: "authorization_code",
-      client_id: clientId,
-      code,
-      redirect_uri: redirectUri,
-      code_verifier: codeVerifier,
-    }),
+    requestKind: "oauth",
+    retryRiskControl: false,
+  };
+  // A one-time authorization code or rotated refresh token must never be replayed.
+  const response = transport
+    ? await transport.fetch(`${authBase}/oauth/token`, options)
+    : await fetch(`${authBase}/oauth/token`, options);
+  if (response.status >= 300 && response.status < 400) {
+    throw new Error("OAUTH_TOKEN_REDIRECT: Token endpoint redirects are not allowed.");
+  }
+  return response;
+}
+
+async function exchangeOAuthCode({ authBase, clientId, code, codeVerifier, redirectUri, transport }) {
+  const res = await postOAuthToken(authBase, transport, new URLSearchParams({
+    grant_type: "authorization_code",
+    client_id: clientId,
+    code,
+    redirect_uri: redirectUri,
+    code_verifier: codeVerifier,
   }));
   const text = await res.text();
   let data;
@@ -1990,33 +2072,11 @@ async function refreshSub2apiOauthExport({ authBase, sourcePath, targetPath, fal
 }
 
 async function refreshOAuthToken({ authBase, clientId, refreshToken, transport }) {
-  const res = await (transport ? transport.fetch(`${authBase}/oauth/token`, {
-    method: "POST",
-    headers: {
-      accept: "application/json",
-      "content-type": "application/x-www-form-urlencoded",
-      ...browserHeadersForTransport(transport),
-    },
-    body: new URLSearchParams({
-      grant_type: "refresh_token",
-      client_id: clientId,
-      refresh_token: refreshToken,
-    }),
-    timeoutMs: DEFAULT_TIMEOUT_MS,
-    retryRiskControl: true,
-  }) : fetch(`${authBase}/oauth/token`, {
-    method: "POST",
-    headers: {
-      accept: "application/json",
-      "content-type": "application/x-www-form-urlencoded",
-      ...browserHeadersForTransport(transport),
-    },
-    body: new URLSearchParams({
-      grant_type: "refresh_token",
-      client_id: clientId,
-      refresh_token: refreshToken,
-    }),
-  }));
+  const res = await postOAuthToken(authBase, transport, {
+    grant_type: "refresh_token",
+    client_id: clientId,
+    refresh_token: refreshToken,
+  });
   const text = await res.text();
   let data;
   try {
@@ -2243,6 +2303,7 @@ function parseSetCookie(line, requestUrl) {
     name: nameValue.slice(0, splitAt),
     value: nameValue.slice(splitAt + 1),
     domain: target.hostname,
+    hostOnly: true,
     path: "/",
     secure: false,
     expires: null,
@@ -2251,7 +2312,12 @@ function parseSetCookie(line, requestUrl) {
     const [rawKey, ...rawValue] = attr.split("=");
     const key = rawKey.toLowerCase();
     const value = rawValue.join("=");
-    if (key === "domain" && value) cookie.domain = value.replace(/^\./, "").toLowerCase();
+    if (key === "domain" && value) {
+      const domain = value.replace(/^\./, "").toLowerCase();
+      if (target.hostname !== domain && !target.hostname.endsWith(`.${domain}`)) return null;
+      cookie.domain = domain;
+      cookie.hostOnly = false;
+    }
     if (key === "path" && value) cookie.path = value;
     if (key === "secure") cookie.secure = true;
     if (key === "expires" && value) {
@@ -2269,8 +2335,11 @@ function parseSetCookie(line, requestUrl) {
 function cookieMatches(cookie, target) {
   const domain = cookie.domain.toLowerCase();
   const host = target.hostname.toLowerCase();
-  const domainOk = host === domain || host.endsWith(`.${domain}`);
-  const pathOk = target.pathname.startsWith(cookie.path || "/");
+  const domainOk = host === domain || (!cookie.hostOnly && host.endsWith(`.${domain}`));
+  const cookiePath = cookie.path || "/";
+  const pathOk = target.pathname === cookiePath || (
+    target.pathname.startsWith(cookiePath) && (cookiePath.endsWith("/") || target.pathname[cookiePath.length] === "/")
+  );
   const secureOk = !cookie.secure || target.protocol === "https:";
   return domainOk && pathOk && secureOk;
 }
@@ -2444,6 +2513,16 @@ function parseArgs(argv) {
     else if (item.startsWith("--codex-redirect-uri=")) {
       args.codexRedirectUri = item.slice("--codex-redirect-uri=".length);
     } else if (item === "--codex-redirect-uri") args.codexRedirectUri = argv[++i];
+    else if (item.startsWith("--codex-originator=")) args.codexOriginator = item.slice("--codex-originator=".length);
+    else if (item === "--codex-originator") args.codexOriginator = argv[++i];
+    else if (item.startsWith("--allowed-workspace-ids=")) args.allowedWorkspaceIds = item.slice("--allowed-workspace-ids=".length).split(",").filter(Boolean);
+    else if (item === "--allowed-workspace-ids") args.allowedWorkspaceIds = String(argv[++i] || "").split(",").filter(Boolean);
+    else if (item.startsWith("--current-workspace-id=")) args.currentWorkspaceId = item.slice("--current-workspace-id=".length);
+    else if (item === "--current-workspace-id") args.currentWorkspaceId = argv[++i];
+    else if (item.startsWith("--codex-login-hint=")) args.codexLoginHint = item.slice("--codex-login-hint=".length);
+    else if (item === "--codex-login-hint") args.codexLoginHint = argv[++i];
+    else if (item.startsWith("--codex-connection=")) args.codexConnection = item.slice("--codex-connection=".length);
+    else if (item === "--codex-connection") args.codexConnection = argv[++i];
     else throw new Error(`Unknown argument: ${item}`);
   }
   return args;
@@ -2564,6 +2643,11 @@ Options:
   --auth-base <url>               Default: ${DEFAULT_AUTH_BASE}
   --codex-client-id <id>          Default: ${DEFAULT_CODEX_CLIENT_ID}
   --codex-redirect-uri <url>      Default: ${DEFAULT_CODEX_REDIRECT_URI}
+  --codex-originator <name>       Default: ${DEFAULT_CODEX_ORIGINATOR}; CODEX_INTERNAL_ORIGINATOR_OVERRIDE takes precedence.
+  --allowed-workspace-ids <ids>   Optional comma-separated workspace allowlist.
+  --current-workspace-id <id>     Optional workspace login context.
+  --codex-login-hint <email>      Optional login hint when current workspace is set.
+  --codex-connection <name>       Optional connection when current workspace is set.
   --verbose                       Print HTTP request status lines.
   --debug-auth                    Print auth cookie/page state diagnostics.
 
@@ -2577,7 +2661,7 @@ Notes:
 `);
 }
 
-run().catch((error) => {
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) run().catch((error) => {
   if (isProxyRiskControlError(error)) {
     console.error(`[proxy-risk-retry] ${String(error.message || "Proxy security check").slice(0, 320)}`);
   } else {
@@ -2585,6 +2669,12 @@ run().catch((error) => {
   }
   process.exitCode = 1;
 });
+
+export {
+  CookieJar, ProtocolClient, browserRequestContext, runCodexOauth, resumeCodexOauth,
+  validateCodexCallback, exchangeOAuthCode, refreshOAuthToken,
+  DEFAULT_CODEX_CLIENT_ID, DEFAULT_CODEX_REDIRECT_URI, CODEX_OAUTH_SCOPE,
+};
 
 function isProxyRiskControlError(error) {
   return /PROXY_RISK_CONTROL|PROXY_CONNECTION_RETRY/i.test(String(error?.message || ""));

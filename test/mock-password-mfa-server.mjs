@@ -17,6 +17,7 @@ let chatgptWorkspaceSelected = false;
 let chatgptLoginComplete = false;
 let workspaceSelectionCount = 0;
 let selectedEmail = "mfa-test@example.com";
+let oauthCallback = "";
 let totpEnabled = false;
 let passwordVerifySentinelCount = 0;
 let replacementTotpEnabled = true;
@@ -208,6 +209,10 @@ const server = http.createServer(async (req, res) => {
     return redirect(res, `${base}/`);
   }
   if (req.method === "GET" && url.pathname === "/oauth/authorize") {
+    const callback = new URL(url.searchParams.get("redirect_uri"));
+    callback.searchParams.set("state", url.searchParams.get("state"));
+    callback.searchParams.set("code", "mock-code");
+    oauthCallback = callback.href;
     return redirect(res, `${base}${chatgptLoginComplete ? "/choose-an-account" : "/log-in"}`);
   }
   if (req.method === "GET" && url.pathname === "/log-in") {
@@ -219,7 +224,7 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "POST" && url.pathname === "/api/accounts/session/select") {
     if (selectedEmail === "direct-codex-callback@example.com") {
       return sendJson(res, 200, {
-        continue_url: "http://localhost:1455/auth/callback?code=mock-code&state=mock-state",
+        continue_url: oauthCallback,
         page: { type: "external_url" },
       });
     }
@@ -246,7 +251,7 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 400, { error: { message: "unexpected Codex workspace" } });
     }
     workspaceSelectionCount += 1;
-    return sendJson(res, 200, { continue_url: "http://localhost:1455/auth/callback?code=mock-code&state=mock-state" });
+    return sendJson(res, 200, { continue_url: oauthCallback });
   }
   if (req.method === "POST" && url.pathname === "/oauth/token") {
     const idTokenPayload = Buffer.from(JSON.stringify({

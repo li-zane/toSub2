@@ -42,6 +42,7 @@ def write_message(payload):
 class Worker:
     def __init__(self):
         self.session = None
+        self.oauth_session = None
         self.proxy = None
         self.impersonate = "chrome146"
         self.verify_tls = True
@@ -55,6 +56,9 @@ class Worker:
                 f"({IMPORT_ERROR})"
             )
         self.close_sentinel()
+        if self.oauth_session is not None:
+            self.oauth_session.close()
+            self.oauth_session = None
         if self.session is not None:
             self.session.close()
             self.session = None
@@ -209,6 +213,7 @@ class Worker:
         return "impersonat" in message.lower() and "not supported" in message.lower()
 
     def _request_with_profile_fallback(self, method, url, headers, body_bytes, timeout_ms):
+        headers = self._coherent_browser_headers(headers)
         try:
             return self.session.request(
                 method,
@@ -223,6 +228,7 @@ class Worker:
                 raise
 
             original_profile = self.impersonate
+            saved_cookies = list(getattr(getattr(self.session, "cookies", None), "jar", []))
             last_error = error
             for profile in self.fallback_profiles:
                 if profile == original_profile:
@@ -234,6 +240,9 @@ class Worker:
                         allow_fallback=False,
                         verify_tls=self.verify_tls,
                     )
+                    for cookie in saved_cookies:
+                        self.session.cookies.jar.set_cookie(cookie)
+                    headers = self._coherent_browser_headers(headers)
                     response = self.session.request(
                         method,
                         url,
@@ -252,6 +261,53 @@ class Worker:
                         raise
             raise last_error
 
+    def _coherent_browser_headers(self, headers):
+        """Keep explicit UA/Client Hints in sync after an actual profile fallback."""
+        result = {str(key).lower(): str(value) for key, value in headers.items()}
+        major = re.match(r"chrome(\d+)", self.impersonate)
+        if not major:
+            return result
+        version = major.group(1)
+        uses_macos = int(version) >= 119
+        if "user-agent" in result:
+            result["user-agent"] = re.sub(r"Chrome/\d+", f"Chrome/{version}", result["user-agent"])
+            platform = "Macintosh; Intel Mac OS X 10_15_7" if uses_macos else "Windows NT 10.0; Win64; x64"
+            result["user-agent"] = re.sub(r"\((?:Macintosh;[^)]*|Windows NT[^)]*)\)", f"({platform})", result["user-agent"])
+        if "sec-ch-ua-platform" in result:
+            result["sec-ch-ua-platform"] = '"macOS"' if uses_macos else '"Windows"'
+        if "sec-ch-ua" in result:
+            result["sec-ch-ua"] = re.sub(
+                r'("(?:Chromium|Google Chrome)";v=")\d+',
+                lambda match: match.group(1) + version,
+                result["sec-ch-ua"],
+            )
+        return result
+
+    def _request_oauth(self, method, url, headers, body_bytes, timeout_ms):
+        # Token exchange is a native HTTP request, not browser navigation. Never
+        # reuse the web session's cookies, browser headers or impersonation.
+        if self.oauth_session is None:
+            session_options = {"default_headers": False}
+            if self._uses_local_http_proxy():
+                session_options["proxies"] = {"http": self.proxy, "https": self.proxy}
+            else:
+                session_options["proxy"] = self.proxy
+            if not self.verify_tls:
+                session_options["verify"] = False
+            self.oauth_session = requests.Session(**session_options)
+        allowed = {"accept", "content-type", "user-agent"}
+        clean_headers = {key.lower(): value for key, value in headers.items() if key.lower() in allowed}
+        # The session can receive Set-Cookie; it must not persist token-endpoint cookies.
+        self.oauth_session.cookies.clear()
+        try:
+            return self.oauth_session.request(
+                method, url, headers=clean_headers, data=body_bytes,
+                timeout=timeout_ms / 1000, allow_redirects=False,
+                default_headers=False, discard_cookies=True,
+            )
+        finally:
+            self.oauth_session.cookies.clear()
+
     def request(self, message):
         if self.session is None:
             self.configure(message.get("proxy"), message.get("impersonate"))
@@ -266,12 +322,14 @@ class Worker:
         body = message.get("body")
         body_bytes = base64.b64decode(body) if body else None
         timeout_ms = max(1, int(message.get("timeoutMs") or 30000))
-        response = self._request_with_profile_fallback(
-            method, url, headers, body_bytes, timeout_ms
-        )
+        is_oauth = message.get("requestKind") == "oauth"
+        if is_oauth:
+            response = self._request_oauth(method, url, headers, body_bytes, timeout_ms)
+        else:
+            response = self._request_with_profile_fallback(method, url, headers, body_bytes, timeout_ms)
         header_items = list(response.headers.multi_items()) if hasattr(response.headers, "multi_items") else list(response.headers.items())
         cookies = []
-        cookie_jar = getattr(self.session.cookies, "jar", None)
+        cookie_jar = None if is_oauth else getattr(self.session.cookies, "jar", None)
         if cookie_jar is not None:
             for cookie in cookie_jar:
                 cookies.append({
@@ -280,6 +338,7 @@ class Worker:
                     "domain": cookie.domain.lstrip("."),
                     "path": cookie.path or "/",
                     "secure": bool(cookie.secure),
+                    "hostOnly": not getattr(cookie, "domain_specified", cookie.domain.startswith(".")),
                     # JavaScript Date.now() and the Node cookie jar use milliseconds.
                     "expires": cookie.expires * 1000 if cookie.expires else None,
                 })
@@ -288,6 +347,7 @@ class Worker:
             "headers": [[str(name), str(value)] for name, value in header_items],
             "body": "" if message.get("discardBody") else base64.b64encode(response.content).decode("ascii"),
             "cookies": cookies,
+            "profile": self.impersonate,
         }
 
     def solve_cloudflare(self, message):
@@ -379,6 +439,9 @@ def main():
                 result = worker.generate_sentinel_tokens(message)
             elif operation == "close":
                 worker.close_sentinel()
+                for session in (worker.session, worker.oauth_session):
+                    if session is not None:
+                        session.close()
                 write_message({"id": request_id, "ok": True, "result": {"closed": True}})
                 return
             else:

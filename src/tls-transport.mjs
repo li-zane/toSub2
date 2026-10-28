@@ -183,7 +183,7 @@ export class TlsFingerprintTransport {
 
   async request(method, url, options = {}) {
     if (!this.enabled) {
-      const response = await fetch(url, options);
+      const response = await fetch(url, { ...options, method });
       return response;
     }
     if (Object.hasOwn(options, "proxy")) await this.configure(options.proxy || null);
@@ -200,6 +200,7 @@ export class TlsFingerprintTransport {
       body,
       timeoutMs: options.timeoutMs || DEFAULT_TIMEOUT_MS,
       discardBody: Boolean(options.discardBody),
+      requestKind: options.requestKind === "oauth" ? "oauth" : "browser",
     };
     let result;
     let retries = 0;
@@ -207,6 +208,12 @@ export class TlsFingerprintTransport {
     for (;;) {
       try {
         result = await this.send(request);
+        const actualProfile = String(result?.profile || "");
+        if (/^chrome\d+[a-z]?$/i.test(actualProfile)) {
+          this.profile = actualProfile;
+          this.identityProfile = actualProfile;
+          this.configuredProfile = actualProfile;
+        }
       } catch (error) {
         if (options.retryRiskControl && this.hasConfiguredProxy() && isRetryableProxyConnectionError(error)) {
           throw new Error(
@@ -219,6 +226,7 @@ export class TlsFingerprintTransport {
       const riskControl = isRiskControlResult(result);
       if (
         riskControl
+        && options.requestKind !== "oauth"
         && this.cloudflareSolver
         && !cloudflareSolveAttempted
         && isSupportedCloudflareChallenge(result)
@@ -238,7 +246,7 @@ export class TlsFingerprintTransport {
           console.log(`[cloudflare] 安全校验处理失败：${safeCloudflareError(error)}，继续执行代理兜底流程。`);
         }
       }
-      if (!options.retryRiskControl || !isRiskControlResult(result)) break;
+      if (options.requestKind === "oauth" || !options.retryRiskControl || !isRiskControlResult(result)) break;
       if (!this.hasConfiguredProxy() || retries >= this.sameProxyRiskRetries) {
         if (this.hasConfiguredProxy() && retries > 0) {
           console.log(`[proxy] 同一代理连续重试 ${retries} 次仍触发安全校验，准备更换代理会话。`);
@@ -253,6 +261,12 @@ export class TlsFingerprintTransport {
         `[proxy] 当前代理出口触发安全校验，保持同一代理重试 ${retries}/${this.sameProxyRiskRetries}。`,
       );
       if (this.sameProxyRiskRetryDelayMs > 0) await delay(this.sameProxyRiskRetryDelayMs);
+    }
+    const actualProfile = String(result?.profile || "");
+    if (/^chrome\d+[a-z]?$/i.test(actualProfile)) {
+      this.profile = actualProfile;
+      this.identityProfile = actualProfile;
+      this.configuredProfile = actualProfile;
     }
     const responseHeaders = new Headers();
     const rawSetCookie = [];

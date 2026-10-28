@@ -39,6 +39,7 @@ import {
   X,
 } from "lucide-react";
 import "./styles.css";
+import { logoutAccountSessions } from "./account-session-actions.mjs";
 
 const POLL_INTERVAL_MS = 900;
 const SUB2API_PIPELINE_TIMEOUT_MS = 15 * 60_000;
@@ -147,6 +148,8 @@ function App() {
   const [selectedJobIds, setSelectedJobIds] = useState(() => new Set());
   const [jobSelectionIndex, setJobSelectionIndex] = useState([]);
   const [batchAction, setBatchAction] = useState("");
+  const [sessionActionError, setSessionActionError] = useState("");
+  const logoutRunningRef = useRef(false);
   const [page, setPage] = useState(1);
   const [pagination, setPagination] = useState({ page: 1, pageSize: 20, total: 0, totalPages: 1 });
   const [stats, setStats] = useState({ active: 0, queued: 0, completed: 0 });
@@ -492,6 +495,8 @@ function App() {
   const forceReloginSelectedCount = selectedJobs.filter((job) => job.canForceRelogin).length;
   const canForceReloginSelected = selectedJobs.length > 0 && selectedJobs.length === selectedJobIds.size
     && forceReloginSelectedCount > 0;
+  const canLogoutSelected = selectedJobs.length > 0 && selectedJobs.length === selectedJobIds.size
+    && selectedJobs.some((job) => job.canLogoutAllSessions);
   const canUploadSelected = selectedJobs.length > 0 && downloadableSelectedCount > 0;
   const canRotateAndUploadSelected = selectedJobs.length > 0
     && selectedJobs.length === selectedJobIds.size
@@ -1331,6 +1336,40 @@ function App() {
     }
   }
 
+  async function logoutAllDevices(targetJobs, bulk = false) {
+    if (batchAction || logoutRunningRef.current || !token) return;
+    const eligible = targetJobs.filter((job) => job.canLogoutAllSessions);
+    if (!eligible.length) return;
+    const skipped = targetJobs.length - eligible.length;
+    const subject = bulk ? `选中的 ${eligible.length} 个账号` : `账号 ${eligible[0].email}`;
+    if (!window.confirm(`确定登出${subject}的所有设备和会话吗？当前会话也会失效，之后可能需要重新登录。${skipped ? `另有 ${skipped} 个账号正在运行或没有已保存的授权，将跳过。` : ""}`)) return;
+    logoutRunningRef.current = true;
+    setBatchAction(bulk ? "logout-all" : `logout-all:${eligible[0].id}`);
+    setSessionActionError("");
+    setError("");
+    setUploadNotice(`正在提交全部设备登出请求 0/${eligible.length}`);
+    try {
+      const results = await logoutAccountSessions(eligible,
+        (url, options) => apiFetch(token, url, options),
+        (completed, total) => setUploadNotice(`正在提交全部设备登出请求 ${completed}/${total}`));
+      const succeeded = results.filter((result) => result.ok);
+      const failed = results.filter((result) => !result.ok);
+      setUploadNotice(`全部设备登出请求：成功 ${succeeded.length} 个，失败 ${failed.length} 个${skipped ? `，跳过 ${skipped} 个` : ""}。服务端可能需要几分钟完成传播。`);
+      if (bulk) {
+        const succeededIds = new Set(succeeded.map((result) => result.job.id));
+        setSelectedJobIds((current) => new Set([...current].filter((id) => !succeededIds.has(id))));
+      }
+      if (failed.length) {
+        setSessionActionError(`登出失败：${failed.slice(0, 5).map(({ job, error }) => `${job.email}：${error}`).join("；")}${failed.length > 5 ? `；另有 ${failed.length - 5} 个失败账号` : ""}。可稍后重试。`);
+      }
+    } catch (requestError) {
+      setSessionActionError(requestError.message);
+    } finally {
+      logoutRunningRef.current = false;
+      setBatchAction("");
+    }
+  }
+
   async function forceReloginSelected() {
     if (!canForceReloginSelected || batchAction) return;
     const skipped = selectedJobIds.size - forceReloginSelectedCount;
@@ -1638,6 +1677,13 @@ function App() {
           </section>
         </div>
 
+        {sessionActionError && (
+          <div className="global-error" role="alert">
+            <CircleAlert size={17} />
+            <span>{sessionActionError}</span>
+            <button type="button" onClick={() => setSessionActionError("")} title="关闭"><X size={16} /></button>
+          </div>
+        )}
         {error && (
           <div className="global-error" role="alert">
             <CircleAlert size={17} />
@@ -1716,6 +1762,12 @@ function App() {
                 <button type="button" className="relogin-button bulk-button" onClick={forceReloginSelected} disabled={!canForceReloginSelected || Boolean(batchAction)}>
                   {batchAction === "relogin" ? <LoaderCircle className="spin" size={16} /> : <LogIn size={16} />}
                   批量重新登录并授权
+                </button>
+              )}
+              {features.accountSessions && (
+                <button type="button" className="secondary-button bulk-button" onClick={() => logoutAllDevices(selectedJobs, true)} disabled={!canLogoutSelected || Boolean(batchAction)}>
+                  {batchAction === "logout-all" ? <LoaderCircle className="spin" size={16} /> : <LogOut size={16} />}
+                  登出所选账号所有设备
                 </button>
               )}
               {features.totpSetup && (
@@ -1888,6 +1940,8 @@ function App() {
                     onOpenRemark={() => setRemarkJob(job)}
                     sessionsAvailable={Boolean(features.accountSessions)}
                     onOpenSessions={() => setSessionJob(job)}
+                    onLogoutAllSessions={() => logoutAllDevices([job])}
+                    logoutAllBusy={batchAction === `logout-all:${job.id}`}
                     workspacesAvailable={Boolean(features.accountWorkspaces)}
                     onOpenWorkspaces={() => setWorkspaceJob(job)}
                     onOpenOperationDetail={(detail) => setOperationDetail({ email: job.email, ...detail })}
@@ -2747,7 +2801,7 @@ function OperationDetailDialog({ detail, onClose }) {
   );
 }
 
-function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggleSelected, onDelete, deleteAvailable, deleteDisabled, deleteBusy, selectionSupported, smsProviderAvailable, smsProvider, onUpload, sub2apiUploadAvailable, sub2apiToggleAvailable, sub2apiToggleBusy, onToggleSub2Api, sub2apiPriorityAvailable, sub2apiPriorityBusy, onUpdateSub2ApiPriority, totpSetupAvailable, passwordAddAvailable, forceReloginAvailable, accountProxyUrl, planTypeMapping, accountUsage, accountUsageAvailable, onRefreshUsage, credentialsAvailable, onOpenCredentials, remarksAvailable, onOpenRemark, sessionsAvailable, onOpenSessions, workspacesAvailable, onOpenWorkspaces, onOpenOperationDetail }) {
+function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggleSelected, onDelete, deleteAvailable, deleteDisabled, deleteBusy, selectionSupported, smsProviderAvailable, smsProvider, onUpload, sub2apiUploadAvailable, sub2apiToggleAvailable, sub2apiToggleBusy, onToggleSub2Api, sub2apiPriorityAvailable, sub2apiPriorityBusy, onUpdateSub2ApiPriority, totpSetupAvailable, passwordAddAvailable, forceReloginAvailable, accountProxyUrl, planTypeMapping, accountUsage, accountUsageAvailable, onRefreshUsage, credentialsAvailable, onOpenCredentials, remarksAvailable, onOpenRemark, sessionsAvailable, onOpenSessions, onLogoutAllSessions, logoutAllBusy, workspacesAvailable, onOpenWorkspaces, onOpenOperationDetail }) {
   const [value, setValue] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [priorityValue, setPriorityValue] = useState(() => job.sub2apiPriority === null || job.sub2apiPriority === undefined ? "" : String(job.sub2apiPriority));
@@ -3120,6 +3174,14 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
           {workspacesAvailable && job.canDownload && (
             <button type="button" className="icon-button" onClick={onOpenWorkspaces} disabled={submitting} title="查看并切换工作空间">
               <BriefcaseBusiness size={17} />
+            </button>
+          )}
+          {sessionsAvailable && (
+            <button type="button" className="icon-button danger" onClick={onLogoutAllSessions}
+              disabled={submitting || deleteDisabled || !job.canLogoutAllSessions}
+              title={job.canLogoutAllSessions ? "登出所有设备和会话（包括当前会话）" : "账号正在运行或没有已保存的授权，暂不能登出所有设备"}
+              aria-label="登出所有设备">
+              {logoutAllBusy ? <LoaderCircle className="spin" size={17} /> : <LogOut size={17} />}
             </button>
           )}
           {job.canDownload && (
@@ -3785,6 +3847,7 @@ function SessionDialog({ token, job, onClose, onError }) {
   }
 
   async function logoutAll() {
+    if (action || !job.canLogoutAllSessions) return;
     if (!window.confirm("确定登出该账号的所有设备和会话吗？当前会话也会失效，需要重新登录。")) return;
     setAction("all");
     setDialogError("");
@@ -3863,7 +3926,7 @@ function SessionDialog({ token, job, onClose, onError }) {
         {dialogError && <div className="dialog-error" role="alert"><CircleAlert size={15} />{dialogError}</div>}
         {notice && <div className="credential-notice" role="status"><Check size={15} />{notice}</div>}
         <div className="dialog-actions session-dialog-actions">
-          <button type="button" className="danger-button" onClick={logoutAll} disabled={loading || Boolean(action)}>
+          <button type="button" className="danger-button" onClick={logoutAll} disabled={loading || Boolean(action) || !job.canLogoutAllSessions}>
             {action === "all" ? <LoaderCircle className="spin" size={16} /> : <LogOut size={16} />}一键登出所有设备
           </button>
           <span className="dialog-actions-spacer" />

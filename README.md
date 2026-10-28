@@ -1,5 +1,7 @@
 # toSub2
 
+账号行的操作列提供“登出所有设备”按钮；勾选账号后，可使用“登出所选账号所有设备”。确认后会提交所选账号的全部设备与会话登出请求（包括当前会话），不会自动重新授权。批量操作最多并发 3 个请求，跳过正在运行或没有已保存授权的账号；成功项取消勾选，失败及跳过项保留以便重试，并显示成功、失败、跳过数量和失败原因。服务端可能需要几分钟完成登出传播，之后可能需要重新登录。
+
 QQ 交流群：`1085165735`
 
 [点击链接加入群聊【toSub2】](https://qm.qq.com/q/n40xuIClm8)
@@ -281,6 +283,16 @@ node src/protocol-login.mjs --email you@example.com --verbose
 ```bash
 node src/protocol-login.mjs --help
 ```
+
+### OAuth 参数与会话
+
+Codex OAuth 默认使用 `originator=codex_cli_rs`、回调地址 `http://127.0.0.1:1455/auth/callback`，以及 `openid profile email offline_access api.connectors.read api.connectors.invoke`。每次授权独立生成 PKCE 和 `state`；回调地址及 `state` 必须校验通过后才能兑换令牌。旧检查点沿用原回调地址。
+
+可通过 `--codex-originator`、`--allowed-workspace-ids`、`--current-workspace-id`、`--codex-login-hint`、`--codex-connection` 配置登录上下文。`CODEX_INTERNAL_ORIGINATOR_OVERRIDE` 优先于命令行 originator；只有配置当前工作区才发送登录提示和 connection。
+
+网页登录维护任务内 Cookie、来源及导航上下文；TLS 配置发生兼容性降级时同步浏览器版本信息。OAuth 令牌请求使用独立的原生 HTTP 会话和原代理配置，不发送网页 Cookie、Client Hints、Origin 或 Referer。授权码交换使用表单，刷新使用 JSON；令牌请求不自动重放，也不跟随重定向。协议参数对齐不代表本项目的 HTTP/TLS 实现与官方 Rust 客户端或真实浏览器完全相同。
+
+验证授权与会话回归：`node test/oauth-flow.mjs`。Python 依赖版本见 `requirements.txt`；可用 `TOSUB2_PYTHON` 指向安装该版本的解释器。
 
 ## 安全说明
 

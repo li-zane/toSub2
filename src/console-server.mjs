@@ -954,7 +954,12 @@ async function handleApi(req, res, requestUrl) {
   if (req.method === "POST" && action === "sessions/logout-all") {
     let result;
     try {
-      result = await withEmailJobLock(job.email, () => revokeAllAccountSessions(job));
+      result = await withEmailJobLock(job.email, () => {
+        if (!canLogoutAllSessions(job)) {
+          throw httpError(409, "账号正在运行或没有已保存的授权，暂不能登出所有设备");
+        }
+        return revokeAllAccountSessions(job);
+      });
     } catch (error) {
       throw sessionApiError(error);
     }
@@ -5455,6 +5460,7 @@ function publicJob(job) {
     canResume: job.status === "resume_available",
     canRegenerate: job.status === "completed" && job.resultSaved,
     canForceRelogin: canForceRelogin(job),
+    canLogoutAllSessions: canLogoutAllSessions(job),
     canSetupTotp: canSetupTotp(job),
     canReplaceTotp: canReplaceTotp(job),
     canAddPassword: canAddPassword(job),
@@ -5693,10 +5699,15 @@ function publicSelectionJob(job) {
     canRetry: ["failed", "mfa_failed", "canceled", "reauth_required", "resume_available"].includes(job.status),
     canRegenerate: job.status === "completed" && job.resultSaved,
     canForceRelogin: canForceRelogin(job),
+    canLogoutAllSessions: canLogoutAllSessions(job),
     canSetupTotp: canSetupTotp(job),
     canReplaceTotp: canReplaceTotp(job),
     canAddPassword: canAddPassword(job),
   };
+}
+
+function canLogoutAllSessions(job) {
+  return Boolean(job.resultSaved) && canForceRelogin(job);
 }
 
 function canForceRelogin(job) {

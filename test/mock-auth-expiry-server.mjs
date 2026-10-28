@@ -45,7 +45,7 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "GET" && url.pathname === "/oauth/authorize") {
     codexAuthorizeCount += 1;
     if (codexAuthorizeCount === 1) return redirect(res, `${publicBase}/choose-an-account`);
-    const callback = new URL("http://localhost:1455/auth/callback");
+    const callback = new URL(url.searchParams.get("redirect_uri"));
     callback.searchParams.set("code", "mock-authorization-code");
     callback.searchParams.set("state", url.searchParams.get("state") || "mock-state");
     return redirect(res, callback.toString());
