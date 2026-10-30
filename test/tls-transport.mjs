@@ -502,6 +502,7 @@ function testProfileProbeWorker() {
   const workerPath = fileURLToPath(new URL("../src/tls_transport.py", import.meta.url));
   const script = String.raw`
 import importlib.util
+import re
 import sys
 
 spec = importlib.util.spec_from_file_location("tosub2_tls_transport", sys.argv[1])
@@ -556,7 +557,12 @@ bounded = module.Worker().probe_profiles(
 assert bounded == {"profile": "chrome142", "attempts": 4}, bounded
 assert FakeRequests.attempts == ["chrome146", "chrome142", "chrome141", "chrome140"]
 profiles = worker._supported_chrome_profiles()
-assert profiles[0] == "chrome146", profiles
+profile_versions = []
+for profile in profiles:
+    match = re.fullmatch(r"chrome(\d+)([a-z]?)", profile)
+    assert match, profile
+    profile_versions.append((int(match.group(1)), match.group(2)))
+assert profile_versions == sorted(profile_versions, reverse=True), profiles
 assert "chrome142" in profiles
 assert "chrome131_android" not in profiles
 assert "chrome" not in profiles

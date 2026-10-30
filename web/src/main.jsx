@@ -285,7 +285,7 @@ function App() {
     try {
       const data = await apiFetch(token, "/api/account-proxy-settings", {
         method: "POST",
-        body: JSON.stringify({ proxyUrl: String(accountProxyUrl).trim(), allowDirectFallback, mode: accountProxyMode }),
+        body: JSON.stringify({ proxyUrl: String(accountProxyUrl).trim(), allowDirectFallback }),
       });
       setAccountProxyUrl(data.settings.proxyUrl || "");
       setAccountProxyMode(data.settings.mode === "sub2api" ? "sub2api" : "global");
@@ -603,14 +603,6 @@ function App() {
       throw requestError;
     } finally {
       setProxySettingsSaving(false);
-    }
-  }
-
-  async function setAccountProxyModeAndLoad(mode) {
-    setAccountProxyMode(mode);
-    setProxySettingsDirty(true);
-    if (mode === "sub2api") {
-      try { await refreshAccountProxyDistribution(); } catch {}
     }
   }
 
@@ -1735,14 +1727,10 @@ function App() {
               </a>
             </div>
             <div className="provider-card-body">
-              <div className="proxy-mode-control" role="group" aria-label="代理模式">
-                <button type="button" className={accountProxyMode === "global" ? "active" : ""}
-                  onClick={() => { setAccountProxyMode("global"); setProxySettingsDirty(true); }}
-                  disabled={!proxySettingsLoaded || proxySettingsSaving}>全局代理</button>
-                <button type="button" className={accountProxyMode === "sub2api" ? "active" : ""}
-                  onClick={() => { void setAccountProxyModeAndLoad("sub2api"); }}
-                  disabled={!proxySettingsLoaded || proxySettingsSaving}>Sub2API 代理</button>
-              </div>
+              <span className="provider-ready">
+                <Globe2 size={14} />
+                {accountProxyMode === "sub2api" ? "任务设置：Sub2API 出口 IP 均衡分配" : "任务设置：全局代理"}
+              </span>
               {accountProxyMode === "sub2api" ? (
                 <>
                   <span className={`provider-ready ${accountProxyDistribution.length ? "" : "incomplete"}`}>
@@ -1790,7 +1778,7 @@ function App() {
               )}
               <button type="button" className="secondary-button" onClick={saveAccountProxySettings}
                 disabled={!proxySettingsLoaded || proxySettingsSaving || !proxySettingsDirty}>
-                {proxySettingsSaving ? "保存中…" : "保存代理模式"}
+                {proxySettingsSaving ? "保存中…" : "保存代理配置"}
               </button>
               {proxySettingsError && <span role="alert">{proxySettingsError}</span>}
             </div>
@@ -2671,6 +2659,8 @@ function App() {
           onClose={() => setTaskSettingsOpen(false)}
           onSaved={(settings) => {
             setTaskSettings(settings);
+            setAccountProxyMode(settings.accountProxyMode === "sub2api" ? "sub2api" : "global");
+            setProxySettingsDirty(false);
             setTaskSettingsOpen(false);
             setUploadNotice(`任务设置已保存，最多同时运行 ${settings.maxActiveJobs} 条任务`);
           }}
@@ -3392,6 +3382,7 @@ function TaskSettingsDialog({ token, settings, availablePlanTypes, planTypeMappi
   const dialogRef = useRef(null);
   const [limit, setLimit] = useState(() => String(settings.maxActiveJobs));
   const [cooldownMinutes, setCooldownMinutes] = useState(() => String(settings.accountProxyCooldownMinutes || 60));
+  const [accountProxyMode, setAccountProxyMode] = useState(() => settings.accountProxyMode === "sub2api" ? "sub2api" : "global");
   const [codexAuthMode, setCodexAuthMode] = useState(() => settings.codexAuthMode || "local");
   const [autoRows, setAutoRows] = useState(() => taskAutoActionRows(settings.autoActions));
   const [saving, setSaving] = useState(false);
@@ -3450,7 +3441,7 @@ function TaskSettingsDialog({ token, settings, availablePlanTypes, planTypeMappi
     try {
       const data = await apiFetch(token, "/api/task-settings", {
         method: "POST",
-        body: JSON.stringify({ maxActiveJobs: value, autoActions, accountProxyCooldownMinutes: Number(cooldownMinutes), codexAuthMode }),
+        body: JSON.stringify({ maxActiveJobs: value, autoActions, accountProxyCooldownMinutes: Number(cooldownMinutes), accountProxyMode, codexAuthMode }),
       });
       onSaved(data.settings);
     } catch (requestError) {
@@ -3484,6 +3475,16 @@ function TaskSettingsDialog({ token, settings, availablePlanTypes, planTypeMappi
               aria-describedby="task-settings-description" aria-invalid={Boolean(error)} />
             <span>条</span>
           </div>
+        </label>
+        <label className="settings-field task-auth-mode-field" htmlFor="task-proxy-mode">
+          <span>账号代理分配</span>
+          <select id="task-proxy-mode" value={accountProxyMode} onChange={(event) => setAccountProxyMode(event.target.value)} disabled={saving}>
+            <option value="global">全局代理</option>
+            <option value="sub2api">Sub2API 均衡分配</option>
+          </select>
+          <small>{accountProxyMode === "sub2api"
+            ? "导入任务开始时按出口 IP 负载分配并绑定，登录、授权和号池同步沿用同一代理。需先在 Sub2API 设置中读取可用代理。"
+            : "所有任务使用代理 IP 配置中的全局代理；未配置时使用账号原代理或服务器出口。"}</small>
         </label>
         <label className="settings-field task-auth-mode-field" htmlFor="task-codex-auth-mode">
           <span>Codex 授权方式</span>
@@ -3553,7 +3554,7 @@ function TaskSettingsDialog({ token, settings, availablePlanTypes, planTypeMappi
         </section>
         {error && <div className="dialog-error" role="alert"><CircleAlert size={15} />{error}</div>}
         <div className="dialog-footer">
-          <button type="button" className="selection-text-button" onClick={() => { setLimit(String(settings.default)); setCooldownMinutes("60"); setCodexAuthMode("local"); }} disabled={saving}>恢复默认</button>
+          <button type="button" className="selection-text-button" onClick={() => { setLimit(String(settings.default)); setCooldownMinutes("60"); setAccountProxyMode("global"); setCodexAuthMode("local"); }} disabled={saving}>恢复默认</button>
           <span className="dialog-actions-spacer" />
           <button type="button" className="cancel-button" onClick={onClose} disabled={saving}>取消</button>
           <button type="submit" className="primary-button" disabled={saving}>

@@ -100,9 +100,9 @@ if (await fs.stat(${JSON.stringify(failLogin)}).then(() => true, () => false)) {
     config: { baseUrl: sub2Url, adminApiKey: "fixture-key", groupIds: [] },
   });
   assert.equal(response.status, 200, JSON.stringify(response.body));
-  response = await post("/api/account-proxy-settings", { proxyUrl: "", allowDirectFallback: false, mode: "sub2api" });
+  response = await post("/api/task-settings", { accountProxyMode: "sub2api" });
   assert.equal(response.status, 200, JSON.stringify(response.body));
-  assert.equal(response.body.settings.mode, "sub2api");
+  assert.equal(response.body.settings.accountProxyMode, "sub2api");
   response = await post("/api/task-settings", { codexAuthMode: "sub2api" });
   assert.equal(response.status, 200, JSON.stringify(response.body));
   assert.equal(response.body.settings.codexAuthMode, "sub2api");
@@ -208,9 +208,9 @@ if (await fs.stat(${JSON.stringify(failLogin)}).then(() => true, () => false)) {
   assert.equal((await readTrace()).length, traceCountBeforeRetry, "sync retry must not log in again");
 
   // Switching global mode and back must restore the saved account proxy URL.
-  response = await post("/api/account-proxy-settings", { proxyUrl: "http://global.invalid:8080", allowDirectFallback: true, mode: "global" });
+  response = await post("/api/task-settings", { accountProxyMode: "global" });
   assert.equal(response.status, 200);
-  response = await post("/api/account-proxy-settings", { proxyUrl: "http://global.invalid:8080", allowDirectFallback: true, mode: "sub2api" });
+  response = await post("/api/task-settings", { accountProxyMode: "sub2api" });
   assert.equal(response.status, 200);
 
   response = await post("/api/task-settings", { accountProxyCooldownMinutes: 1 });
@@ -263,6 +263,7 @@ if (await fs.stat(${JSON.stringify(failLogin)}).then(() => true, () => false)) {
 
   const setting = JSON.parse(await fs.readFile(path.join(output, "task-settings.json"), "utf8"));
   assert.equal(setting.accountProxyCooldownMinutes, 1);
+  assert.equal(setting.accountProxyMode, "sub2api", "proxy distribution mode should persist in global task settings");
   assert.equal(setting.codexAuthMode, "sub2api");
   assert.equal(traces.at(-1).authMode, "sub2api", "authorization source must persist after restart");
 

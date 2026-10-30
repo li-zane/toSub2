@@ -19,6 +19,10 @@ try {
   await start("");
   assert.equal((await readSettings()).maxActiveJobs, 4);
   assert.equal((await readSettings()).codexAuthMode, "local");
+  assert.equal((await readSettings()).accountProxyMode, "global");
+  assert.equal((await saveSettings({ accountProxyMode: "invalid" })).status, 400);
+  assert.equal((await saveSettings({ accountProxyMode: "sub2api" })).status, 409);
+  assert.equal((await readSettings()).accountProxyMode, "global");
   for (const mode of [null, "", "invalid", 1]) assert.equal((await saveSettings({ codexAuthMode: mode })).status, 400);
   assert.equal((await saveSettings({ codexAuthMode: "sub2api" })).status, 409);
   assert.equal((await readSettings()).codexAuthMode, "local");

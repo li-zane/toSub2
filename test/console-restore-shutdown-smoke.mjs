@@ -204,16 +204,20 @@ try {
     monitorRequestStarted,
     delay(3_000).then(() => { throw new Error("monitor request did not start"); }),
   ]);
-  const shutdownStartedAt = Date.now();
-  child.kill("SIGTERM");
-  const exit = await Promise.race([childExit, delay(10_000).then(() => null)]);
-  assert.ok(exit, "console did not exit after SIGTERM");
-  assert.equal(exit.code, 0, logs);
-  assert.ok(Date.now() - shutdownStartedAt < 5_000, "shutdown should abort the pending Sub2API monitor request");
-  const metadata = JSON.parse(await fs.readFile(path.join(outputRoot, created.job.id, "job-meta.json"), "utf8"));
-  assert.equal(metadata.status, "canceled");
-  assert.equal(metadata.prompt, "流程已取消");
-  console.log("console restore and graceful shutdown tests passed");
+  if (process.platform !== "win32") {
+    const shutdownStartedAt = Date.now();
+    child.kill("SIGTERM");
+    const exit = await Promise.race([childExit, delay(10_000).then(() => null)]);
+    assert.ok(exit, "console did not exit after SIGTERM");
+    assert.equal(exit.code, 0, logs);
+    assert.ok(Date.now() - shutdownStartedAt < 5_000, "shutdown should abort the pending Sub2API monitor request");
+    const metadata = JSON.parse(await fs.readFile(path.join(outputRoot, created.job.id, "job-meta.json"), "utf8"));
+    assert.equal(metadata.status, "canceled");
+    assert.equal(metadata.prompt, "流程已取消");
+    console.log("console restore and graceful shutdown tests passed");
+  } else {
+    console.log("console restore smoke passed (POSIX SIGTERM shutdown assertions skipped on Windows)");
+  }
 } finally {
   if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
   await Promise.race([childExit, delay(2_000)]);
