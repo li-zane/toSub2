@@ -50,6 +50,7 @@ export class TlsFingerprintTransport {
     profile = DEFAULT_PROFILE,
     verbose = false,
     maxProxySessionAttempts = 10,
+    rotateProxySessions = true,
     sameProxyRiskRetries = DEFAULT_SAME_PROXY_RISK_RETRIES,
     sameProxyRiskRetryDelayMs = DEFAULT_SAME_PROXY_RISK_RETRY_DELAY_MS,
     cloudflareSolver = true,
@@ -68,6 +69,7 @@ export class TlsFingerprintTransport {
     this.configuredProfile = null;
     this.closed = false;
     this.remainingProxySessionAttempts = normalizeProxyAttemptLimit(maxProxySessionAttempts);
+    this.rotateProxySessions = Boolean(rotateProxySessions);
     this.sameProxyRiskRetries = normalizeRetryLimit(sameProxyRiskRetries, DEFAULT_SAME_PROXY_RISK_RETRIES);
     this.sameProxyRiskRetryDelayMs = normalizeRetryLimit(
       sameProxyRiskRetryDelayMs,
@@ -127,7 +129,7 @@ export class TlsFingerprintTransport {
       return null;
     }
 
-    const canRotate = proxySupportsSessionRotation(template);
+    const canRotate = this.rotateProxySessions && proxySupportsSessionRotation(template);
     if (canRotate && this.remainingProxySessionAttempts <= 0) {
       throw new Error("PROXY_RISK_CONTROL: 代理会话检测额度已用尽");
     }

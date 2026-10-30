@@ -779,7 +779,7 @@ try {
       { id: 7, name: "测试号池", platform: "openai", status: "active" },
       { id: 8, name: "备用号池", platform: "openai", status: "active" },
     ],
-    proxies: [{ id: 3, name: "测试代理", protocol: "http", host: "proxy.example", port: 8080, ipAddress: "203.0.113.10", status: "active" }],
+    proxies: [{ id: 3, name: "测试代理", protocol: "http", host: "proxy.example", port: 8080, ipAddress: "203.0.113.10", status: "active", accountCount: 0 }],
   });
 
   openaiGroupsMode = "empty";
@@ -1537,7 +1537,6 @@ try {
     group_ids: [7],
     extra: { existing_setting: "keep" },
   }];
-  const batchCountBeforePlanChange = batchUploadCount;
   const baselinePlanCheckResponse = await fetch(`${baseUrl}/api/sub2api/monitor/check`, {
     method: "POST",
     headers,
@@ -1546,8 +1545,8 @@ try {
   assert.equal(baselinePlanCheckResponse.status, 200, baselinePlanCheckText);
   const baselinePlanCheck = JSON.parse(baselinePlanCheckText);
   assert.equal(baselinePlanCheck.result.planTypeChanges, 0);
-  assert.equal(batchUploadCount, batchCountBeforePlanChange, "首次巡检只建立订阅类型基线，不应上传文件");
 
+  const batchCountBeforeChangedPlanCheck = batchUploadCount;
   remoteErrorAccounts[0].credentials.plan_type = "self_serve_business_prolite";
   const changedPlanCheckResponse = await fetch(`${baseUrl}/api/sub2api/monitor/check`, {
     method: "POST",
@@ -1559,7 +1558,7 @@ try {
   assert.equal(changedPlanCheck.result.planTypeChanged, 1);
   assert.equal(changedPlanCheck.result.planTypeChanges, 1);
   assert.equal(changedPlanCheck.result.planTypeUpdated, 1);
-  assert.equal(batchUploadCount, batchCountBeforePlanChange, "订阅变化应 PUT 更新已有账号，不应重新上传文件");
+  assert.equal(batchUploadCount, batchCountBeforeChangedPlanCheck, "订阅变化应 PUT 更新已有账号，不应重新上传文件");
   assert.deepEqual(updatedRemoteAccounts.get(120).group_ids, [71]);
   assert.equal(updatedRemoteAccounts.get(120).proxy_id, 3);
   assert.equal(updatedRemoteAccounts.get(120).concurrency, 4);

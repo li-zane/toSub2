@@ -402,6 +402,7 @@ async function requestWithOAuth(job, method, endpoint, jsonBody = undefined) {
       enabled: true,
       profile: String(process.env.TOSUB2_TLS_PROFILE || DEFAULT_TLS_PROFILE).trim() || DEFAULT_TLS_PROFILE,
       maxProxySessionAttempts: process.env.CHATGPT_PROXY_MAX_ATTEMPTS || 10,
+      rotateProxySessions: !job?.fixedProxy,
       sameProxyRiskRetryDelayMs: process.env.CHATGPT_SAME_PROXY_RISK_RETRY_DELAY_MS,
     });
   try {

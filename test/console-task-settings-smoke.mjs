@@ -18,6 +18,15 @@ let logs = "";
 try {
   await start("");
   assert.equal((await readSettings()).maxActiveJobs, 4);
+  assert.equal((await readSettings()).codexAuthMode, "local");
+  for (const mode of [null, "", "invalid", 1]) assert.equal((await saveSettings({ codexAuthMode: mode })).status, 400);
+  assert.equal((await saveSettings({ codexAuthMode: "sub2api" })).status, 409);
+  assert.equal((await readSettings()).codexAuthMode, "local");
+  assert.equal((await readSettings()).accountProxyCooldownMinutes, 60);
+  assert.equal((await saveSettings({ accountProxyCooldownMinutes: 0 })).status, 400);
+  assert.equal((await saveSettings({ accountProxyCooldownMinutes: 43_201 })).status, 400);
+  assert.equal((await saveSettings({ accountProxyCooldownMinutes: 3 })).status, 200);
+  assert.equal((await readSettings()).accountProxyCooldownMinutes, 3);
   assert.equal((await fetch(`${baseUrl}/api/task-settings`)).status, 403);
   assert.equal((await fetch(`${baseUrl}/api/task-settings`, {
     method: "POST", headers: { "content-type": "application/json" }, body: '{"maxActiveJobs":20}',
@@ -49,7 +58,7 @@ try {
   // must recover rather than inheriting the rejected write promise.
   await fs.rename(settingsPath, `${settingsPath}.backup`);
   await fs.mkdir(settingsPath);
-  assert.equal((await save(8)).status, 500);
+  assert.equal((await saveSettings({ maxActiveJobs: 8, accountProxyCooldownMinutes: 3 })).status, 500);
   assert.equal((await readSettings()).maxActiveJobs, 2);
   await fs.rmdir(settingsPath);
   await fs.rename(`${settingsPath}.backup`, settingsPath);
@@ -63,6 +72,7 @@ try {
   await stop();
   await start("20");
   assert.equal((await readSettings()).maxActiveJobs, 3, "saved UI limit overrides environment on restart");
+  assert.equal((await readSettings()).accountProxyCooldownMinutes, 3);
   assert.equal((await pageData()).taskSettings.maxActiveJobs, 3);
   console.log("console task settings smoke passed: validation, live queue limits, write recovery, persistence");
 } catch (error) {
@@ -114,6 +124,7 @@ async function stop() {
 async function readSettings() { return (await (await fetch(`${baseUrl}/api/task-settings`, { headers })).json()).settings; }
 async function pageData() { return (await fetch(`${baseUrl}/api/jobs`, { headers })).json(); }
 function save(maxActiveJobs) { return fetch(`${baseUrl}/api/task-settings`, { method: "POST", headers, body: JSON.stringify({ maxActiveJobs }) }); }
+function saveSettings(settings) { return fetch(`${baseUrl}/api/task-settings`, { method: "POST", headers, body: JSON.stringify(settings) }); }
 async function cancel(id) { assert.equal((await fetch(`${baseUrl}/api/jobs/${id}/cancel`, { method: "POST", headers })).status, 200); }
 async function waitForCounts(active, queued) {
   const deadline = Date.now() + 10_000;

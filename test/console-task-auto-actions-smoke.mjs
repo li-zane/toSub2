@@ -56,6 +56,9 @@ try {
     maxActiveJobs: 6,
     proxyUrl: "",
     allowDirectFallback: false,
+    accountProxyMode: "global",
+    codexAuthMode: "local",
+    accountProxyCooldownMinutes: 60,
     autoActions: {
       self_serve_business_prolite: ["upload", "rotate-logout-reauthorize-upload"],
       SELF_SERVE_PRO: ["upload"],

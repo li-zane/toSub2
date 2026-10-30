@@ -31,6 +31,7 @@ import {
   RotateCcw,
   Send,
   Settings2,
+  Shuffle,
   ShieldCheck,
   Smartphone,
   Tags,
@@ -190,6 +191,8 @@ function App() {
   });
   const [uploadNotice, setUploadNotice] = useState("");
   const [accountProxyUrl, setAccountProxyUrl] = useState("");
+  const [accountProxyMode, setAccountProxyMode] = useState("global");
+  const [accountProxyDistribution, setAccountProxyDistribution] = useState([]);
   const [allowDirectFallback, setAllowDirectFallback] = useState(false);
   const [proxySettingsLoaded, setProxySettingsLoaded] = useState(false);
   const [proxySettingsDirty, setProxySettingsDirty] = useState(false);
@@ -250,6 +253,7 @@ function App() {
         if (stopped) return;
         if (!proxySettingsDirty) {
           setAccountProxyUrl(data.settings.proxyUrl || "");
+          setAccountProxyMode(data.settings.mode === "sub2api" ? "sub2api" : "global");
           setAllowDirectFallback(data.settings.allowDirectFallback === true);
         }
         setProxySettingsLoaded(true);
@@ -262,6 +266,18 @@ function App() {
     return () => { stopped = true; window.clearInterval(timer); };
   }, [token, proxySettingsDirty]);
 
+  useEffect(() => {
+    if (!token || accountProxyMode !== "sub2api" || !hasUsableSub2ApiSettings(sub2apiSettings)) return undefined;
+    let stopped = false;
+    const refresh = () => apiFetch(token, "/api/sub2api/options", {
+      method: "POST", body: JSON.stringify({ config: sub2apiSettings }),
+    }).then((data) => { if (!stopped) setAccountProxyDistribution(Array.isArray(data.proxies) ? data.proxies : []); })
+      .catch((error) => { if (!stopped) setProxySettingsError(error.message); });
+    void refresh();
+    const timer = window.setInterval(refresh, 30_000);
+    return () => { stopped = true; window.clearInterval(timer); };
+  }, [token, accountProxyMode, sub2apiSettings]);
+
   async function saveAccountProxySettings() {
     if (proxySettingsSaving) return;
     setProxySettingsSaving(true);
@@ -269,9 +285,10 @@ function App() {
     try {
       const data = await apiFetch(token, "/api/account-proxy-settings", {
         method: "POST",
-        body: JSON.stringify({ proxyUrl: String(accountProxyUrl).trim(), allowDirectFallback }),
+        body: JSON.stringify({ proxyUrl: String(accountProxyUrl).trim(), allowDirectFallback, mode: accountProxyMode }),
       });
       setAccountProxyUrl(data.settings.proxyUrl || "");
+      setAccountProxyMode(data.settings.mode === "sub2api" ? "sub2api" : "global");
       setAllowDirectFallback(data.settings.allowDirectFallback === true);
       setProxySettingsDirty(false);
       setProxySettingsLoaded(true);
@@ -497,6 +514,11 @@ function App() {
     && forceReloginSelectedCount > 0;
   const canLogoutSelected = selectedJobs.length > 0 && selectedJobs.length === selectedJobIds.size
     && selectedJobs.some((job) => job.canLogoutAllSessions);
+  const sessionEligibleSelectedCount = selectedJobs.filter((job) => job.canLogoutAllSessions && job.canForceRelogin).length;
+  const canCooldownSelected = selectedJobs.length > 0 && selectedJobs.length === selectedJobIds.size
+    && sessionEligibleSelectedCount > 0;
+  const canSwitchProxySelected = accountProxyMode === "sub2api" && !proxySettingsDirty && canCooldownSelected
+    && hasUsableSub2ApiSettings(sub2apiSettings);
   const canUploadSelected = selectedJobs.length > 0 && downloadableSelectedCount > 0;
   const canRotateAndUploadSelected = selectedJobs.length > 0
     && selectedJobs.length === selectedJobIds.size
@@ -556,6 +578,39 @@ function App() {
       setError(requestError.message);
     } finally {
       setTaskSettingsOpening(false);
+    }
+  }
+
+  async function refreshAccountProxyDistribution() {
+    if (!hasUsableSub2ApiSettings(sub2apiSettings)) {
+      const message = "请先配置 Sub2API 后端地址和管理员 API Key";
+      setProxySettingsError(message);
+      throw new Error(message);
+    }
+    setProxySettingsSaving(true);
+    setProxySettingsError("");
+    try {
+      const data = await apiFetch(token, "/api/sub2api/options", {
+        method: "POST",
+        body: JSON.stringify({ config: sub2apiSettings }),
+      });
+      const proxies = Array.isArray(data.proxies) ? data.proxies : [];
+      setAccountProxyDistribution(proxies);
+      setProxySettingsError("");
+      return proxies;
+    } catch (requestError) {
+      setProxySettingsError(requestError.message);
+      throw requestError;
+    } finally {
+      setProxySettingsSaving(false);
+    }
+  }
+
+  async function setAccountProxyModeAndLoad(mode) {
+    setAccountProxyMode(mode);
+    setProxySettingsDirty(true);
+    if (mode === "sub2api") {
+      try { await refreshAccountProxyDistribution(); } catch {}
     }
   }
 
@@ -1336,6 +1391,39 @@ function App() {
     }
   }
 
+  async function runSelectedPoolAction(action) {
+    if (!selectedJobIds.size || batchAction) return;
+    if (action === "switch-proxy" && (accountProxyMode !== "sub2api" || proxySettingsDirty)) {
+      setProxySettingsError("请先切换到 Sub2API 代理模式");
+      return;
+    }
+    const endpoint = action === "cooldown" ? "/api/jobs/cooldown-batch" : "/api/jobs/switch-proxy-batch";
+    const label = action === "cooldown" ? "一键冷却" : "一键切换 IP";
+    if (!window.confirm(action === "cooldown"
+      ? `确定登出选中账号的所有设备，并在任务设置的冷却时长后重新登录、授权和同步号池凭据吗？共 ${sessionEligibleSelectedCount} 个账号。`
+      : `确定为选中账号重新分配 Sub2API 代理，然后登出所有设备、重新登录授权并同步号池凭据吗？共 ${sessionEligibleSelectedCount} 个账号。`)) return;
+    setBatchAction(action);
+    setError("");
+    setUploadNotice(`${label}正在处理 ${sessionEligibleSelectedCount} 个账号`);
+    try {
+      const data = await apiFetch(token, endpoint, {
+        method: "POST",
+        body: JSON.stringify({ ids: [...selectedJobIds] }),
+      });
+      const failed = Array.isArray(data.failed) ? data.failed : [];
+      setUploadNotice(action === "cooldown"
+        ? `冷却已开始 ${data.started} 个账号，时长 ${data.cooldownMinutes} 分钟${failed.length ? `，失败 ${failed.length} 个` : ""}`
+        : `已启动切换 IP 并重新授权 ${data.started} 个账号${failed.length ? `，失败 ${failed.length} 个` : ""}`);
+      if (failed.length) setError(failed.slice(0, 5).map((item) => `${item.email}：${item.error}`).join("；"));
+      setSelectedJobIds(new Set());
+      void refreshSub2ApiAccountStatus(true).catch(() => {});
+    } catch (requestError) {
+      setError(`${label}失败：${requestError.message}`);
+    } finally {
+      setBatchAction("");
+    }
+  }
+
   async function logoutAllDevices(targetJobs, bulk = false) {
     if (batchAction || logoutRunningRef.current || !token) return;
     const eligible = targetJobs.filter((job) => job.canLogoutAllSessions);
@@ -1647,6 +1735,36 @@ function App() {
               </a>
             </div>
             <div className="provider-card-body">
+              <div className="proxy-mode-control" role="group" aria-label="代理模式">
+                <button type="button" className={accountProxyMode === "global" ? "active" : ""}
+                  onClick={() => { setAccountProxyMode("global"); setProxySettingsDirty(true); }}
+                  disabled={!proxySettingsLoaded || proxySettingsSaving}>全局代理</button>
+                <button type="button" className={accountProxyMode === "sub2api" ? "active" : ""}
+                  onClick={() => { void setAccountProxyModeAndLoad("sub2api"); }}
+                  disabled={!proxySettingsLoaded || proxySettingsSaving}>Sub2API 代理</button>
+              </div>
+              {accountProxyMode === "sub2api" ? (
+                <>
+                  <span className={`provider-ready ${accountProxyDistribution.length ? "" : "incomplete"}`}>
+                    {accountProxyDistribution.length ? <Check size={14} /> : <CircleAlert size={14} />}
+                    {accountProxyDistribution.length
+                      ? `读取 ${accountProxyDistribution.length} 个代理节点 / ${new Set(accountProxyDistribution.map((proxy) => proxy.ipAddress || proxy.host)).size} 个出口 IP；新账号按 IP 均衡分配，已有绑定保持不变`
+                      : "读取 Sub2API 代理以启用账号级分配"}
+                  </span>
+                  {accountProxyDistribution.length > 0 && (
+                    <div className="proxy-distribution" aria-label="代理 IP 账号分配">
+                      {accountProxyDistribution.map((proxy) => (
+                        <span key={proxy.id}>{proxy.name} · {proxy.ipAddress || `${proxy.host}:${proxy.port}`} · {proxy.accountCount || 0} 个账号</span>
+                      ))}
+                    </div>
+                  )}
+                  <button type="button" className="secondary-button" onClick={() => { void refreshAccountProxyDistribution().catch(() => {}); }}
+                    disabled={proxySettingsSaving || !token}>
+                    {proxySettingsSaving ? <LoaderCircle className="spin" size={15} /> : <RotateCcw size={15} />}读取代理
+                  </button>
+                </>
+              ) : (
+                <>
               <label className="provider-field account-proxy-field" title="支持 http://、https://、socks5:// 和 socks5h://；用户名中包含 -sid- 时会自动轮换会话编号">
                 <Globe2 size={15} aria-hidden="true" />
                 <input
@@ -1668,9 +1786,11 @@ function App() {
                   disabled={!proxySettingsLoaded || proxySettingsSaving} />
                 代理失败时允许回退本地出口 IP
               </label>
+                </>
+              )}
               <button type="button" className="secondary-button" onClick={saveAccountProxySettings}
                 disabled={!proxySettingsLoaded || proxySettingsSaving || !proxySettingsDirty}>
-                {proxySettingsSaving ? "保存中…" : "保存代理配置"}
+                {proxySettingsSaving ? "保存中…" : "保存代理模式"}
               </button>
               {proxySettingsError && <span role="alert">{proxySettingsError}</span>}
             </div>
@@ -1762,6 +1882,20 @@ function App() {
                 <button type="button" className="relogin-button bulk-button" onClick={forceReloginSelected} disabled={!canForceReloginSelected || Boolean(batchAction)}>
                   {batchAction === "relogin" ? <LoaderCircle className="spin" size={16} /> : <LogIn size={16} />}
                   批量重新登录并授权
+                </button>
+              )}
+              {features.accountSessions && (
+                <button type="button" className="secondary-button bulk-button" onClick={() => runSelectedPoolAction("cooldown")} disabled={!canCooldownSelected || Boolean(batchAction)}
+                  title={taskSettings?.accountProxyCooldownMinutes ? `冷却 ${taskSettings.accountProxyCooldownMinutes} 分钟后重新授权并同步号池` : "冷却后重新授权并同步号池"}>
+                  {batchAction === "cooldown" ? <LoaderCircle className="spin" size={16} /> : <LogOut size={16} />}
+                  一键冷却
+                </button>
+              )}
+              {features.accountSessions && (
+                <button type="button" className="secondary-button bulk-button" onClick={() => runSelectedPoolAction("switch-proxy")} disabled={!canSwitchProxySelected || Boolean(batchAction)}
+                  title="为账号重新分配 Sub2API IP，登出并重新授权后同步号池">
+                  {batchAction === "switch-proxy" ? <LoaderCircle className="spin" size={16} /> : <Shuffle size={16} />}
+                  一键切换 IP
                 </button>
               )}
               {features.accountSessions && (
@@ -3068,6 +3202,14 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
       </td>
       <td><StatusBadge status={job.status} /></td>
       <td className="step-cell">
+        {job.assignedProxyId && <span className="prompt-line">绑定代理 #{job.assignedProxyId}</span>}
+        {job.poolRefreshAction && <OperationDetailText
+          text={job.poolRefreshError
+            ? `号池凭据待更新：${job.poolRefreshError}${job.poolRefreshReady ? "；稍后自动重试同步" : "；请重试登录授权"}`
+            : job.poolRefreshDueAt
+              ? `冷却中，将于 ${new Date(job.poolRefreshDueAt).toLocaleString()} 重新登录并更新号池凭据`
+              : job.poolRefreshReady ? "正在更新号池凭据" : "正在重新登录授权，完成后更新号池凭据"}
+          className="prompt-line" onOpen={onOpenOperationDetail} />}
         {job.prompt && <OperationDetailText text={job.prompt} className="prompt-line" onOpen={onOpenOperationDetail} />}
         {job.lastError && <OperationDetailText text={extractResponseMessage(job.lastError)} className="row-error" onOpen={onOpenOperationDetail} />}
         {job.autoRepairBlocked && (
@@ -3249,6 +3391,8 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
 function TaskSettingsDialog({ token, settings, availablePlanTypes, planTypeMapping, returnFocusRef, onClose, onSaved }) {
   const dialogRef = useRef(null);
   const [limit, setLimit] = useState(() => String(settings.maxActiveJobs));
+  const [cooldownMinutes, setCooldownMinutes] = useState(() => String(settings.accountProxyCooldownMinutes || 60));
+  const [codexAuthMode, setCodexAuthMode] = useState(() => settings.codexAuthMode || "local");
   const [autoRows, setAutoRows] = useState(() => taskAutoActionRows(settings.autoActions));
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
@@ -3279,6 +3423,11 @@ function TaskSettingsDialog({ token, settings, availablePlanTypes, planTypeMappi
       setError(`同时运行任务数必须是 ${settings.min} 到 ${settings.max} 的整数`);
       return;
     }
+    const cooldownValue = Number(cooldownMinutes);
+    if (!Number.isInteger(cooldownValue) || cooldownValue < 1 || cooldownValue > 43_200) {
+      setError("冷却时长必须是 1 到 43200 分钟的整数");
+      return;
+    }
     const configuredRows = autoRows
       .map((row) => ({ planType: String(row.planType || "").trim(), actions: [...new Set(row.actions || [])] }))
       .filter((row) => row.planType || row.actions.length);
@@ -3301,7 +3450,7 @@ function TaskSettingsDialog({ token, settings, availablePlanTypes, planTypeMappi
     try {
       const data = await apiFetch(token, "/api/task-settings", {
         method: "POST",
-        body: JSON.stringify({ maxActiveJobs: value, autoActions }),
+        body: JSON.stringify({ maxActiveJobs: value, autoActions, accountProxyCooldownMinutes: Number(cooldownMinutes), codexAuthMode }),
       });
       onSaved(data.settings);
     } catch (requestError) {
@@ -3330,10 +3479,28 @@ function TaskSettingsDialog({ token, settings, availablePlanTypes, planTypeMappi
         <label className="settings-field task-limit-field" htmlFor="task-limit">
           <span>同时运行任务数</span>
           <div>
-            <input id="task-limit" type="number" min={settings.min} max={settings.max} step="1" required autoFocus
+          <input id="task-limit" type="number" min={settings.min} max={settings.max} step="1" required autoFocus
               value={limit} onChange={(event) => setLimit(event.target.value)} disabled={saving}
               aria-describedby="task-settings-description" aria-invalid={Boolean(error)} />
             <span>条</span>
+          </div>
+        </label>
+        <label className="settings-field task-auth-mode-field" htmlFor="task-codex-auth-mode">
+          <span>Codex 授权方式</span>
+          <select id="task-codex-auth-mode" value={codexAuthMode} onChange={(event) => setCodexAuthMode(event.target.value)} disabled={saving}>
+            <option value="local">本地授权（toSub2 生成链接和凭据）</option>
+            <option value="sub2api">Sub2API 授权（号池生成链接和凭据）</option>
+          </select>
+          <small>{codexAuthMode === "sub2api"
+            ? "使用已保存的 Sub2API 后端和管理员 Key，由号池生成授权链接、兑换和刷新令牌；toSub2 完成登录并保存凭据。需要先配置 Sub2API。"
+            : "由 toSub2 生成授权链接并直接兑换、刷新令牌，沿用当前授权流程。"}</small>
+        </label>
+        <label className="settings-field task-cooldown-field" htmlFor="task-cooldown-minutes">
+          <span>一键冷却时长</span>
+          <div>
+            <input id="task-cooldown-minutes" type="number" min="1" max="43200" step="1" required
+              value={cooldownMinutes} onChange={(event) => setCooldownMinutes(event.target.value)} disabled={saving} />
+            <span>分钟</span>
           </div>
         </label>
         <p id="task-settings-description" className="task-settings-help">可设置 {settings.min}–{settings.max} 条，默认 {settings.default} 条。超过上限的任务自动排队。并发越高，服务器和代理的负载越大。</p>
@@ -3386,7 +3553,7 @@ function TaskSettingsDialog({ token, settings, availablePlanTypes, planTypeMappi
         </section>
         {error && <div className="dialog-error" role="alert"><CircleAlert size={15} />{error}</div>}
         <div className="dialog-footer">
-          <button type="button" className="selection-text-button" onClick={() => setLimit(String(settings.default))} disabled={saving}>恢复默认</button>
+          <button type="button" className="selection-text-button" onClick={() => { setLimit(String(settings.default)); setCooldownMinutes("60"); setCodexAuthMode("local"); }} disabled={saving}>恢复默认</button>
           <span className="dialog-actions-spacer" />
           <button type="button" className="cancel-button" onClick={onClose} disabled={saving}>取消</button>
           <button type="submit" className="primary-button" disabled={saving}>
@@ -4479,6 +4646,7 @@ function operationLabel(type) {
     add_password: "添加密码",
     account_update: "更新账号资料",
     proxy_update: "更新代理 IP",
+    cooldown: "账号冷却",
   })[type] || "账号操作";
 }
 

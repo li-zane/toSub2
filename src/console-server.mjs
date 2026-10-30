@@ -26,6 +26,7 @@ import {
 } from "./mail-otp.mjs";
 import { createSmsProvider, publicSmsProviderDefinitions } from "./sms-providers.mjs";
 import { hasJobTotpKey, isReauthorizationComplete, isTotpRotationComplete } from "./task-auto-state.mjs";
+import { normalizeCodexAuthMode } from "./sub2api-oauth.mjs";
 import { DirectTlsProfileProbe, proxySupportsSessionRotation } from "./tls-transport.mjs";
 
 const DEFAULT_HOST = "127.0.0.1";
@@ -36,6 +37,7 @@ const DEFAULT_TLS_PROFILE = "chrome146";
 const MAX_BATCH_JOBS = 500;
 const TASK_AUTO_PIPELINE_TIMEOUT_MS = 15 * 60_000;
 const TASK_AUTO_POLL_INTERVAL_MS = 900;
+const MAX_ACCOUNT_PROXY_COOLDOWN_MINUTES = 43_200;
 const TASK_AUTO_ACTIONS = new Set(["upload", "rotate-logout-reauthorize-upload"]);
 const TASK_AUTO_ACTION_LABELS = {
   upload: "上传到 Sub2API",
@@ -149,7 +151,14 @@ let maxActiveJobs = initialMaxActiveJobs();
 let taskAutoActions = Object.create(null);
 let globalProxyUrl = null;
 let allowDirectFallback = false;
+let accountProxyMode = "global";
+let codexAuthMode = "local";
+let accountProxyCooldownMinutes = 60;
 let taskSettingsWritePromise = Promise.resolve();
+let accountProxyAssignmentPromise = Promise.resolve();
+const accountProxyReservations = new Map();
+const poolRefreshTimers = new Map();
+const poolRefreshOperations = new Set();
 let shutdownPromise = null;
 let sub2ApiSettingsConfig = null;
 let sub2ApiMonitorConfig = null;
@@ -215,6 +224,13 @@ await loadPlanTypeLabelMapping();
 await loadSub2ApiSettingsConfiguration();
 await loadSub2ApiMonitorConfiguration();
 await syncCompletedOutputs(true);
+for (const job of jobs.values()) {
+  if (job.poolRefreshAction) {
+    schedulePoolRefresh(job, job.poolRefreshAction === "cooldown" && job.poolRefreshDueAt
+      ? Math.max(0, Date.parse(job.poolRefreshDueAt) - Date.now())
+      : 0);
+  }
+}
 resumePendingTaskAutoActions();
 scheduleQueuedJobs();
 scheduleSub2ApiMonitor();
@@ -348,16 +364,45 @@ async function handleApi(req, res, requestUrl) {
       if (typeof body.proxyUrl !== "string" || typeof body.allowDirectFallback !== "boolean") {
         throw httpError(400, "代理地址必须是字符串，回退开关必须是布尔值");
       }
-      await saveTaskSettings({ proxyUrl: body.proxyUrl, allowDirectFallback: body.allowDirectFallback });
+      const previousMode = accountProxyMode;
+      const nextMode = normalizeAccountProxyMode(body.mode ?? accountProxyMode);
+      if (previousMode !== nextMode && [...jobs.values()].some((job) => isActive(job.status) || job.poolRefreshAction)) {
+        throw httpError(409, "请等待登录、冷却和号池同步任务完成后再切换代理模式");
+      }
+      let pendingAssignments = null;
+      if (nextMode === "sub2api") {
+        const config = sub2ApiSettingsConfig;
+        if (!config?.baseUrl || !config?.adminApiKey) throw httpError(409, "请先配置 Sub2API 后端和管理员 API Key");
+        const proxies = await listSub2ApiProxies(config);
+        if (!proxies.some((proxy) => proxy.url && !isSub2ApiProxyExpired(proxy))) throw httpError(409, "Sub2API 中没有可用且包含连接地址的代理");
+        if (previousMode !== "sub2api") {
+          const pending = listUniqueJobs();
+          if (pending.length) pendingAssignments = { pending, assignments: await assignSub2ApiProxies(pending) };
+        }
+      }
+      await saveTaskSettings({ proxyUrl: body.proxyUrl, allowDirectFallback: body.allowDirectFallback, accountProxyMode: nextMode });
+      for (const job of jobs.values()) job.fixedProxy = nextMode === "sub2api";
+      if (pendingAssignments) {
+        await Promise.all(pendingAssignments.pending.map((job) => withEmailJobLock(job.email, async () => {
+          const proxy = pendingAssignments.assignments.get(job.id);
+          if (!proxy) return;
+          job.assignedProxyId = proxy.id;
+          await updateJobProxy(job, proxy.url);
+          await saveJobMetadata(job);
+        })));
+      }
     } else if (req.method !== "GET") {
       throw httpError(405, "Method not allowed");
     }
-    sendJson(res, 200, { settings: { proxyUrl: globalProxyUrl || "", allowDirectFallback } });
+    sendJson(res, 200, { settings: { proxyUrl: globalProxyUrl || "", allowDirectFallback, mode: accountProxyMode } });
     return;
   }
 
   if (req.method === "POST" && requestUrl.pathname === "/api/task-settings") {
     const body = await readJson(req);
+    if (Object.hasOwn(body, "accountProxyMode") && body.accountProxyMode !== accountProxyMode) {
+      throw httpError(400, "请通过代理配置保存代理模式");
+    }
     const settings = await saveTaskSettings(body);
     sendJson(res, 200, { settings });
     return;
@@ -412,14 +457,25 @@ async function handleApi(req, res, requestUrl) {
     const result = await withEmailJobLock(email, async () => {
       const existing = findJobByEmail(email);
       if (existing) {
-        const proxyUrl = globalProxyUrl || requestedProxyUrl || existing.proxyUrl;
+        if (accountProxyMode === "sub2api" && !existing.assignedProxyId) {
+          const assignment = (await assignSub2ApiProxies([{ ...existing }])).get(existing.id);
+          if (assignment) {
+            existing.assignedProxyId = assignment.id;
+            existing.proxyUrl = assignment.url;
+            await saveStoredLoginCredentials(existing.email, existing);
+            await saveJobMetadata(existing);
+          }
+        }
+        const proxyUrl = effectiveAccountProxyUrl(existing.proxyUrl, globalProxyUrl, requestedProxyUrl);
         if (hasCredentialUpdate) await updateJobCredentials(existing, credentials, { proxyUrl, hasProxyUpdate: true });
         else if (hasProxyUpdate) await updateJobProxy(existing, proxyUrl);
         if (Object.hasOwn(body, "remark")) await updateJobRemark(existing, body.remark);
         return { job: existing, created: false, updated: hasCredentialUpdate || hasProxyUpdate || Object.hasOwn(body, "remark") };
       }
-      const proxyUrl = globalProxyUrl || requestedProxyUrl;
-      const job = await startJob(email, { ...credentials, ...(Object.hasOwn(body, "remark") ? { remark: normalizeAccountRemark(body.remark) } : {}) }, proxyUrl);
+      const assignedProxy = accountProxyMode === "sub2api" ? (await assignSub2ApiProxies([{ email }])).get(email.toLowerCase()) : null;
+      const proxyUrl = effectiveAccountProxyUrl(assignedProxy?.url, globalProxyUrl, requestedProxyUrl);
+      const job = await startJob(email, { ...credentials, assignedProxyId: assignedProxy?.id, ...(Object.hasOwn(body, "remark") ? { remark: normalizeAccountRemark(body.remark) } : {}) }, proxyUrl);
+      if (assignedProxy) await saveJobMetadata(job);
       if (Object.hasOwn(body, "remark")) await synchronizeSub2ApiRemark(job);
       return { job, created: true, updated: false };
     });
@@ -430,11 +486,24 @@ async function handleApi(req, res, requestUrl) {
   if (req.method === "POST" && requestUrl.pathname === "/api/jobs/batch") {
     const body = await readJson(req);
     const entries = parseBatchEntries(body.text, mailRequestConfig);
-    const proxyUrl = globalProxyUrl || (String(body.proxyUrl || "").trim() ? normalizeProxyUrl(body.proxyUrl) : null);
+    const requestedProxyUrl = String(body.proxyUrl || "").trim() ? normalizeProxyUrl(body.proxyUrl) : null;
+    const assignmentEntries = entries
+      .map((entry) => {
+        const existing = findJobByEmail(entry.email);
+        return existing ? { ...entry, id: existing.id, assignedProxyId: existing.assignedProxyId } : entry;
+      })
+      .filter((entry) => !entry.assignedProxyId);
+    const assignedProxies = accountProxyMode === "sub2api" ? await assignSub2ApiProxies(assignmentEntries) : new Map();
     const results = await Promise.all(entries.map((entry) => withEmailJobLock(entry.email, async () => {
       const existing = findJobByEmail(entry.email);
       if (existing) {
-        await updateJobCredentials(existing, entry, { proxyUrl: proxyUrl || existing.proxyUrl, hasProxyUpdate: true });
+        const proxyUrl = effectiveAccountProxyUrl(existing.proxyUrl, globalProxyUrl, requestedProxyUrl);
+        const assignedProxy = assignedProxies.get(existing.id);
+        if (assignedProxy) {
+          existing.assignedProxyId = assignedProxy.id;
+          existing.proxyUrl = assignedProxy.url;
+        }
+        await updateJobCredentials(existing, entry, { proxyUrl: assignedProxy?.url || proxyUrl || existing.proxyUrl, hasProxyUpdate: true });
         const sub2api = Object.hasOwn(entry, "remark") ? await updateJobRemark(existing, entry.remark) : null;
         existing.autoTaskEligible = true;
         existing.autoTaskActions = [];
@@ -445,7 +514,9 @@ async function handleApi(req, res, requestUrl) {
         if (existing.resultSaved && !isActive(existing.status)) await queueConfiguredTaskActions(existing);
         return { job: existing, updated: true, sub2api };
       }
-      const job = await startJob(entry.email, entry, proxyUrl);
+      const assignedProxy = assignedProxies.get(entry.email.toLowerCase()) || null;
+      const proxyUrl = effectiveAccountProxyUrl(assignedProxy?.url, globalProxyUrl, requestedProxyUrl);
+      const job = await startJob(entry.email, { ...entry, assignedProxyId: assignedProxy?.id }, proxyUrl);
       const sub2api = Object.hasOwn(entry, "remark") ? await synchronizeSub2ApiRemark(job) : null;
       job.autoTaskEligible = true;
       await saveJobMetadata(job);
@@ -521,6 +592,70 @@ async function handleApi(req, res, requestUrl) {
     return;
   }
 
+  if (req.method === "POST" && requestUrl.pathname === "/api/jobs/cooldown-batch") {
+    const body = await readJson(req);
+    const selected = resolveSelectedJobs(body.ids);
+    const eligible = selected.filter((job) => canLogoutAllSessions(job) && canForceRelogin(job));
+    if (!eligible.length) throw httpError(409, "选中的账号当前都不能冷却");
+    const delayMinutes = accountProxyCooldownMinutes;
+    const results = await Promise.allSettled(eligible.map((job) => withEmailJobLock(job.email, async () => {
+      if (!canLogoutAllSessions(job)) throw httpError(409, "账号状态已变化，请刷新后重试");
+      await refreshJobProxyBinding(job);
+      await revokeAllAccountSessions(job);
+      beginPoolRefresh(job, "cooldown", new Date(Date.now() + delayMinutes * 60_000).toISOString());
+      recordJobOperation(job, "cooldown");
+      appendJobLog(job, `[cooldown] 已登出全部设备，保持当前代理，${delayMinutes} 分钟后重新登录并同步号池凭据。\n`);
+      touch(job);
+      await saveJobMetadata(job);
+      schedulePoolRefresh(job, delayMinutes * 60_000);
+      return job;
+    })));
+    const started = results.filter((result) => result.status === "fulfilled").map((result) => result.value);
+    sendJson(res, 200, {
+      jobs: started.map(publicJob),
+      started: started.length,
+      skipped: selected.length - started.length,
+      failed: results.filter((result) => result.status === "rejected").map((result) => ({ email: eligible[results.indexOf(result)].email, error: String(result.reason?.message || result.reason).slice(0, 300) })),
+      cooldownMinutes: delayMinutes,
+    });
+    return;
+  }
+
+  if (req.method === "POST" && requestUrl.pathname === "/api/jobs/switch-proxy-batch") {
+    const selected = resolveSelectedJobs((await readJson(req)).ids);
+    const eligible = selected.filter((job) => canLogoutAllSessions(job) && canForceRelogin(job));
+    if (!eligible.length) throw httpError(409, "选中的账号当前都不能切换代理");
+    if (accountProxyMode !== "sub2api") throw httpError(409, "请先切换并保存 Sub2API 代理模式");
+    if (!sub2ApiSettingsConfig?.baseUrl || !sub2ApiSettingsConfig?.adminApiKey) throw httpError(409, "请先配置 Sub2API 后端和管理员 API Key");
+    const results = await Promise.allSettled(eligible.map((job) => withEmailJobLock(job.email, async () => {
+      if (!canLogoutAllSessions(job)) throw httpError(409, "账号状态已变化，请刷新后重试");
+      const proxy = (await assignSub2ApiProxies([job], { reassign: true })).get(job.id);
+      if (!proxy) throw httpError(409, `${job.email} 没有可用的切换代理`);
+      // Use the replacement for logout too, including after a restart without cached proxy credentials.
+      try {
+        await revokeAllAccountSessions({ ...job, proxyUrl: proxy.url, fixedProxy: true });
+      } catch (error) {
+        accountProxyReservations.delete(job.email.toLowerCase());
+        throw error;
+      }
+      job.fixedProxy = true;
+      job.assignedProxyId = proxy.id;
+      job.proxyUrl = proxy.url;
+      await saveStoredLoginCredentials(job.email, job);
+      await forceReloginJob(job, { proxyUrl: job.proxyUrl }, { poolRefreshAction: "switch-proxy" });
+      await saveJobMetadata(job);
+      return job;
+    })));
+    const started = results.filter((result) => result.status === "fulfilled").map((result) => result.value);
+    sendJson(res, 200, {
+      jobs: started.map(publicJob),
+      started: started.length,
+      skipped: selected.length - started.length,
+      failed: results.filter((result) => result.status === "rejected").map((result) => ({ email: eligible[results.indexOf(result)].email, error: String(result.reason?.message || result.reason).slice(0, 300) })),
+    });
+    return;
+  }
+
   if (req.method === "POST" && requestUrl.pathname === "/api/jobs/setup-2fa-batch") {
     const body = await readJson(req);
     const selected = resolveSelectedJobs(body.ids);
@@ -579,20 +714,32 @@ async function handleApi(req, res, requestUrl) {
       listSub2ApiTargetGroups(config),
       requestSub2Api(config, "/api/v1/admin/proxies/all"),
     ]);
-    const proxies = Array.isArray(proxyPayload) ? proxyPayload : Array.isArray(proxyPayload?.data) ? proxyPayload.data : [];
+    const listing = await listSub2ApiAccounts(config, { withMeta: true });
+    const proxyCounts = new Map();
+    const proxiesById = new Map(normalizeSub2ApiProxyList(proxyPayload).map((proxy) => [proxy.id, proxy]));
+    const countedEmails = new Set();
+    for (const account of listing.accounts) {
+      const email = sub2ApiAccountEmail(account);
+      if (email && countedEmails.has(email)) continue;
+      if (email) countedEmails.add(email);
+      const job = accountProxyMode === "sub2api" ? findJobByEmail(email) : null;
+      const proxy = proxiesById.get(normalizeStoredProxyId(job?.assignedProxyId || account.proxy_id));
+      if (!proxy) continue;
+      const ip = proxyIpKey(proxy);
+      proxyCounts.set(ip, (proxyCounts.get(ip) || 0) + 1);
+    }
+    if (accountProxyMode === "sub2api") {
+      for (const job of listUniqueJobs()) {
+        if (countedEmails.has(job.email.toLowerCase())) continue;
+        const proxy = proxiesById.get(normalizeStoredProxyId(job.assignedProxyId));
+        if (!proxy) continue;
+        const ip = proxyIpKey(proxy);
+        proxyCounts.set(ip, (proxyCounts.get(ip) || 0) + 1);
+      }
+    }
     sendJson(res, 200, {
       groups: groupPayload,
-      proxies: proxies
-        .filter((proxy) => proxy && Number.isInteger(Number(proxy.id)))
-        .map((proxy) => ({
-          id: Number(proxy.id),
-          name: String(proxy.name || `代理 ${proxy.id}`),
-          protocol: String(proxy.protocol || ""),
-          host: String(proxy.host || ""),
-          port: Number(proxy.port || 0),
-          ipAddress: String(proxy.ip_address || ""),
-          status: String(proxy.status || "active"),
-        })),
+      proxies: [...proxiesById.values()].map((proxy) => ({ ...publicSub2ApiProxy(proxy), accountCount: proxyCounts.get(proxyIpKey(proxy)) || 0 })),
     });
     return;
   }
@@ -818,6 +965,7 @@ async function handleApi(req, res, requestUrl) {
   }
   if (req.method === "GET" && action === "sessions") {
     try {
+      await refreshJobProxyBinding(job);
       sendJson(res, 200, { sessions: await listAccountSessions(job) });
     } catch (error) {
       throw sessionApiError(error);
@@ -827,6 +975,7 @@ async function handleApi(req, res, requestUrl) {
   if (req.method === "GET" && action === "workspaces") {
     if (!job.resultSaved) throw httpError(409, "账号授权尚未完成，暂时无法读取工作空间");
     try {
+      await refreshJobProxyBinding(job);
       sendJson(res, 200, { workspaces: await listAccountWorkspaces(job) });
     } catch (error) {
       throw sessionApiError(error);
@@ -944,7 +1093,10 @@ async function handleApi(req, res, requestUrl) {
     const body = await readJson(req);
     let result;
     try {
-      result = await withEmailJobLock(job.email, () => revokeAccountSession(job, body));
+      result = await withEmailJobLock(job.email, async () => {
+        await refreshJobProxyBinding(job);
+        return revokeAccountSession(job, body);
+      });
     } catch (error) {
       throw sessionApiError(error);
     }
@@ -954,10 +1106,11 @@ async function handleApi(req, res, requestUrl) {
   if (req.method === "POST" && action === "sessions/logout-all") {
     let result;
     try {
-      result = await withEmailJobLock(job.email, () => {
+      result = await withEmailJobLock(job.email, async () => {
         if (!canLogoutAllSessions(job)) {
           throw httpError(409, "账号正在运行或没有已保存的授权，暂不能登出所有设备");
         }
+        await refreshJobProxyBinding(job);
         return revokeAllAccountSessions(job);
       });
     } catch (error) {
@@ -1108,7 +1261,7 @@ function normalizeEmailFilter(value) {
 }
 
 async function startJob(email, credentials = {}, proxyUrl = null) {
-  proxyUrl = globalProxyUrl || proxyUrl;
+  proxyUrl = effectiveAccountProxyUrl(proxyUrl, globalProxyUrl);
   const { loginMode, mailApiUrl, mailRequestBody, password, totpSecret } = normalizeLoginCredentials(credentials);
   await saveStoredLoginCredentials(email, { password, totpSecret, proxyUrl });
   const id = crypto.randomUUID();
@@ -1149,6 +1302,12 @@ async function startJob(email, credentials = {}, proxyUrl = null) {
     hasPasswordCredential: Boolean(password),
     hasTotpCredential: Boolean(totpSecret),
     proxyUrl,
+    assignedProxyId: normalizeStoredProxyId(credentials.assignedProxyId),
+    fixedProxy: accountProxyMode === "sub2api",
+    poolRefreshAction: null,
+    poolRefreshDueAt: null,
+    poolRefreshError: null,
+    poolRefreshReady: false,
     mailApiUrl,
     mailRequestBody,
     mailSeenCandidateKeys: new Set(),
@@ -1259,9 +1418,12 @@ function scheduleQueuedJobs() {
 
 async function prepareAndLaunchJob(job, mode, queueRunId) {
   try {
+    await refreshJobProxyBinding(job);
+    if (!job.proxyFallbackActive) job.proxyUrl = effectiveAccountProxyUrl(job.proxyUrl, globalProxyUrl);
+    const oauthSettings = ["full", "refresh"].includes(mode) ? await codexOAuthSettingsForJob(job) : { codexAuthMode: "local" };
     if (["full", "totp_setup", "password_add"].includes(mode) && job.mailApiUrl) await loadMailboxBaseline(job);
     if (!isActive(job.status) || job.status === "queued" || job.queueRunId !== queueRunId) return;
-    launchJob(job, { mode });
+    launchJob(job, { mode, ...oauthSettings });
   } catch (error) {
     if (mode === "totp_setup") {
       await restoreTotpSetupFailure(job, `准备 2FA 设置失败：${error.message}`);
@@ -1269,6 +1431,12 @@ async function prepareAndLaunchJob(job, mode, queueRunId) {
       restorePasswordAddFailure(job, `准备添加密码失败：${error.message}`);
     } else {
       failJob(job, `准备登录任务失败：${error.message}`);
+    }
+    if (job.poolRefreshAction && job.status !== "completed") {
+      job.poolRefreshError = job.lastError || job.prompt || `登录任务准备失败：${error.message}`;
+      job.poolRefreshDueAt = null;
+      touch(job);
+      await saveJobMetadata(job);
     }
     scheduleQueuedJobs();
   }
@@ -1287,12 +1455,15 @@ function enqueueJob(job, mode, startPrompt) {
 }
 
 function launchJob(job, options = {}) {
-  if (globalProxyUrl && !job.proxyFallbackActive) job.proxyUrl = globalProxyUrl;
+  if (options.sub2ApiOAuth) job.proxyUrl = options.loginProxyUrl;
+  else if (!job.proxyFallbackActive) job.proxyUrl = effectiveAccountProxyUrl(job.proxyUrl, globalProxyUrl);
+  job.runProxyFixed = accountProxyMode === "sub2api" || Boolean(options.sub2ApiOAuth?.proxyId);
   const mode = options.mode || "full";
   if (mode === "full" && !job.authAutomationAttempt) {
     beginAuthorizationAutomationAttempt(job, "login");
   }
   const runId = crypto.randomUUID();
+  job.runResultSaved = false;
   job.runId = runId;
   job.runMode = mode;
   job.mailOtpRequestedAt = null;
@@ -1349,6 +1520,11 @@ function launchJob(job, options = {}) {
       CHATGPT_TOTP_SECRET: job.totpSecret || "",
       CHATGPT_NEW_PASSWORD: mode === "password_add" ? job.pendingNewPassword || "" : "",
       CHATGPT_PROXY_URL: job.proxyFallbackActive ? "" : (job.proxyUrl || ""),
+      CHATGPT_PROXY_FIXED: job.runProxyFixed ? "1" : "0",
+      TOSUB2_CODEX_AUTH_MODE: options.codexAuthMode || "local",
+      TOSUB2_OAUTH_BASE_URL: options.sub2ApiOAuth?.baseUrl || "",
+      TOSUB2_OAUTH_ADMIN_KEY: options.sub2ApiOAuth?.adminApiKey || "",
+      TOSUB2_OAUTH_PROXY_ID: options.sub2ApiOAuth?.proxyId ? String(options.sub2ApiOAuth.proxyId) : "",
       CHATGPT_PROXY_MAX_ATTEMPTS: String(Math.max(0, MAX_PROXY_RISK_RETRIES - (job.proxyRiskRetryCount || 0))),
       TOSUB2_TLS_PROFILE:
         String(process.env.TOSUB2_TLS_PROFILE || "").trim()
@@ -1370,6 +1546,11 @@ function launchJob(job, options = {}) {
       if (mode === "totp_setup") await restoreTotpSetupFailure(job, `无法启动 2FA 设置进程：${error.message}`);
       else if (mode === "password_add") restorePasswordAddFailure(job, `无法启动添加密码进程：${error.message}`);
       else failJob(job, `无法启动登录进程：${error.message}`);
+      if (job.poolRefreshAction) {
+        job.poolRefreshError = job.lastError || job.prompt || `登录进程启动失败：${error.message}`;
+        job.poolRefreshDueAt = null;
+        await saveJobMetadata(job);
+      }
     });
   });
   child.on("close", (code, signal) => {
@@ -1386,6 +1567,7 @@ async function handleChildClose(job, { code, signal, mode, runId }) {
   job.child = null;
   if (mode === "totp_setup") {
     await finishTotpSetup(job, code, signal);
+    if (job.poolRefreshAction && job.status === "completed" && job.resultSaved) await synchronizePoolRefresh(job);
     scheduleQueuedJobs();
     return;
   }
@@ -1399,16 +1581,18 @@ async function handleChildClose(job, { code, signal, mode, runId }) {
     scheduleQueuedJobs();
     return;
   }
-  if (!isTerminalStatus(job.status) && code === 0 && job.resultSaved && (await fileExists(job.outputPath))) {
+  if (!isTerminalStatus(job.status) && code === 0 && job.runResultSaved && (await fileExists(job.outputPath))) {
     job.planType = await readPlanTypeFromOutput(job.outputPath);
     if (mode === "full") completeAuthorizationAutomationAttempt(job);
     job.loginCheckpointAvailable = false;
     job.status = "completed";
     job.prompt = "授权完成，可以下载导入文件";
     job.completedAt = new Date().toISOString();
+    if (job.poolRefreshAction) job.poolRefreshReady = true;
     touch(job);
     await saveJobMetadata(job);
     await finishSub2ApiAutoRepairSuccess(job);
+    if (job.poolRefreshAction) await synchronizePoolRefresh(job);
     await queueConfiguredTaskActions(job);
     scheduleQueuedJobs();
     return;
@@ -1424,6 +1608,12 @@ async function handleChildClose(job, { code, signal, mode, runId }) {
     }
   }
   await finishSub2ApiAutoRepairFailure(job);
+  if (job.poolRefreshAction) {
+    job.poolRefreshError = job.lastError || job.prompt || "重新授权未完成";
+    job.poolRefreshDueAt = null;
+    touch(job);
+    await saveJobMetadata(job);
+  }
   scheduleQueuedJobs();
 }
 
@@ -1449,6 +1639,10 @@ function handleChildCloseFailure(job, mode, runId, error) {
   } else {
     failJob(job, message);
   }
+  if (job.poolRefreshAction && !job.poolRefreshReady) {
+    job.poolRefreshError = message;
+    job.poolRefreshDueAt = null;
+  }
   touch(job);
   void saveJobMetadata(job).catch(() => {});
   scheduleQueuedJobs();
@@ -1459,11 +1653,11 @@ async function retryJob(job, options = {}) {
     throw httpError(409, "当前任务不需要重新授权");
   }
   const retryingSecurityCheck = Boolean(job.securityCheckRequired);
-  job.proxyUrl = globalProxyUrl || job.proxyUrl;
+  job.proxyUrl = effectiveAccountProxyUrl(job.proxyUrl, globalProxyUrl);
   job.proxyFallbackAttempted = false;
   job.proxyFallbackActive = false;
   if (Object.hasOwn(options, "proxyUrl")) {
-    job.proxyUrl = globalProxyUrl || (String(options.proxyUrl || "").trim() ? normalizeProxyUrl(options.proxyUrl) : job.proxyUrl);
+    job.proxyUrl = effectiveAccountProxyUrl(job.proxyUrl, globalProxyUrl, String(options.proxyUrl || "").trim() ? normalizeProxyUrl(options.proxyUrl) : null);
     const persisted = await saveStoredLoginCredentials(job.email, job);
   }
   const resumingCheckpoint = job.status === "resume_available"
@@ -1498,6 +1692,7 @@ async function retryJob(job, options = {}) {
   job.autoRepairPendingBackend = null;
   beginAuthorizationAutomationAttempt(job, "manual_retry");
   recordJobOperation(job, resumingCheckpoint ? "resume" : "reauthorize");
+  beginPoolRefresh(job, "reauthorize");
   appendJobLog(
     job,
     retryingSecurityCheck
@@ -1511,9 +1706,9 @@ async function regenerateJob(job, options = {}) {
   if (job.status !== "completed" || !job.resultSaved) {
     throw httpError(409, "只能为已经完成的任务重新生成授权");
   }
-  job.proxyUrl = globalProxyUrl || job.proxyUrl;
+  job.proxyUrl = effectiveAccountProxyUrl(job.proxyUrl, globalProxyUrl);
   if (Object.hasOwn(options, "proxyUrl")) {
-    job.proxyUrl = globalProxyUrl || (String(options.proxyUrl || "").trim() ? normalizeProxyUrl(options.proxyUrl) : job.proxyUrl);
+    job.proxyUrl = effectiveAccountProxyUrl(job.proxyUrl, globalProxyUrl, String(options.proxyUrl || "").trim() ? normalizeProxyUrl(options.proxyUrl) : null);
     await saveStoredLoginCredentials(job.email, job);
   }
   job.proxyFallbackAttempted = false;
@@ -1533,6 +1728,7 @@ async function regenerateJob(job, options = {}) {
   job.proxySessionAttemptIds.clear();
   job.proxyAttemptParserTail = "";
   recordJobOperation(job, "reauthorize");
+  beginPoolRefresh(job, "reauthorize");
   appendJobLog(job, `\n[refresh] 第 ${job.attempt} 次生成：优先使用已有刷新令牌。\n`);
   enqueueJob(job, "refresh", "正在使用已有刷新令牌直接生成新授权");
 }
@@ -1542,12 +1738,12 @@ async function forceReloginJob(job, options = {}, context = {}) {
     throw httpError(409, "当前任务正在进行中，不能重新登录");
   }
   await reloadMissingJobCredentials(job);
-  if (globalProxyUrl) job.proxyUrl = globalProxyUrl;
+  job.proxyUrl = effectiveAccountProxyUrl(job.proxyUrl, globalProxyUrl);
   if (!canForceRelogin(job)) {
     throw httpError(409, "当前任务正在进行中，不能重新登录");
   }
   if (Object.hasOwn(options, "proxyUrl")) {
-    job.proxyUrl = globalProxyUrl || (String(options.proxyUrl || "").trim() ? normalizeProxyUrl(options.proxyUrl) : job.proxyUrl);
+    job.proxyUrl = effectiveAccountProxyUrl(job.proxyUrl, globalProxyUrl, String(options.proxyUrl || "").trim() ? normalizeProxyUrl(options.proxyUrl) : null);
     await saveStoredLoginCredentials(job.email, job);
   }
   job.proxyFallbackAttempted = false;
@@ -1595,6 +1791,9 @@ async function forceReloginJob(job, options = {}, context = {}) {
   }
   beginAuthorizationAutomationAttempt(job, context.autoRepair ? "sub2api_monitor" : "manual_relogin");
   recordJobOperation(job, context.autoRepair ? "automatic_relogin" : "relogin");
+  if (!context.autoRepair) {
+    beginPoolRefresh(job, context.poolRefreshAction || "relogin");
+  }
   appendJobLog(job, `\n[relogin] 第 ${job.attempt} 次授权：跳过刷新令牌并强制重新登录。\n`);
   if (job.hasTotpCredential && !job.totpSecret) {
     appendJobLog(job, "[mfa] 本地未能读取已记录的 2FA 密钥，遇到 2FA 时需要手动输入验证码。\n");
@@ -1622,7 +1821,7 @@ async function reloadMissingJobCredentials(job) {
 async function startTotpSetup(job, options = {}) {
   job.proxyFallbackAttempted = false;
   job.proxyFallbackActive = false;
-  job.proxyUrl = globalProxyUrl || job.proxyUrl;
+  job.proxyUrl = effectiveAccountProxyUrl(job.proxyUrl, globalProxyUrl);
   const replaceExisting = Boolean(options.replaceExisting);
   await reloadMissingJobCredentials(job);
   if (replaceExisting) {
@@ -1646,7 +1845,7 @@ async function startTotpSetup(job, options = {}) {
     throw httpError(409, "邮箱登录检查点已丢失，请先重新登录");
   }
   if (Object.hasOwn(options, "proxyUrl")) {
-    job.proxyUrl = globalProxyUrl || (String(options.proxyUrl || "").trim() ? normalizeProxyUrl(options.proxyUrl) : job.proxyUrl);
+    job.proxyUrl = effectiveAccountProxyUrl(job.proxyUrl, globalProxyUrl, String(options.proxyUrl || "").trim() ? normalizeProxyUrl(options.proxyUrl) : null);
     await saveStoredLoginCredentials(job.email, job);
   }
   stopMailPolling(job);
@@ -1703,7 +1902,7 @@ async function hasIncompleteRemoteTotpRotation(resultPath, metadataFlag = false)
 async function startPasswordAdd(job, options = {}) {
   job.proxyFallbackAttempted = false;
   job.proxyFallbackActive = false;
-  job.proxyUrl = globalProxyUrl || job.proxyUrl;
+  job.proxyUrl = effectiveAccountProxyUrl(job.proxyUrl, globalProxyUrl);
   if (!canAddPassword(job)) {
     throw httpError(409, "只能为已完成授权，或已保存邮箱登录检查点且尚未保存密码的账号添加密码");
   }
@@ -1713,7 +1912,7 @@ async function startPasswordAdd(job, options = {}) {
     throw httpError(409, "邮箱登录检查点已丢失，请先重新登录");
   }
   if (Object.hasOwn(options, "proxyUrl")) {
-    job.proxyUrl = globalProxyUrl || (String(options.proxyUrl || "").trim() ? normalizeProxyUrl(options.proxyUrl) : job.proxyUrl);
+    job.proxyUrl = effectiveAccountProxyUrl(job.proxyUrl, globalProxyUrl, String(options.proxyUrl || "").trim() ? normalizeProxyUrl(options.proxyUrl) : null);
     await saveStoredLoginCredentials(job.email, job);
   }
   stopMailPolling(job);
@@ -1812,6 +2011,7 @@ async function finishPasswordAdd(job, code, signal) {
   job.passwordAddResumesAuthorization = false;
   touch(job);
   await saveJobMetadata(job);
+  if (job.poolRefreshAction && job.status === "completed" && job.resultSaved) await synchronizePoolRefresh(job);
 }
 
 function restorePasswordAddFailure(job, message) {
@@ -1831,6 +2031,7 @@ function restorePasswordAddFailure(job, message) {
   touch(job);
   void removePrivateFile(job.passwordAddResultPath).catch(() => {});
   void saveJobMetadata(job).catch(() => {});
+  if (job.poolRefreshAction && !resumeAuthorization) void synchronizePoolRefresh(job).catch(() => {});
 }
 
 async function loadTotpSetupResult(job) {
@@ -1936,6 +2137,7 @@ async function finishTotpSetup(job, code, signal) {
   }
   touch(job);
   await saveJobMetadata(job);
+  if (job.poolRefreshAction && job.status === "completed" && job.resultSaved) await synchronizePoolRefresh(job);
 }
 
 async function removePrivateFile(filePath) {
@@ -2229,6 +2431,7 @@ function consumeOutput(job, rawText) {
   }
   if (scan.includes("[ok] Saved sub2api import:")) {
     job.resultSaved = true;
+    job.runResultSaved = true;
     setStage(job, "finalizing", "导入文件已生成，正在收尾");
   }
   if (scan.includes("[ok] Account password added and saved securely")) {
@@ -2253,6 +2456,10 @@ async function restartAfterProxyRisk(job, options = {}) {
   job.proxyRiskRestarting = true;
   const mode = job.runMode || job.queuedMode || "full";
   try {
+    if (accountProxyMode === "sub2api" || job.runProxyFixed) {
+      finishProxyRiskRetries(job, "账号固定代理连接失败或触发安全校验；已保留 IP 绑定，请重试或手动切换 IP");
+      return;
+    }
     if (!job.proxyUrl || job.proxyFallbackActive) {
       if (job.directTlsFallbackAttempted) {
         finishProxyRiskRetries(job, "Cloudflare 安全校验未能完成，直连 TLS 指纹筛选已经使用过，请稍后重试");
@@ -2331,7 +2538,7 @@ async function restartAfterProxyRisk(job, options = {}) {
 
 function finishProxyRiskRetries(job, message) {
   job.proxyRiskRestarting = false;
-  if (allowDirectFallback && job.proxyUrl && !job.proxyFallbackAttempted) {
+  if (accountProxyMode !== "sub2api" && !job.runProxyFixed && allowDirectFallback && job.proxyUrl && !job.proxyFallbackAttempted) {
     void fallbackToDirectIp(job, message).catch((error) => {
       finishProxyRiskRetries(job, `本地出口回退失败：${error.message}`);
     });
@@ -2874,6 +3081,11 @@ async function cancelJob(job) {
   job.status = mfaPending ? "mfa_failed" : "canceled";
   job.prompt = mfaPending ? "2FA 未通过，流程已停止" : "流程已取消";
   if (mfaPending) job.lastError = "任务在 2FA 验证阶段停止，验证码未完成校验";
+  if (job.poolRefreshAction && !job.poolRefreshReady && !shuttingDown) {
+    job.poolRefreshError = "登录授权已取消，请重新登录后更新号池凭据";
+    job.poolRefreshDueAt = null;
+    clearPoolRefreshTimer(job);
+  }
   job.child?.kill("SIGTERM");
   job.child = null;
   touch(job);
@@ -2979,12 +3191,27 @@ async function buildSub2ApiUploadPayload(downloadable) {
 async function uploadJobsToSub2Api(selected, config, profileState = snapshotSub2ApiProfileState()) {
   const downloadable = selected.filter((job) => job.resultSaved);
   if (downloadable.length === 0) throw httpError(409, "选中的任务里没有已完成的导入文件");
+  if (accountProxyMode === "sub2api") {
+    const unassigned = downloadable.filter((job) => !normalizeStoredProxyId(job.assignedProxyId));
+    const assignments = unassigned.length ? await assignSub2ApiProxies(unassigned) : new Map();
+    for (const job of unassigned) {
+      const proxy = assignments.get(job.id);
+      if (!proxy) continue;
+      job.assignedProxyId = proxy.id;
+      job.proxyUrl = proxy.url;
+      await saveStoredLoginCredentials(job.email, job);
+      await saveJobMetadata(job);
+    }
+    for (const job of downloadable) await refreshJobProxyBinding(job);
+  }
   const payload = await buildSub2ApiUploadPayload(downloadable);
   const idempotencyKey = `tosub2-upload-${crypto.randomUUID()}`;
   const accountsByProfile = new Map();
   for (const account of payload.accounts) {
     const accountConfig = await resolveSub2ApiWriteConfig(resolveSub2ApiConfigForAccount(config, account, profileState));
     const { proxy_key: _proxyKey, ...accountData } = account;
+    const localJob = findJobByEmail(sub2ApiAccountEmail(account));
+    const assignedProxyId = accountProxyMode === "sub2api" ? normalizeStoredProxyId(localJob?.assignedProxyId) : null;
     const credentials = { ...(account.credentials || {}) };
     const extra = buildSub2ApiAccountExtra(account.extra, accountConfig);
     const accountName = renderSub2ApiAccountName(accountConfig.accountNameTemplate, account);
@@ -3000,6 +3227,7 @@ async function uploadJobsToSub2Api(selected, config, profileState = snapshotSub2
       schedulable: true,
       group_ids: accountConfig.groupIds.length ? accountConfig.groupIds : (account.group_ids || []),
       ...sub2ApiProxyFields(accountConfig),
+      ...(assignedProxyId ? { proxy_id: assignedProxyId } : {}),
       ...(accountConfig.concurrency !== null ? { concurrency: accountConfig.concurrency } : {}),
       ...(accountConfig.loadFactor !== null ? { load_factor: accountConfig.loadFactor } : {}),
       ...(accountConfig.priority !== null && !accountConfig.importDatePriority?.enabled ? { priority: accountConfig.priority } : {}),
@@ -3017,14 +3245,14 @@ async function uploadJobsToSub2Api(selected, config, profileState = snapshotSub2
   for (const { config: accountConfig, accounts } of accountsByProfile.values()) {
     const listing = await listSub2ApiAccounts(accountConfig, { withMeta: true });
     if (!listing.complete) throw new Error("Sub2API 账号列表不完整，已停止上传以避免创建重复账号");
+    const profileNewAccounts = accounts.filter((account) => !listing.accounts.some((remote) => sub2ApiAccountEmail(account) === sub2ApiAccountEmail(remote)));
     // Replace each existing row's PlanType with the uploaded workspace PlanType
     // but keep its original pool import date. New rows join the same day ranks.
     const effective = listing.accounts.map((remote) => {
       const local = accounts.find((account) => sub2ApiAccountEmail(account) === sub2ApiAccountEmail(remote));
       return local ? { ...remote, ...local, id: remote.id, created_at: remote.created_at } : remote;
     });
-    const newAccounts = accounts.filter((account) => !listing.accounts.some((remote) => sub2ApiAccountEmail(account) === sub2ApiAccountEmail(remote)));
-    const dayPriorities = importDatePriorities([...effective, ...newAccounts], config, profileState);
+    const dayPriorities = importDatePriorities([...effective, ...profileNewAccounts], config, profileState);
     const accountsToCreate = [];
     for (const account of accounts) {
       const email = sub2ApiAccountEmail(account);
@@ -3039,7 +3267,7 @@ async function uploadJobsToSub2Api(selected, config, profileState = snapshotSub2
       for (const remoteAccount of matches) {
         const accountId = normalizeSub2ApiAccountId(remoteAccount?.id);
         if (!accountId) continue;
-        const accountUpdate = buildSub2ApiAccountUpdate(account, accountConfig, remoteAccount);
+        const accountUpdate = await buildSub2ApiAccountUpdate(account, accountConfig, remoteAccount);
         const dated = effective.find((item) => item.id === remoteAccount.id);
         if (dayPriorities.has(dated)) accountUpdate.priority = dayPriorities.get(dated);
         await requestSub2Api(accountConfig, `/api/v1/admin/accounts/${encodeURIComponent(accountId)}`, {
@@ -3490,6 +3718,9 @@ function publicTaskSettings(includeProxy = true) {
   return {
     maxActiveJobs,
     ...(includeProxy ? { proxyUrl: globalProxyUrl || "" } : {}),
+    accountProxyMode,
+    codexAuthMode,
+    accountProxyCooldownMinutes,
     allowDirectFallback,
     min: 1,
     max: MAX_ACTIVE_JOBS_LIMIT,
@@ -3506,6 +3737,9 @@ async function loadTaskSettings() {
     taskAutoActions = normalizeTaskAutoActions(saved.autoActions);
     globalProxyUrl = saved.proxyUrl ? normalizeProxyUrl(saved.proxyUrl) : null;
     allowDirectFallback = saved.allowDirectFallback === true;
+    accountProxyMode = normalizeAccountProxyMode(saved.accountProxyMode);
+    codexAuthMode = normalizeCodexAuthMode(saved.codexAuthMode);
+    accountProxyCooldownMinutes = normalizeCooldownMinutes(saved.accountProxyCooldownMinutes);
   } catch (error) {
     if (error?.code !== "ENOENT") {
       throw new Error(`任务设置读取失败：${error.message}`);
@@ -3516,6 +3750,14 @@ async function loadTaskSettings() {
 
 async function saveTaskSettings(body) {
   const source = body && typeof body === "object" && !Array.isArray(body) ? body : {};
+  let nextCodexAuthMode = codexAuthMode;
+  if (Object.hasOwn(source, "codexAuthMode")) {
+    try { nextCodexAuthMode = normalizeCodexAuthMode(source.codexAuthMode); }
+    catch (error) { throw httpError(400, error.message); }
+    if (nextCodexAuthMode === "sub2api" && (!sub2ApiSettingsConfig?.baseUrl || !sub2ApiSettingsConfig?.adminApiKey)) {
+      throw httpError(409, "请先保存 Sub2API 后端地址和管理员 API Key，再选择 Sub2API 授权");
+    }
+  }
   const nextLimit = Object.hasOwn(source, "maxActiveJobs") ? validateMaxActiveJobs(source.maxActiveJobs) : maxActiveJobs;
   const nextAutoActions = normalizeTaskAutoActions(
     Object.hasOwn(source, "autoActions") ? source.autoActions : taskAutoActions,
@@ -3526,12 +3768,21 @@ async function saveTaskSettings(body) {
   const nextAllowDirectFallback = Object.hasOwn(source, "allowDirectFallback")
     ? source.allowDirectFallback === true
     : allowDirectFallback;
+  const nextAccountProxyMode = Object.hasOwn(source, "accountProxyMode")
+    ? normalizeAccountProxyMode(source.accountProxyMode)
+    : accountProxyMode;
+  const nextCooldownMinutes = Object.hasOwn(source, "accountProxyCooldownMinutes")
+    ? normalizeCooldownMinutes(source.accountProxyCooldownMinutes)
+    : accountProxyCooldownMinutes;
   // Serialize writes so memory and the last persisted setting always agree.
   const operation = taskSettingsWritePromise.catch(() => {}).then(async () => {
     const effectiveLimit = Object.hasOwn(source, "maxActiveJobs") ? nextLimit : maxActiveJobs;
     const effectiveAutoActions = Object.hasOwn(source, "autoActions") ? nextAutoActions : taskAutoActions;
     const effectiveProxyUrl = Object.hasOwn(source, "proxyUrl") ? nextProxyUrl : globalProxyUrl;
     const effectiveFallback = Object.hasOwn(source, "allowDirectFallback") ? nextAllowDirectFallback : allowDirectFallback;
+    const effectiveAccountProxyMode = Object.hasOwn(source, "accountProxyMode") ? nextAccountProxyMode : accountProxyMode;
+    const effectiveCodexAuthMode = Object.hasOwn(source, "codexAuthMode") ? nextCodexAuthMode : codexAuthMode;
+    const effectiveCooldownMinutes = Object.hasOwn(source, "accountProxyCooldownMinutes") ? nextCooldownMinutes : accountProxyCooldownMinutes;
     const tempPath = `${TASK_SETTINGS_PATH}.${process.pid}.${crypto.randomUUID()}.tmp`;
     try {
       await fs.writeFile(tempPath, `${JSON.stringify({
@@ -3540,6 +3791,9 @@ async function saveTaskSettings(body) {
         autoActions: Object.fromEntries(Object.entries(effectiveAutoActions).map(([key, actions]) => [key, [...actions]])),
         proxyUrl: effectiveProxyUrl || "",
         allowDirectFallback: effectiveFallback,
+        accountProxyMode: effectiveAccountProxyMode,
+        codexAuthMode: effectiveCodexAuthMode,
+        accountProxyCooldownMinutes: effectiveCooldownMinutes,
       }, null, 2)}\n`, { mode: 0o600 });
       await fs.rename(tempPath, TASK_SETTINGS_PATH);
     } finally {
@@ -3549,6 +3803,9 @@ async function saveTaskSettings(body) {
     taskAutoActions = effectiveAutoActions;
     globalProxyUrl = effectiveProxyUrl;
     allowDirectFallback = effectiveFallback;
+    accountProxyMode = effectiveAccountProxyMode;
+    codexAuthMode = effectiveCodexAuthMode;
+    accountProxyCooldownMinutes = effectiveCooldownMinutes;
     // Reducing the limit leaves running jobs alone; they drain before new work
     // starts. Increasing it immediately makes extra slots available.
     scheduleQueuedJobs();
@@ -3922,6 +4179,11 @@ async function runSub2ApiMonitor(trigger = "scheduled") {
     };
     try {
       await syncCompletedOutputs(true);
+      const refreshRetries = await Promise.allSettled([...jobs.values()]
+        .filter((job) => job.poolRefreshAction && job.poolRefreshReady && job.poolRefreshError && job.status === "completed")
+        .map((job) => withEmailJobLock(job.email, () => synchronizePoolRefresh(job))));
+      const refreshFailure = refreshRetries.find((result) => result.status === "rejected");
+      if (refreshFailure) summary.poolCredentialSyncFailed = refreshRetries.filter((result) => result.status === "rejected").length;
       await retryPendingSub2ApiUploads(config, summary, profileState);
       if (shuttingDown) throw httpError(503, "服务正在关闭，已停止号池巡检");
       const accountListing = await listSub2ApiAccounts(config, { withMeta: true });
@@ -4008,7 +4270,7 @@ async function runSub2ApiMonitor(trigger = "scheduled") {
             summary.busy += accounts.length;
             return;
           }
-          if (isAutoRepairCoolingDown(job)) {
+          if (job.poolRefreshAction || isAutoRepairCoolingDown(job)) {
             summary.cooldown += accounts.length;
             return;
           }
@@ -4120,6 +4382,7 @@ async function resolveSub2ApiProxyFallback(config, proxyId) {
 }
 
 async function resolveSub2ApiWriteConfig(accountConfig) {
+  if (accountProxyMode === "sub2api") return accountConfig;
   const proxyId = Number(accountConfig?.proxyId);
   if (!Number.isSafeInteger(proxyId) || proxyId <= 0) return accountConfig;
   const target = await resolveSub2ApiProxyFallback(accountConfig, proxyId);
@@ -4139,6 +4402,30 @@ function sub2ApiProxyFields(accountConfig) {
  * no longer reference the expired ID and are left alone.
  */
 async function fallBackExpiredSub2ApiProxies(config, profileState, accounts, summary) {
+  if (accountProxyMode === "sub2api") {
+    for (const account of accounts) {
+      if (shuttingDown) return;
+      const accountId = normalizeSub2ApiAccountId(account?.id);
+      const assignedProxyId = normalizeStoredProxyId(findJobByEmail(sub2ApiAccountEmail(account))?.assignedProxyId);
+      if (!accountId || !assignedProxyId) continue;
+      try {
+        const state = await getSub2ApiProxyState(config, assignedProxyId);
+        if (state.found !== true || isSub2ApiProxyExpired(state.proxy)) throw new Error("账号绑定代理已失效或状态未知，请修复代理或手动切换 IP");
+        const proxyId = assignedProxyId;
+        if (Number(account?.proxy_id) === Number(proxyId)) continue;
+        await requestSub2Api(config, `/api/v1/admin/accounts/${encodeURIComponent(accountId)}`, {
+          method: "PUT",
+          body: JSON.stringify({ proxy_id: proxyId }),
+        });
+        summary.proxyFallbackUpdated += 1;
+      } catch (error) {
+        summary.proxyFallbackFailed += 1;
+        console.warn(`[warn] Sub2API 账号 ${accountId} 代理回退失败：${String(error?.message || error).slice(0, 180)}`);
+      }
+    }
+    if (summary.proxyFallbackUpdated) invalidateSub2ApiAccountStatusCache();
+    return;
+  }
   const proxyIds = [...new Set([...profileState.profiles.values()]
     .map((profile) => Number(profile.proxyId))
     .filter((id) => Number.isSafeInteger(id) && id > 0))];
@@ -4193,7 +4480,7 @@ function diffSub2ApiProfileSyncTargets(previous, next) {
 function unsyncableSub2ApiProfileFields(accountConfig, fields) {
   return fields.filter((field) => {
     if (field === "groupIds") return !accountConfig.groupIds.length;
-    if (field === "proxyId") return !accountConfig.proxyId;
+    if (field === "proxyId") return accountProxyMode === "sub2api" || !accountConfig.proxyId;
     if (["concurrency", "loadFactor", "priority"].includes(field)) return accountConfig[field] === null;
     if (field === "accountNameTemplate") return !accountConfig.accountNameTemplate;
     if (field === "modelWhitelist") return !accountConfig.modelWhitelist.length;
@@ -4201,11 +4488,11 @@ function unsyncableSub2ApiProfileFields(accountConfig, fields) {
   });
 }
 
-function buildSub2ApiProfileSyncUpdate(remoteAccount, accountConfig, fields) {
+async function buildSub2ApiProfileSyncUpdate(remoteAccount, accountConfig, fields) {
   const changed = new Set(fields);
   const body = {};
   if (changed.has("groupIds")) body.group_ids = accountConfig.groupIds;
-  if (changed.has("proxyId")) Object.assign(body, sub2ApiProxyFields(accountConfig));
+  if (changed.has("proxyId")) Object.assign(body, await sub2ApiProxyFieldsForAccount(accountConfig, sub2ApiAccountEmail(remoteAccount), remoteAccount));
   if (changed.has("concurrency")) body.concurrency = accountConfig.concurrency;
   if (changed.has("loadFactor")) body.load_factor = accountConfig.loadFactor;
   if (changed.has("priority") && !accountConfig.importDatePriority?.enabled) body.priority = accountConfig.priority;
@@ -4287,7 +4574,7 @@ async function syncSub2ApiProfileChanges(config, targets, profileState) {
     while (cursor < work.length && !shuttingDown) {
       const { accountId, account, target } = work[cursor];
       cursor += 1;
-      const body = buildSub2ApiProfileSyncUpdate(account, target.accountConfig, target.fields);
+      const body = await buildSub2ApiProfileSyncUpdate(account, target.accountConfig, target.fields);
       if (!Object.keys(body).length) continue;
       try {
         await requestSub2Api(config, `/api/v1/admin/accounts/${encodeURIComponent(accountId)}`, {
@@ -4312,7 +4599,7 @@ async function updateSub2ApiAccountFromProfile(globalConfig, remoteAccount, prof
   const accountConfig = await resolveSub2ApiWriteConfig(profileConfig(profile, globalConfig));
   const body = {};
   if (Array.isArray(accountConfig.groupIds) && accountConfig.groupIds.length) body.group_ids = accountConfig.groupIds;
-  Object.assign(body, sub2ApiProxyFields(accountConfig));
+  Object.assign(body, await sub2ApiProxyFieldsForAccount(accountConfig, sub2ApiAccountEmail(remoteAccount), remoteAccount));
   if (accountConfig.concurrency !== null) body.concurrency = accountConfig.concurrency;
   if (accountConfig.loadFactor !== null) body.load_factor = accountConfig.loadFactor;
   if (accountConfig.priority !== null && !accountConfig.importDatePriority?.enabled) body.priority = accountConfig.priority;
@@ -4332,7 +4619,7 @@ async function updateSub2ApiAccountFromProfile(globalConfig, remoteAccount, prof
   return true;
 }
 
-function buildSub2ApiAccountUpdate(localAccount, accountConfig, remoteAccount = {}) {
+async function buildSub2ApiAccountUpdate(localAccount, accountConfig, remoteAccount = {}) {
   const remarkJob = findJobByEmail(sub2ApiAccountEmail(localAccount));
   // Routine uploads/workspace changes must not overwrite a newer pool edit.
   // Explicit local changes remain pending until their notes write succeeds.
@@ -4383,11 +4670,21 @@ function buildSub2ApiAccountUpdate(localAccount, accountConfig, remoteAccount = 
     ...(accountConfig.groupIds.length
       ? { group_ids: accountConfig.groupIds }
       : { group_ids: sub2ApiAccountGroupIds(remoteAccount) }),
-    ...sub2ApiProxyFields(accountConfig),
+    ...await sub2ApiProxyFieldsForAccount(accountConfig, sub2ApiAccountEmail(localAccount), remoteAccount),
     ...(accountConfig.concurrency !== null ? { concurrency: accountConfig.concurrency } : {}),
     ...(accountConfig.loadFactor !== null ? { load_factor: accountConfig.loadFactor } : {}),
     ...(accountConfig.priority !== null && !accountConfig.importDatePriority?.enabled ? { priority: accountConfig.priority } : {}),
   };
+}
+
+async function sub2ApiProxyFieldsForAccount(accountConfig, email, remoteAccount = {}) {
+  if (accountProxyMode !== "sub2api") return sub2ApiProxyFields(accountConfig);
+  const assignedProxyId = normalizeStoredProxyId(findJobByEmail(email)?.assignedProxyId)
+    || normalizeStoredProxyId(remoteAccount.proxy_id);
+  if (!assignedProxyId) return Object.hasOwn(remoteAccount, "proxy_id") && Number(remoteAccount.proxy_id) === 0
+    ? { proxy_id: 0 }
+    : {};
+  return { proxy_id: assignedProxyId };
 }
 
 function normalizeAccountRemark(value) {
@@ -4540,7 +4837,7 @@ async function synchronizeSub2ApiWorkspaceAccount(job) {
     const accountId = normalizeSub2ApiAccountId(remoteAccount?.id);
     if (!accountId) continue;
     const accountConfig = await resolveSub2ApiWriteConfig(resolveSub2ApiConfigForAccount(config, localAccount, profileState));
-    const accountUpdate = buildSub2ApiAccountUpdate(localAccount, accountConfig, remoteAccount);
+    const accountUpdate = await buildSub2ApiAccountUpdate(localAccount, accountConfig, remoteAccount);
     await requestSub2Api(config, `/api/v1/admin/accounts/${encodeURIComponent(accountId)}`, {
       method: "PUT",
       body: JSON.stringify(accountUpdate),
@@ -4584,7 +4881,6 @@ async function retryPendingSub2ApiUploads(config, summary, profileState = snapsh
         || job.autoRepairOperation
         || isAutoRepairCoolingDown(job)
       ) return;
-
       const accounts = [];
       const missingIds = [];
       const expectedEmail = String(job.email || "").trim().toLowerCase();
@@ -4772,6 +5068,9 @@ async function importSub2ApiPoolOnlyAccounts(remoteAccounts) {
       const planType = extractPlanTypeFromAccount(account, { preferJwt: false }) || null;
       await fs.mkdir(outputDir, { recursive: true });
       // OAuth tokens stay in the protected export file; status APIs expose only metadata.
+      const proxy = accountProxyMode === "sub2api"
+        ? (await assignSub2ApiProxies([{ email, assignedProxyId: normalizeStoredProxyId(account.proxy_id) }])).get(email)
+        : null;
       if (account.credentials?.access_token || account.credentials?.refresh_token) {
         const { id: remoteId, ...oauthAccount } = account;
         await fs.writeFile(path.join(outputDir, "sub2api-import-oauth.json"), `${JSON.stringify({
@@ -4792,7 +5091,9 @@ async function importSub2ApiPoolOnlyAccounts(remoteAccounts) {
         completed_at: createdAt,
         last_operation_at: createdAt,
         last_operation_type: "sub2api_sync",
+        assigned_proxy_id: proxy?.id || normalizeStoredProxyId(account.proxy_id),
       }, null, 2)}\n`, { mode: 0o600 });
+      if (proxy?.url) await saveStoredLoginCredentials(email, { proxyUrl: proxy.url });
       await syncCompletedOutputs(true);
       knownEmails.add(email);
       return true;
@@ -5162,6 +5463,233 @@ async function listSub2ApiTargetGroups(config) {
   ));
 }
 
+function normalizeAccountProxyMode(value) {
+  return value === "sub2api" ? "sub2api" : "global";
+}
+
+function normalizeCooldownMinutes(value) {
+  const minutes = Number(value ?? 60);
+  if (!Number.isSafeInteger(minutes) || minutes < 1 || minutes > MAX_ACCOUNT_PROXY_COOLDOWN_MINUTES) {
+    throw httpError(400, `冷却时长必须是 1 到 ${MAX_ACCOUNT_PROXY_COOLDOWN_MINUTES} 分钟的整数`);
+  }
+  return minutes;
+}
+
+function effectiveAccountProxyUrl(assignedUrl, globalUrl, requestedUrl = null) {
+  return accountProxyMode === "sub2api" ? (assignedUrl || null) : (globalUrl || requestedUrl || assignedUrl || null);
+}
+
+function normalizeStoredProxyId(value) {
+  const id = Number(value);
+  return Number.isSafeInteger(id) && id > 0 ? id : null;
+}
+
+function normalizePoolRefreshAction(value) {
+  return ["cooldown", "switch-proxy", "relogin", "reauthorize"].includes(value) ? value : null;
+}
+
+function normalizeSub2ApiProxyList(payload) {
+  const data = payload?.data && typeof payload.data === "object" ? payload.data : payload;
+  const list = Array.isArray(data) ? data : Array.isArray(data?.items) ? data.items : Array.isArray(data?.proxies) ? data.proxies : [];
+  const directList = list.some((proxy) => Object.hasOwn(proxy || {}, "id"));
+  return list.flatMap((proxy) => {
+    const id = normalizeStoredProxyId(proxy?.id);
+    if (!id) return [];
+    const protocol = String(proxy.protocol || "http").replace(/:\/\/$/, "").toLowerCase();
+    const explicitUrl = String(proxy.proxy_url || proxy.url || "").trim();
+    let url = null;
+    try {
+      if (explicitUrl) url = normalizeProxyUrl(explicitUrl);
+      else if (proxy.host && Number(proxy.port) > 0 && ["http", "https", "socks5", "socks5h"].includes(protocol)) {
+        const parsed = new URL(`${protocol}://${proxy.host}:${Number(proxy.port)}`);
+        const username = String(proxy.username || proxy.user || proxy.auth?.username || "");
+        const password = String(proxy.password || proxy.auth?.password || "");
+        if (username) parsed.username = username;
+        if (password) parsed.password = password;
+        url = normalizeProxyUrl(parsed.toString());
+      }
+    } catch {}
+    return [{
+      ...proxy,
+      id,
+      name: String(proxy.name || `代理 ${id}`),
+      protocol,
+      host: String(proxy.host || ""),
+      port: Number(proxy.port || 0),
+      ipAddress: String(proxy.ip_address || proxy.ipAddress || proxy.exit_ip || proxy.ip || proxy.host || "").trim(),
+      status: String(proxy.status || "active"),
+      url,
+      hasUrl: Boolean(url),
+      directList,
+    }];
+  });
+}
+
+function publicSub2ApiProxy(proxy) {
+  return {
+    id: proxy.id,
+    name: proxy.name,
+    protocol: proxy.protocol,
+    host: proxy.host,
+    port: proxy.port,
+    ipAddress: proxy.ipAddress,
+    status: proxy.status,
+  };
+}
+
+async function listSub2ApiProxies(config = sub2ApiSettingsConfig) {
+  if (!config?.baseUrl || !config?.adminApiKey) throw httpError(409, "请先配置 Sub2API 后端和管理员 API Key");
+  return normalizeSub2ApiProxyList(await requestSub2Api(config, "/api/v1/admin/proxies/all"));
+}
+
+// Resolve the saved binding before each login; never silently change its exit IP.
+async function codexOAuthSettingsForJob(job) {
+  const selectedMode = codexAuthMode;
+  if (selectedMode !== "sub2api") return { codexAuthMode: "local" };
+  const config = sub2ApiSettingsConfig;
+  if (!config?.baseUrl || !config?.adminApiKey) throw new Error("请先配置 Sub2API 后端地址和管理员 API Key");
+  let proxyId = null;
+  if (accountProxyMode === "sub2api") {
+    proxyId = normalizeStoredProxyId(job.assignedProxyId);
+    if (!proxyId) throw new Error("账号缺少已分配的 Sub2API 代理");
+  } else if (job.proxyUrl) {
+    const proxies = await listSub2ApiProxies(config);
+    proxyId = proxies.find((proxy) => proxy.url === job.proxyUrl && !isSub2ApiProxyExpired(proxy))?.id || null;
+    if (!proxyId) throw new Error("Sub2API 授权需要使用号池中已有的同一代理，请选择 Sub2API 账号代理模式或同步全局代理配置");
+  }
+  return { codexAuthMode: selectedMode, loginProxyUrl: job.proxyUrl,
+    sub2ApiOAuth: { baseUrl: config.baseUrl, adminApiKey: config.adminApiKey, proxyId } };
+}
+
+async function refreshJobProxyBinding(job) {
+  job.fixedProxy = accountProxyMode === "sub2api";
+  if (!job.fixedProxy) return;
+  if (!job.assignedProxyId) {
+    const assignment = (await assignSub2ApiProxies([job])).get(job.id);
+    if (assignment) job.assignedProxyId = assignment.id;
+  }
+  const proxy = (await listSub2ApiProxies()).find((item) => item.id === job.assignedProxyId);
+  if (!proxy?.url || isSub2ApiProxyExpired(proxy)) throw httpError(409, "账号绑定代理已失效，请在 Sub2API 修复代理或手动切换 IP");
+  job.proxyUrl = proxy.url;
+  job.proxyFallbackActive = false;
+  await saveStoredLoginCredentials(job.email, job);
+  await saveJobMetadata(job);
+}
+
+function proxyIpKey(proxy) {
+  return String(proxy.ipAddress || proxy.host || proxy.id).trim().toLowerCase();
+}
+
+async function assignSub2ApiProxies(accounts, { reassign = false } = {}) {
+  const run = accountProxyAssignmentPromise.catch(() => {}).then(async () => {
+    const config = sub2ApiSettingsConfig;
+    if (!config?.baseUrl || !config?.adminApiKey) throw httpError(409, "请先配置 Sub2API 后端和管理员 API Key");
+    const allProxies = await listSub2ApiProxies(config);
+    const allProxiesById = new Map(allProxies.map((proxy) => [proxy.id, proxy]));
+    const proxies = allProxies.filter((proxy) => proxy.url && !isSub2ApiProxyExpired(proxy));
+    const ipGroups = new Map();
+    for (const proxy of proxies) {
+      const ip = proxyIpKey(proxy);
+      if (!ipGroups.has(ip)) ipGroups.set(ip, { ip, accountCount: 0, proxyCounts: new Map(), proxies: [] });
+      ipGroups.get(ip).proxies.push(proxy);
+    }
+    if (!ipGroups.size) throw httpError(409, "Sub2API 中没有可用且包含连接地址的代理");
+    const targets = new Set(accounts.map((account) => String(account.email || "").toLowerCase()));
+    const listing = await listSub2ApiAccounts(config, { withMeta: true });
+    if (!listing.complete) throw httpError(409, "Sub2API 账号列表不完整，已停止代理分配");
+    const proxyById = new Map(proxies.map((proxy) => [proxy.id, proxy]));
+    const backend = monitorBackendIdentity(config);
+    for (const [email, reservation] of accountProxyReservations) {
+      if (reservation.expiresAt < Date.now() || reservation.backend !== backend) accountProxyReservations.delete(email);
+    }
+    const targetByEmail = new Map(accounts.map((account) => [String(account.email || "").toLowerCase(), account]));
+    const remoteEmails = new Set();
+    const countedEmails = new Set();
+    const assignments = new Map();
+    for (const remote of listing.accounts) {
+      const email = String(sub2ApiAccountEmail(remote) || "").toLowerCase();
+      if (email) remoteEmails.add(email);
+      const local = findJobByEmail(email);
+      const proxy = proxyById.get(normalizeStoredProxyId(accountProxyReservations.get(email)?.proxyId || local?.assignedProxyId || remote.proxy_id));
+      if (targets.has(email)) {
+        const target = targetByEmail.get(email);
+        if (!reassign && target && !target.assignedProxyId && proxy && !assignments.has(target.id || email)) {
+          assignments.set(target.id || email, proxy);
+          const group = ipGroups.get(proxyIpKey(proxy));
+          group.accountCount += 1;
+          group.proxyCounts.set(proxy.id, (group.proxyCounts.get(proxy.id) || 0) + 1);
+        }
+        continue;
+      }
+      if (!proxy) continue;
+      if (email && countedEmails.has(email)) continue;
+      if (email) countedEmails.add(email);
+      const group = ipGroups.get(proxyIpKey(proxy));
+      group.accountCount += 1;
+      group.proxyCounts.set(proxy.id, (group.proxyCounts.get(proxy.id) || 0) + 1);
+    }
+    for (const job of jobs.values()) {
+      const email = String(job.email || "").toLowerCase();
+      if (!email || targets.has(email) || remoteEmails.has(email)) continue;
+      const proxy = proxyById.get(normalizeStoredProxyId(accountProxyReservations.get(email)?.proxyId || job.assignedProxyId));
+      if (!proxy) continue;
+      const group = ipGroups.get(proxyIpKey(proxy));
+      group.accountCount += 1;
+      group.proxyCounts.set(proxy.id, (group.proxyCounts.get(proxy.id) || 0) + 1);
+    }
+    for (const [email, reservation] of accountProxyReservations) {
+      if (reservation.expiresAt < Date.now() || reservation.backend !== backend) {
+        accountProxyReservations.delete(email);
+        continue;
+      }
+      if (targets.has(email) || remoteEmails.has(email) || findJobByEmail(email)) continue;
+      const proxy = proxyById.get(reservation.proxyId);
+      if (!proxy) continue;
+      const group = ipGroups.get(proxyIpKey(proxy));
+      group.accountCount += 1;
+      group.proxyCounts.set(proxy.id, (group.proxyCounts.get(proxy.id) || 0) + 1);
+    }
+    for (const account of accounts) {
+      const key = String(account.email || "").toLowerCase();
+      if (!reassign && assignments.has(account.id || key)) continue;
+      if (!reassign && account.assignedProxyId) {
+        const preserved = proxyById.get(account.assignedProxyId);
+        if (preserved) {
+          assignments.set(account.id || key, preserved);
+          const group = ipGroups.get(proxyIpKey(preserved));
+          group.accountCount += 1;
+          group.proxyCounts.set(preserved.id, (group.proxyCounts.get(preserved.id) || 0) + 1);
+          continue;
+        }
+        throw httpError(409, `${account.email} 绑定的代理已失效，请修复代理或手动切换 IP`);
+      }
+      const previousProxy = allProxiesById.get(account.assignedProxyId);
+      const previousIp = previousProxy ? proxyIpKey(previousProxy) : null;
+      const alternatives = [...ipGroups.values()].filter((group) => !reassign || !previousIp || group.ip !== previousIp);
+      if (reassign && previousIp && !alternatives.length) throw httpError(409, `${account.email} 当前 Sub2API 代理没有不同的出口 IP`);
+      const candidates = alternatives;
+      candidates.sort((left, right) => left.accountCount - right.accountCount || left.ip.localeCompare(right.ip));
+      const group = candidates[0];
+      const proxy = [...group.proxies].sort((left, right) => (group.proxyCounts.get(left.id) || 0) - (group.proxyCounts.get(right.id) || 0) || left.id - right.id)[0];
+      assignments.set(account.id || key, proxy);
+      group.accountCount += 1;
+      group.proxyCounts.set(proxy.id, (group.proxyCounts.get(proxy.id) || 0) + 1);
+    }
+    for (const account of accounts) {
+      const email = String(account.email || "").toLowerCase();
+      const proxy = assignments.get(account.id || email);
+      if (proxy) accountProxyReservations.set(email, { proxyId: proxy.id, backend, expiresAt: Date.now() + 300_000 });
+    }
+    return assignments;
+  });
+  accountProxyAssignmentPromise = run;
+  return run;
+}
+
+async function assignNextSub2ApiProxy() {
+  return (await assignSub2ApiProxies([{ email: crypto.randomUUID() }])).values().next().value;
+}
+
 function isSub2ApiAccountInMonitoredGroups(account, groupIds) {
   if (!groupIds.length) return true;
   const accountGroupIds = sub2ApiAccountGroupIds(account)
@@ -5286,7 +5814,9 @@ async function performSub2ApiAutoRepairSuccess(job) {
         ...(job.remarkSyncPending ? { notes: job.remark || "" } : {}),
         ...(accountName ? { name: accountName } : {}),
         ...(accountConfig.groupIds.length ? { group_ids: accountConfig.groupIds } : {}),
-        ...sub2ApiProxyFields(accountConfig),
+        ...(accountProxyMode === "sub2api" && job.assignedProxyId
+          ? { proxy_id: job.assignedProxyId }
+          : sub2ApiProxyFields(accountConfig)),
         ...(accountConfig.concurrency !== null ? { concurrency: accountConfig.concurrency } : {}),
         ...(accountConfig.loadFactor !== null ? { load_factor: accountConfig.loadFactor } : {}),
         ...(accountConfig.priority !== null && !accountConfig.importDatePriority?.enabled ? { priority: accountConfig.priority } : {}),
@@ -5466,6 +5996,11 @@ function publicJob(job) {
     canAddPassword: canAddPassword(job),
     restartRequired: job.restartRequired,
     proxyConfigured: Boolean(job.proxyUrl),
+    assignedProxyId: normalizeStoredProxyId(job.assignedProxyId),
+    poolRefreshReady: Boolean(job.poolRefreshReady),
+    poolRefreshAction: normalizePoolRefreshAction(job.poolRefreshAction),
+    poolRefreshDueAt: job.poolRefreshDueAt || null,
+    poolRefreshError: job.poolRefreshError || null,
     autoRepairEligible: autoRepair.eligible,
     autoRepairEligibilityReason: autoRepair.reason,
     autoRepairBlocked: Boolean(job.autoRepairBlocked),
@@ -5856,6 +6391,90 @@ function recordJobOperation(job, type, at = new Date().toISOString()) {
   job.lastOperationType = type;
 }
 
+function clearPoolRefreshTimer(job) {
+  clearTimeout(poolRefreshTimers.get(job.id));
+  poolRefreshTimers.delete(job.id);
+}
+
+function beginPoolRefresh(job, action, dueAt = null) {
+  clearPoolRefreshTimer(job);
+  job.poolRefreshAction = action;
+  job.poolRefreshDueAt = dueAt;
+  job.poolRefreshError = null;
+  job.poolRefreshReady = false;
+}
+
+function schedulePoolRefresh(job, delayMs) {
+  clearPoolRefreshTimer(job);
+  if (shuttingDown || job.deleted || !job.poolRefreshAction) return;
+  const timer = setTimeout(() => {
+    poolRefreshTimers.delete(job.id);
+    if (shuttingDown || job.deleted || jobs.get(job.id) !== job || !job.poolRefreshAction) return;
+    const operation = withEmailJobLock(job.email, () => runPoolRefresh(job));
+    poolRefreshOperations.add(operation);
+    void operation.catch(async (error) => {
+      if (shuttingDown || job.deleted) return;
+      job.poolRefreshError = String(error?.message || error).slice(0, 500);
+      appendJobLog(job, `[pool-refresh] 自动恢复失败：${job.poolRefreshError}\n`);
+      touch(job);
+      await saveJobMetadata(job).catch(() => {});
+      schedulePoolRefresh(job, 60_000);
+    }).finally(() => poolRefreshOperations.delete(operation));
+  }, Math.min(2_147_483_647, Math.max(0, Number(delayMs) || 0)));
+  timer.unref?.();
+  poolRefreshTimers.set(job.id, timer);
+}
+
+async function runPoolRefresh(job) {
+  if (shuttingDown || job.deleted || !job.poolRefreshAction) return;
+  if (job.poolRefreshReady && job.status === "completed" && job.resultSaved) {
+    await synchronizePoolRefresh(job);
+    return;
+  }
+  if (job.poolRefreshAction === "cooldown" && job.poolRefreshDueAt) {
+    const remaining = Date.parse(job.poolRefreshDueAt) - Date.now();
+    if (remaining > 0) {
+      schedulePoolRefresh(job, remaining);
+      return;
+    }
+    if (!canForceRelogin(job)) {
+      schedulePoolRefresh(job, 60_000);
+      return;
+    }
+    await forceReloginJob(job, {}, { poolRefreshAction: "cooldown" });
+    await saveJobMetadata(job);
+  } else if (!job.poolRefreshReady && !job.poolRefreshError && canForceRelogin(job)) {
+    await forceReloginJob(job, {}, { poolRefreshAction: job.poolRefreshAction });
+    await saveJobMetadata(job);
+  }
+}
+
+async function synchronizePoolRefresh(job) {
+  const action = normalizePoolRefreshAction(job.poolRefreshAction);
+  if (!action || !job.poolRefreshReady || job.status !== "completed" || shuttingDown || job.deleted) return null;
+  try {
+    const config = sub2ApiSettingsConfig;
+    if (!config?.baseUrl || !config?.adminApiKey) throw new Error("尚未配置 Sub2API 后端和管理员 API Key");
+    await uploadJobsToSub2Api([job], config, snapshotSub2ApiProfileState());
+    job.poolRefreshAction = null;
+    job.poolRefreshDueAt = null;
+    job.poolRefreshError = null;
+    job.poolRefreshReady = false;
+    clearPoolRefreshTimer(job);
+    appendJobLog(job, `[pool-refresh] ${action === "cooldown" ? "冷却后重新授权" : action === "switch-proxy" ? "切换代理后重新授权" : "重新授权"}已完成，号池凭据已同步。\n`);
+    touch(job);
+    await saveJobMetadata(job);
+    return true;
+  } catch (error) {
+    job.poolRefreshError = String(error?.message || error).slice(0, 500);
+    appendJobLog(job, `[pool-refresh] 重新授权成功，但号池凭据同步失败：${job.poolRefreshError}\n`);
+    touch(job);
+    await saveJobMetadata(job);
+    schedulePoolRefresh(job, 60_000);
+    return false;
+  }
+}
+
 function sanitizeLog(text) {
   return String(text)
     .replace(/([?&](?:code|token|state|csrf|nonce|otp|login_hint|code_challenge)=)[^&\s]+/gi, "$1<redacted>")
@@ -5964,6 +6583,8 @@ async function deleteJobsByEmail(email) {
   const directories = new Set();
   matching.forEach((job) => {
     job.deleted = true;
+    clearPoolRefreshTimer(job);
+    accountProxyReservations.delete(job.email.toLowerCase());
     stopMailPolling(job);
     releaseSmsNumber(job, "idle");
     job.runId = crypto.randomUUID();
@@ -6064,6 +6685,12 @@ async function syncCompletedOutputs(force = false) {
           mailApiUrl,
           mailRequestBody: typeof metadata.mail_request_body === "string" ? metadata.mail_request_body : "",
           proxyUrl: storedCredentials.proxyUrl,
+          assignedProxyId: normalizeStoredProxyId(metadata.assigned_proxy_id),
+          fixedProxy: accountProxyMode === "sub2api",
+          poolRefreshReady: metadata.pool_refresh_ready === true,
+          poolRefreshAction: normalizePoolRefreshAction(metadata.pool_refresh_action),
+          poolRefreshDueAt: metadata.pool_refresh_due_at || null,
+          poolRefreshError: metadata.pool_refresh_error || null,
           mailSeenCandidateKeys: new Set(),
           mailCandidateCounts: new Map(),
           mailStatus: mailApiUrl ? "ready" : "manual",
@@ -6091,6 +6718,12 @@ async function syncCompletedOutputs(force = false) {
           securityCheckRequired: Boolean(metadata.security_check_required),
           ...newSmsState(),
         });
+        const restored = jobs.get(entry.name);
+        if (restored.poolRefreshAction) {
+          schedulePoolRefresh(restored, restored.poolRefreshAction === "cooldown" && restored.poolRefreshDueAt
+            ? Math.max(0, Date.parse(restored.poolRefreshDueAt) - Date.now())
+            : 0);
+        }
         return;
       } catch {}
 
@@ -6164,6 +6797,12 @@ async function syncCompletedOutputs(force = false) {
           mailApiUrl,
           mailRequestBody: typeof metadata.mail_request_body === "string" ? metadata.mail_request_body : "",
           proxyUrl: storedCredentials.proxyUrl,
+          assignedProxyId: normalizeStoredProxyId(metadata.assigned_proxy_id),
+          fixedProxy: accountProxyMode === "sub2api",
+          poolRefreshReady: metadata.pool_refresh_ready === true,
+          poolRefreshAction: normalizePoolRefreshAction(metadata.pool_refresh_action),
+          poolRefreshDueAt: metadata.pool_refresh_due_at || null,
+          poolRefreshError: metadata.pool_refresh_error || null,
           mailSeenCandidateKeys: new Set(),
           mailCandidateCounts: new Map(),
           mailStatus: mailApiUrl ? "ready" : "manual",
@@ -6261,6 +6900,12 @@ async function syncCompletedOutputs(force = false) {
           mailApiUrl,
           mailRequestBody: typeof metadata.mail_request_body === "string" ? metadata.mail_request_body : "",
           proxyUrl: storedCredentials.proxyUrl,
+          assignedProxyId: normalizeStoredProxyId(metadata.assigned_proxy_id),
+          fixedProxy: accountProxyMode === "sub2api",
+          poolRefreshReady: metadata.pool_refresh_ready === true,
+          poolRefreshAction: normalizePoolRefreshAction(metadata.pool_refresh_action),
+          poolRefreshDueAt: metadata.pool_refresh_due_at || null,
+          poolRefreshError: metadata.pool_refresh_error || null,
           mailSeenCandidateKeys: new Set(),
           mailCandidateCounts: new Map(),
           mailStatus: mailApiUrl ? "baseline" : "manual",
@@ -7309,6 +7954,11 @@ async function saveJobMetadata(job) {
         proxy_risk_retry_count: Number(job.proxyRiskRetryCount || 0),
         proxy_connection_failure_count: Number(job.proxyConnectionFailureCount || 0),
         proxy_configured: Boolean(job.proxyUrl),
+        assigned_proxy_id: normalizeStoredProxyId(job.assignedProxyId),
+        pool_refresh_ready: Boolean(job.poolRefreshReady),
+        pool_refresh_action: normalizePoolRefreshAction(job.poolRefreshAction),
+        pool_refresh_due_at: job.poolRefreshDueAt || null,
+        pool_refresh_error: job.poolRefreshError || null,
         sms_provider_id: job.smsProviderId || null,
         sms_provider_name: job.smsProviderName || null,
         sms_service_label: job.smsServiceLabel || null,
@@ -7617,6 +8267,8 @@ async function shutdown() {
   if (shutdownPromise) return shutdownPromise;
   shutdownPromise = (async () => {
     shuttingDown = true;
+    for (const timer of poolRefreshTimers.values()) clearTimeout(timer);
+    poolRefreshTimers.clear();
     queueSchedulingPaused = true;
     if (sub2ApiMonitorTimer) {
       clearInterval(sub2ApiMonitorTimer);
@@ -7628,6 +8280,7 @@ async function shutdown() {
       taskSettingsWritePromise,
       ...sub2ApiRequestPromises,
       ...sub2ApiAutoRepairPromises,
+      ...poolRefreshOperations,
     ].filter(Boolean));
     const activeJobs = [...jobs.values()].filter((job) => isActive(job.status));
     const childWaits = activeJobs

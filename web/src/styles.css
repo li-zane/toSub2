@@ -180,6 +180,12 @@ button:focus-visible, a:focus-visible, select:focus-visible { outline: 2px solid
 .provider-ready.incomplete { color: var(--amber); }
 .proxy-fallback-option { display: flex; align-items: center; gap: 7px; min-height: 32px; font-size: 12px; line-height: 1.5; }
 .proxy-fallback-option input { flex: 0 0 auto; width: 16px; height: 16px; }
+.proxy-mode-control { display: flex; width: fit-content; max-width: 100%; padding: 3px; border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--surface-muted); }
+.proxy-mode-control button { min-height: 30px; padding: 0 10px; border: 0; border-radius: var(--radius-sm); background: transparent; color: var(--muted); font-size: 12px; font-weight: 650; cursor: pointer; }
+.proxy-mode-control button.active { background: var(--surface); color: var(--ink); box-shadow: var(--shadow-sm); }
+.proxy-mode-control button:disabled { cursor: not-allowed; opacity: .6; }
+.proxy-distribution { width: 100%; display: grid; gap: 4px; color: var(--muted); font-size: 11px; line-height: 1.5; }
+.proxy-distribution span { overflow-wrap: anywhere; }
 .provider-field {
   width: 100%;
   height: 34px;
@@ -906,6 +912,13 @@ tbody tr:last-child td { border-bottom: 0; }
 .task-limit-field { margin-top: 20px; }
 .task-settings-dialog .task-limit-field > div { height: 44px; }
 .task-settings-dialog .task-limit-field input { font-size: 16px; font-variant-numeric: tabular-nums; }
+.task-cooldown-field { margin-top: 16px; }
+.task-cooldown-field > div { height: 40px; }
+.task-cooldown-field input { font-variant-numeric: tabular-nums; }
+.task-auth-mode-field { margin-top: 16px; }
+.task-auth-mode-field select { width: 100%; min-width: 0; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--ink); font: inherit; }
+.task-auth-mode-field small { color: var(--muted); font-size: 12px; line-height: 1.6; }
+.task-cooldown-field > div > span { flex-shrink: 0; white-space: nowrap; }
 .task-auto-settings { display: grid; gap: 12px; margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--line); }
 .task-auto-settings-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
 .task-auto-settings-heading h3 { margin: 0 0 4px; color: var(--ink); font-size: 14px; }

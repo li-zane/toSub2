@@ -55,18 +55,26 @@ if (/^(blocked|fallback)@/.test(email) && proxy) {
     console.log('proxy settings API=404; server settings have no global proxy or fallback switch');
   } else {
     assert.equal(response.status, 200);
-    assert.deepEqual((await response.json()).settings, { proxyUrl: "", allowDirectFallback: false });
+    assert.deepEqual((await response.json()).settings, { proxyUrl: "", allowDirectFallback: false, mode: "global" });
     assert.equal((await fetch(`${base}/api/account-proxy-settings`)).status, 403);
     assert.equal((await request("/api/account-proxy-settings", { proxyUrl: "invalid", allowDirectFallback: false })).status, 400);
     assert.equal((await request("/api/account-proxy-settings", { proxyUrl: proxy, allowDirectFallback: "false" })).status, 400);
     await save(proxy, false);
+    let modeResponse = await request("/api/account-proxy-settings", { proxyUrl: proxy, allowDirectFallback: false, mode: "sub2api" });
+    assert.equal(modeResponse.status, 409, "Sub2API mode requires saved backend credentials");
+    modeResponse = await request("/api/sub2api/settings", { config: { baseUrl: `http://127.0.0.1:${remote.address().port}`, adminApiKey: "fixture-key" } });
+    assert.equal(modeResponse.status, 200, await modeResponse.text());
+    modeResponse = await request("/api/account-proxy-settings", { proxyUrl: proxy, allowDirectFallback: false, mode: "sub2api" });
+    assert.equal(modeResponse.status, 409, "proxy without connection endpoint cannot be used for login");
+    modeResponse = await request("/api/account-proxy-settings", { proxyUrl: proxy, allowDirectFallback: false, mode: "global" });
+    assert.equal(modeResponse.status, 200);
     const seedAccountProxy = await request("/api/jobs", { email: emails[0], proxyUrl: proxy });
     assert.equal(seedAccountProxy.status, 200);
     const bootstrap = await (await fetch(`${base}/api/bootstrap`)).json();
     assert.equal(Object.hasOwn(bootstrap.taskSettings, "proxyUrl"), false, "unauthenticated bootstrap must not expose proxy credentials");
     await stop();
     await start();
-    assert.deepEqual((await (await fetch(`${base}/api/account-proxy-settings`, { headers })).json()).settings, { proxyUrl: proxy, allowDirectFallback: false });
+    assert.deepEqual((await (await fetch(`${base}/api/account-proxy-settings`, { headers })).json()).settings, { proxyUrl: proxy, allowDirectFallback: false, mode: "global" });
     const created = await request("/api/jobs", { email: "new@example.com", proxyUrl: "" });
     assert.equal(created.status, 201);
     await waitFor(async () => (await records()).some(r => r.email === "new@example.com" && r.proxy === proxy));

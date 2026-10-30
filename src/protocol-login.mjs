@@ -10,6 +10,7 @@ import {
   shouldUseTlsTransport,
   TlsFingerprintTransport,
 } from "./tls-transport.mjs";
+import { normalizeCodexAuthMode, generateSub2ApiOAuth, exchangeSub2ApiOAuth, refreshSub2ApiOAuth, sub2ApiOAuthIdentity } from "./sub2api-oauth.mjs";
 
 const DEFAULT_CHATGPT_BASE = "https://chatgpt.com";
 const DEFAULT_AUTH_BASE = "https://auth.openai.com";
@@ -315,6 +316,12 @@ class ProtocolClient {
 
 async function run() {
   const args = parseArgs(process.argv.slice(2));
+  const codexAuthMode = normalizeCodexAuthMode(process.env.TOSUB2_CODEX_AUTH_MODE);
+  const sub2ApiOAuth = codexAuthMode === "sub2api" ? {
+    baseUrl: process.env.TOSUB2_OAUTH_BASE_URL,
+    adminApiKey: process.env.TOSUB2_OAUTH_ADMIN_KEY,
+    proxyId: process.env.TOSUB2_OAUTH_PROXY_ID || null,
+  } : null;
   if (args.help) {
     printHelp();
     return;
@@ -337,6 +344,7 @@ async function run() {
       || "chrome146",
     verbose: Boolean(args.verbose),
     maxProxySessionAttempts: process.env.CHATGPT_PROXY_MAX_ATTEMPTS || 10,
+    rotateProxySessions: process.env.CHATGPT_PROXY_FIXED !== "1",
     sameProxyRiskRetryDelayMs: process.env.CHATGPT_SAME_PROXY_RISK_RETRY_DELAY_MS,
   });
   async function prepareLoginProxy(url) {
@@ -351,8 +359,10 @@ async function run() {
   }
   try {
     if (args.refreshSub2api) {
-      if (proxyTemplate) await prepareLoginProxy(`${authBase}/`);
-      else await transport.configure(null, { force: true });
+      if (!sub2ApiOAuth) {
+        if (proxyTemplate) await prepareLoginProxy(`${authBase}/`);
+        else await transport.configure(null, { force: true });
+      }
       const sourcePath = path.resolve(args.refreshSub2api);
       const targetPath = path.resolve(args.sub2apiOut || sourcePath);
       const refreshed = await refreshSub2apiOauthExport({
@@ -361,6 +371,7 @@ async function run() {
         targetPath,
         fallbackClientId: args.codexClientId || DEFAULT_CODEX_CLIENT_ID,
         transport,
+        sub2ApiOAuth,
       });
       console.log(`[ok] Saved sub2api import: ${targetPath}`);
       console.log(`[ok] Refreshed OAuth account: ${refreshed.email || "<unknown>"}`);
@@ -556,6 +567,9 @@ async function run() {
     let codex = null;
     const codexOptions = {
       authBase,
+      codexAuthMode,
+      sub2ApiOAuth,
+      expectedEmail: email,
       rl,
       phone: args.phone,
       codexClientId: args.codexClientId || DEFAULT_CODEX_CLIENT_ID,
@@ -593,7 +607,7 @@ async function run() {
       });
       console.log(`[resume] Continue saved login flow from ${checkpoint.stage}.`);
       try {
-        codex = await resumeCodexOauth(client, { ...codexOptions, saveCheckpoint }, checkpoint);
+        codex = await resumeCodexOauth(client, { ...codexOptions, expectedEmail: email, saveCheckpoint }, checkpoint);
         web = checkpoint.web || null;
       } catch (error) {
         if (isSecurityCheckRequiredError(error)) throw error;
@@ -641,7 +655,7 @@ async function run() {
       if (!args.webOnly) {
         console.log("[2/5] Start Codex OAuth flow");
         try {
-          codex = await runCodexOauth(client, { ...codexOptions, saveCheckpoint });
+          codex = await runCodexOauth(client, { ...codexOptions, expectedEmail: email, saveCheckpoint });
         } catch (error) {
           if (isSecurityCheckRequiredError(error)) throw error;
           if (!isExpiredCheckpointError(error)) throw error;
@@ -676,13 +690,13 @@ async function run() {
       console.log("[ok] Codex callback URL:");
       console.log(safeUrl(codex.callbackUrl));
     }
-    if (codex?.callbackUrl && codex?.codeVerifier && !args.noSub2apiExport && outputMode !== "session") {
+    if (codex?.callbackUrl && (codex?.codeVerifier || codex?.sub2ApiSessionId) && !args.noSub2apiExport && outputMode !== "session") {
       console.log("[6/6] Convert OAuth callback to sub2api import");
       const sub2apiExport = await buildSub2apiOauthExport({
         authBase,
         callbackUrl: codex.callbackUrl,
         codeVerifier: codex.codeVerifier,
-        clientId: args.codexClientId || DEFAULT_CODEX_CLIENT_ID,
+        clientId: codex.clientId || args.codexClientId || DEFAULT_CODEX_CLIENT_ID,
         redirectUri: codex.redirectUri || args.codexRedirectUri || DEFAULT_CODEX_REDIRECT_URI,
         expectedState: codex.state,
         accountName: args.sub2apiName,
@@ -690,6 +704,8 @@ async function run() {
         priority: args.priority,
         rateMultiplier: args.rateMultiplier,
         transport,
+        sub2ApiOAuth: codex.provider === "sub2api" ? sub2ApiOAuth : null,
+        oauth: codex,
       });
       await writeJsonAtomic(sub2apiOutPath, sub2apiExport.data);
       await removeProtocolCheckpoint(checkpointPath);
@@ -1574,6 +1590,11 @@ function decodeBase32Secret(value) {
 }
 
 async function runCodexOauth(client, options) {
+  if (options.codexAuthMode === "sub2api") {
+    const oauth = await generateSub2ApiOAuth(options.sub2ApiOAuth, options);
+    const { authUrl, ...session } = oauth;
+    return followCodexAuthorization(client, { ...options, codexRedirectUri: oauth.redirectUri }, authUrl, session);
+  }
   const codeVerifier = base64Url(crypto.randomBytes(48));
   const codeChallenge = base64Url(crypto.createHash("sha256").update(codeVerifier).digest());
   const state = base64Url(crypto.randomBytes(24));
@@ -1599,10 +1620,16 @@ async function runCodexOauth(client, options) {
   }
   const authUrl = `${options.authBase}/oauth/authorize?${parameters}`;
 
+  return followCodexAuthorization(client, options, authUrl, { codeVerifier, state, redirectUri: options.codexRedirectUri });
+}
+
+async function followCodexAuthorization(client, options, authUrl, session) {
+  const { state } = session;
+
   const authorized = await client.follow(authUrl);
   if (isLocalCallback(authorized.finalUrl)) {
     validateCodexCallback(authorized.finalUrl, { redirectUri: options.codexRedirectUri, expectedState: state });
-    const result = { callbackUrl: authorized.finalUrl, codeVerifier, state, redirectUri: options.codexRedirectUri };
+    const result = { ...session, callbackUrl: authorized.finalUrl, state, redirectUri: options.codexRedirectUri };
     await options.saveCheckpoint?.("callback_ready", { oauth: result });
     return result;
   }
@@ -1629,7 +1656,7 @@ async function runCodexOauth(client, options) {
   }, { referer: `${options.authBase}/choose-an-account` });
   let current = selected;
   const addPhoneUrl = getContinueUrl(selected);
-  const oauth = { codeVerifier, state, sessionId, addPhoneUrl, redirectUri: options.codexRedirectUri };
+  const oauth = { ...session, state, sessionId, addPhoneUrl, redirectUri: options.codexRedirectUri };
   if (options.debugAuth) {
     logAuthSnapshot(client, "session/select", `${options.authBase}/api/accounts/session/select`, HAR_ADD_PHONE_COOKIE_NAMES);
     console.log(`[debug] session/select continue_url: ${addPhoneUrl || "<none>"}`);
@@ -1657,7 +1684,13 @@ async function resumeCodexOauth(client, options, checkpoint) {
   }
 
   const oauth = checkpoint.oauth || {};
-  if (!oauth.codeVerifier || !oauth.state) throw new Error("CHECKPOINT_INVALID: missing OAuth PKCE state");
+  const remote = oauth.provider === "sub2api";
+  if ((options.codexAuthMode === "sub2api") !== remote
+    || (remote && oauth.sub2ApiBackend !== sub2ApiOAuthIdentity(options.sub2ApiOAuth))) {
+    console.log("[resume] OAuth provider or backend changed; starting a new authorization with the saved login session.");
+    return runCodexOauth(client, options);
+  }
+  if ((!remote && !oauth.codeVerifier) || (remote && !oauth.sub2ApiSessionId) || !oauth.state) throw new Error("CHECKPOINT_INVALID: missing OAuth session state");
   // Before redirectUri was recorded, the protocol's fixed default was localhost.
   if (!oauth.redirectUri) {
     oauth.redirectUri = isLocalCallback(oauth.callbackUrl)
@@ -1668,8 +1701,9 @@ async function resumeCodexOauth(client, options, checkpoint) {
     const redirectUri = oauth.redirectUri;
     validateCodexCallback(oauth.callbackUrl, { redirectUri, expectedState: oauth.state });
     return {
+      ...oauth,
       callbackUrl: oauth.callbackUrl,
-      codeVerifier: oauth.codeVerifier,
+      ...(oauth.codeVerifier ? { codeVerifier: oauth.codeVerifier } : {}),
       state: oauth.state,
       redirectUri,
       workspaceId: oauth.workspaceId || null,
@@ -1720,8 +1754,9 @@ async function finishCodexOauth(client, options, initial, oauth) {
 
   const continued = await continueFlow(client, current);
   const result = {
+    ...oauth,
     callbackUrl: continued?.finalUrl || current?.continue_url || null,
-    codeVerifier: oauth.codeVerifier,
+    ...(oauth.codeVerifier ? { codeVerifier: oauth.codeVerifier } : {}),
     state: oauth.state,
     redirectUri: oauth.redirectUri || options.codexRedirectUri,
     workspaceId: workspaceId || null,
@@ -1885,10 +1920,12 @@ async function buildSub2apiOauthExport({
   priority,
   rateMultiplier,
   transport,
+  sub2ApiOAuth,
+  oauth,
 }) {
   const code = validateCodexCallback(callbackUrl, { redirectUri, expectedState });
 
-  const tokenSet = await exchangeOAuthCode({
+  const tokenSet = sub2ApiOAuth ? await exchangeSub2ApiOAuth(sub2ApiOAuth, oauth, code) : await exchangeOAuthCode({
     authBase,
     clientId,
     code,
@@ -1897,12 +1934,20 @@ async function buildSub2apiOauthExport({
     transport,
   });
 
-  const claims = decodeJwtPayload(tokenSet.id_token);
+  const claims = tokenSet.id_token ? decodeJwtPayload(tokenSet.id_token) : {};
   const authClaims = claims["https://api.openai.com/auth"] || {};
-  const planType = planTypeFromClaims(claims) || planTypeFromJwt(tokenSet.access_token);
-  const email = claims.email || "";
-  const chatgptAccountId = claims.sid || "";
-  const chatgptUserId = authClaims.user_id || claims.sub || "";
+  const planType = tokenSet.plan_type || planTypeFromClaims(claims) || planTypeFromJwt(tokenSet.access_token);
+  const email = tokenSet.email || claims.email || "";
+  if (sub2ApiOAuth && !email) throw new Error("SUB2API_OAUTH_RESPONSE: 号池凭据缺少邮箱，已停止保存");
+  if (sub2ApiOAuth && oauth.expectedEmail && email.toLowerCase() !== oauth.expectedEmail.toLowerCase()) {
+    throw new Error("SUB2API_OAUTH_ACCOUNT: 返回的凭据与登录账号邮箱不一致");
+  }
+  const chatgptAccountId = sub2ApiOAuth
+    ? tokenSet.chatgpt_account_id || authClaims.chatgpt_account_id || claims.sid || ""
+    : claims.sid || "";
+  const chatgptUserId = sub2ApiOAuth
+    ? tokenSet.chatgpt_user_id || authClaims.chatgpt_user_id || authClaims.user_id || claims.sub || ""
+    : authClaims.user_id || claims.sub || "";
   const account = {
     name: accountName || buildAccountName(email),
     platform: "openai",
@@ -1913,19 +1958,22 @@ async function buildSub2apiOauthExport({
       email,
       id_token: tokenSet.id_token,
       refresh_token: tokenSet.refresh_token,
+      ...(sub2ApiOAuth ? { client_id: tokenSet.client_id || clientId,
+        ...(tokenSet.expires_at ? { expires_at: tokenSet.expires_at } : {}) } : {}),
       ...(planType ? { plan_type: planType } : {}),
     },
     extra: {
       account_id: chatgptAccountId,
       chatgpt_account_id: chatgptAccountId,
       chatgpt_user_id: chatgptUserId,
-      client_id: clientId,
+      client_id: tokenSet.client_id || clientId,
       email,
       ...(planType ? { plan_type: planType } : {}),
       openai_long_context_billing_enabled: false,
       openai_oauth_responses_websockets_v2_enabled: false,
       openai_oauth_responses_websockets_v2_mode: "off",
-      privacy_mode: "training_set_failed",
+      privacy_mode: tokenSet.privacy_mode || "training_set_failed",
+      ...(tokenSet.organization_id ? { organization_id: tokenSet.organization_id } : {}),
     },
     concurrency: Number(concurrency || 10),
     priority: Number(priority || 1),
@@ -2017,7 +2065,7 @@ async function exchangeOAuthCode({ authBase, clientId, code, codeVerifier, redir
   return data;
 }
 
-async function refreshSub2apiOauthExport({ authBase, sourcePath, targetPath, fallbackClientId, transport }) {
+async function refreshSub2apiOauthExport({ authBase, sourcePath, targetPath, fallbackClientId, transport, sub2ApiOAuth }) {
   let data;
   try {
     data = JSON.parse(await fs.readFile(sourcePath, "utf8"));
@@ -2027,24 +2075,47 @@ async function refreshSub2apiOauthExport({ authBase, sourcePath, targetPath, fal
   const account = data?.accounts?.[0];
   const credentials = account?.credentials;
   const refreshToken = credentials?.refresh_token;
-  const clientId = account?.extra?.client_id || fallbackClientId;
+  const clientId = credentials?.client_id || account?.extra?.client_id || fallbackClientId;
   if (data?.type !== "sub2api-data" || !account || !refreshToken) {
     throw new Error("REFRESH_TOKEN_INVALID: 原文件缺少 OAuth 账号或 refresh_token");
   }
 
-  const tokenSet = await refreshOAuthToken({ authBase, clientId, refreshToken, transport });
+  const tokenSet = sub2ApiOAuth ? await refreshSub2ApiOAuth(sub2ApiOAuth, refreshToken, clientId)
+    : await refreshOAuthToken({ authBase, clientId, refreshToken, transport });
+  if (sub2ApiOAuth && tokenSet.email && credentials.email && tokenSet.email.toLowerCase() !== credentials.email.toLowerCase()) {
+    throw new Error("SUB2API_OAUTH_ACCOUNT: 刷新响应的邮箱与账号不一致");
+  }
   credentials.access_token = tokenSet.access_token;
   credentials.refresh_token = tokenSet.refresh_token || refreshToken;
   if (tokenSet.id_token) credentials.id_token = tokenSet.id_token;
+  if (sub2ApiOAuth) {
+    const accountId = tokenSet.chatgpt_account_id || credentials.chatgpt_account_id || "";
+    const userId = tokenSet.chatgpt_user_id || account.extra?.chatgpt_user_id || "";
+    if (accountId) credentials.chatgpt_account_id = accountId;
+    if (tokenSet.email) credentials.email = tokenSet.email;
+    if (tokenSet.expires_at) credentials.expires_at = tokenSet.expires_at;
+    credentials.client_id = tokenSet.client_id || clientId;
+    if (tokenSet.plan_type) credentials.plan_type = tokenSet.plan_type;
+    account.extra = { ...account.extra, account_id: accountId, chatgpt_account_id: accountId,
+      chatgpt_user_id: userId, client_id: credentials.client_id, email: credentials.email,
+      ...(tokenSet.plan_type ? { plan_type: tokenSet.plan_type } : {}),
+      ...(tokenSet.privacy_mode ? { privacy_mode: tokenSet.privacy_mode } : {}),
+      ...(tokenSet.organization_id ? { organization_id: tokenSet.organization_id } : {}) };
+    if (credentials.email) account.name = buildAccountName(credentials.email);
+  }
 
-  if (credentials.id_token) {
+  if (credentials.id_token && (!sub2ApiOAuth || tokenSet.id_token)) {
     try {
       const claims = decodeJwtPayload(credentials.id_token);
       const authClaims = claims["https://api.openai.com/auth"] || {};
-      const planType = planTypeFromClaims(claims) || planTypeFromJwt(credentials.access_token);
-      const accountId = claims.sid || credentials.chatgpt_account_id || "";
-      const userId = authClaims.user_id || claims.sub || account?.extra?.chatgpt_user_id || "";
-      const email = claims.email || credentials.email || account?.extra?.email || "";
+      const planType = tokenSet.plan_type || planTypeFromClaims(claims) || planTypeFromJwt(credentials.access_token);
+      const accountId = sub2ApiOAuth
+        ? tokenSet.chatgpt_account_id || authClaims.chatgpt_account_id || claims.sid || credentials.chatgpt_account_id || ""
+        : claims.sid || credentials.chatgpt_account_id || "";
+      const userId = sub2ApiOAuth
+        ? tokenSet.chatgpt_user_id || authClaims.chatgpt_user_id || authClaims.user_id || claims.sub || account?.extra?.chatgpt_user_id || ""
+        : authClaims.user_id || claims.sub || account?.extra?.chatgpt_user_id || "";
+      const email = tokenSet.email || claims.email || credentials.email || account?.extra?.email || "";
       credentials.chatgpt_account_id = accountId;
       credentials.email = email;
       account.extra = {
@@ -2052,7 +2123,7 @@ async function refreshSub2apiOauthExport({ authBase, sourcePath, targetPath, fal
         account_id: accountId,
         chatgpt_account_id: accountId,
         chatgpt_user_id: userId,
-        client_id: clientId,
+        client_id: tokenSet.client_id || clientId,
         email,
         ...(planType ? { plan_type: planType } : {}),
       };
@@ -2673,6 +2744,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
 export {
   CookieJar, ProtocolClient, browserRequestContext, runCodexOauth, resumeCodexOauth,
   validateCodexCallback, exchangeOAuthCode, refreshOAuthToken,
+  buildSub2apiOauthExport, refreshSub2apiOauthExport,
   DEFAULT_CODEX_CLIENT_ID, DEFAULT_CODEX_REDIRECT_URI, CODEX_OAUTH_SCOPE,
 };
 
