@@ -195,6 +195,7 @@ function App() {
   const [accountProxyUrl, setAccountProxyUrl] = useState("");
   const [accountProxyMode, setAccountProxyMode] = useState("global");
   const [accountProxyDistribution, setAccountProxyDistribution] = useState([]);
+  const [accountProxyDirectCount, setAccountProxyDirectCount] = useState(0);
   const [allowDirectFallback, setAllowDirectFallback] = useState(false);
   const [proxySettingsLoaded, setProxySettingsLoaded] = useState(false);
   const [proxySettingsDirty, setProxySettingsDirty] = useState(false);
@@ -273,7 +274,11 @@ function App() {
     let stopped = false;
     const refresh = () => apiFetch(token, "/api/sub2api/options", {
       method: "POST", body: JSON.stringify({ config: sub2apiSettings }),
-    }).then((data) => { if (!stopped) setAccountProxyDistribution(Array.isArray(data.proxies) ? data.proxies : []); })
+    }).then((data) => {
+      if (stopped) return;
+      setAccountProxyDistribution(Array.isArray(data.proxies) ? data.proxies : []);
+      setAccountProxyDirectCount(data.directAccountCount || 0);
+    })
       .catch((error) => { if (!stopped) setProxySettingsError(error.message); });
     void refresh();
     const timer = window.setInterval(refresh, 30_000);
@@ -599,6 +604,7 @@ function App() {
       });
       const proxies = Array.isArray(data.proxies) ? data.proxies : [];
       setAccountProxyDistribution(proxies);
+      setAccountProxyDirectCount(data.directAccountCount || 0);
       setProxySettingsError("");
       return proxies;
     } catch (requestError) {
@@ -1734,19 +1740,20 @@ function App() {
                 <Globe2 size={14} />
                 {accountProxyMode === "plan" ? "任务设置：动态登录 · 按 PlanType 授权" : accountProxyMode === "sub2api" ? "任务设置：Sub2API 出口 IP 均衡分配" : "任务设置：全局代理"}
               </span>
-              {accountProxyMode === "sub2api" ? (
+              {["sub2api", "plan"].includes(accountProxyMode) && (
                 <>
                   <span className={`provider-ready ${accountProxyDistribution.length ? "" : "incomplete"}`}>
                     {accountProxyDistribution.length ? <Check size={14} /> : <CircleAlert size={14} />}
                     {accountProxyDistribution.length
-                      ? `读取 ${accountProxyDistribution.length} 个代理节点 / ${new Set(accountProxyDistribution.map((proxy) => proxy.ipAddress || proxy.host)).size} 个出口 IP；新账号按 IP 均衡分配，已有绑定保持不变`
+                      ? `读取 ${accountProxyDistribution.length} 个代理节点 / ${proxyDistributionByIp(accountProxyDistribution).length} 个出口 IP；${accountProxyMode === "plan" ? "按 PlanType 方案首次分配，已有绑定保持不变" : "新账号按 IP 均衡分配，已有绑定保持不变"}`
                       : "读取 Sub2API 代理以启用账号级分配"}
                   </span>
-                  {accountProxyDistribution.length > 0 && (
+                  {(accountProxyDistribution.length > 0 || accountProxyDirectCount > 0) && (
                     <div className="proxy-distribution" aria-label="代理 IP 账号分配">
-                      {accountProxyDistribution.map((proxy) => (
-                        <span key={proxy.id}>{proxy.name} · {proxy.ipAddress || `${proxy.host}:${proxy.port}`} · {proxy.accountCount || 0} 个账号</span>
+                      {proxyDistributionByIp(accountProxyDistribution).map((proxy) => (
+                        <span key={proxy.ipAddress}>{proxy.names.join("、")} · {proxy.ipAddress} · {proxy.accountCount} 个账号</span>
                       ))}
+                      <span>直连 · {accountProxyDirectCount} 个账号</span>
                     </div>
                   )}
                   <button type="button" className="secondary-button" onClick={() => { void refreshAccountProxyDistribution().catch(() => {}); }}
@@ -1754,7 +1761,8 @@ function App() {
                     {proxySettingsSaving ? <LoaderCircle className="spin" size={15} /> : <RotateCcw size={15} />}读取代理
                   </button>
                 </>
-              ) : (
+              )}
+              {accountProxyMode !== "sub2api" && (
                 <>
               <label className="provider-field account-proxy-field" title="支持 http://、https://、socks5:// 和 socks5h://；用户名中包含 -sid- 时会自动轮换会话编号">
                 <Globe2 size={15} aria-hidden="true" />
@@ -3300,9 +3308,7 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
         <time dateTime={job.lastOperationAt || job.createdAt}>{formatDateTime(job.lastOperationAt || job.createdAt)}</time>
         <span>{operationLabel(job.lastOperationType)}</span>
       </td>
-      <td className="bound-ip-cell" title={job.boundIps?.join("、") || (job.boundProxyStatus === "direct" ? "直连（无代理）" : job.boundProxyStatus === "bound" ? "已绑定代理，尚未获取出口 IP" : "尚未绑定授权代理")} >
-        {job.boundIps?.length ? job.boundIps.map((ip) => <span key={ip}>{ip}</span>) : <span className="muted">{job.boundProxyStatus === "direct" ? "直连" : job.boundProxyStatus === "bound" ? "待获取" : "未绑定"}</span>}
-      </td>
+      <BoundProxyCell job={job} />
       <td className="overload-cell"><OverloadDetection job={job} token={token} onError={onError} /></td>
       <td className="actions-cell">
         <div className="row-actions">
@@ -3497,7 +3503,7 @@ function TaskSettingsDialog({ token, settings, availablePlanTypes, planTypeMappi
             <option value="plan">动态登录 + 按 PlanType 授权</option>
           </select>
           <small>{accountProxyMode === "plan"
-            ? "网页登录使用全局动态代理；识别当前工作空间的 PlanType 后，Codex 授权按绑定的 Sub2API 方案选择代理。只有方案选择“均衡分配（toSub2）”的账号会自动均衡分配 IP。"
+            ? "仅首次网页登录使用全局动态代理；识别 PlanType 后按对应方案分配并绑定 IP。后续网页登录、Codex 授权、刷新与号池同步均复用该绑定，服务重启后保留。只有选择“均衡分配（toSub2）”的方案参与自动均衡。"
             : accountProxyMode === "sub2api"
             ? "导入任务开始时按出口 IP 负载分配并绑定，登录、授权和号池同步沿用同一代理。需先在 Sub2API 设置中读取可用代理。"
             : "所有任务使用代理 IP 配置中的全局代理；未配置时使用账号原代理或服务器出口。"}</small>
@@ -5136,6 +5142,31 @@ function writeLocalTextSetting(key, value) {
   }
 }
 
+function proxyDistributionByIp(proxies) {
+  const groups = new Map();
+  for (const proxy of proxies) {
+    const ipAddress = proxy.ipAddress || `${proxy.host}:${proxy.port}`;
+    let group = groups.get(ipAddress);
+    if (!group) { group = { ipAddress, names: [], accountCount: 0 }; groups.set(ipAddress, group); }
+    if (!group.names.includes(proxy.name)) group.names.push(proxy.name);
+    // The API already aggregates accounts across all nodes sharing this exit IP.
+    group.accountCount = Math.max(group.accountCount, proxy.accountCount || 0);
+  }
+  return [...groups.values()];
+}
+
+function BoundProxyCell({ job }) {
+  const proxies = Array.isArray(job.boundProxies) ? job.boundProxies : (job.boundIps || []).map((ipAddress) => ({ id: ipAddress, ipAddress, name: "" }));
+  const label = job.boundProxyStatus === "direct" ? "直连" : job.boundProxyStatus === "bound" ? "待获取" : "未绑定";
+  const visible = job.boundProxyStatus === "direct" ? [] : proxies;
+  return <td className="bound-ip-cell" title={visible.length ? visible.map((proxy) => `${proxy.name}${proxy.ipAddress ? ` · ${proxy.ipAddress}` : ""}`).join("、") : label}>
+    {visible.length ? visible.map((proxy) => <span className="bound-proxy" key={proxy.id}>
+      {proxy.name && <span className="bound-proxy-name">{proxy.name}</span>}
+      <span className="bound-proxy-ip">{proxy.ipAddress || "出口 IP 待获取"}</span>
+    </span>) : <span className="muted">{label}</span>}
+  </td>;
+}
+
 function sub2ApiStatusJobFields(status) {
   const fields = {
     sub2apiInPool: status?.inPool ?? null,
@@ -5144,6 +5175,7 @@ function sub2ApiStatusJobFields(status) {
     sub2apiAccountId: status?.accountId || null,
     sub2apiAccountIds: Array.isArray(status?.accountIds) ? status.accountIds : [],
     ...(Array.isArray(status?.boundIps) ? { boundIps: status.boundIps, boundProxyStatus: status.proxyIds?.length ? "bound" : "direct" } : {}),
+    ...(Array.isArray(status?.boundProxies) ? { boundProxies: status.boundProxies } : {}),
     sub2apiGroupIds: Array.isArray(status?.groupIds) ? status.groupIds : [],
     sub2apiRemoteStatus: status?.remoteStatus || null,
     sub2apiUsage: status?.usage || null,

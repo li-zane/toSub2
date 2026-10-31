@@ -724,13 +724,18 @@ async function handleApi(req, res, requestUrl) {
     const listing = await listSub2ApiAccounts(config, { withMeta: true });
     const proxyCounts = new Map();
     const proxiesById = new Map(normalizeSub2ApiProxyList(proxyPayload).map((proxy) => [proxy.id, proxy]));
+    publicProxyCatalog = { backend: monitorBackendIdentity(config), proxies: new Map([...proxiesById.values()].map((proxy) => [proxy.id, publicSub2ApiProxy(proxy)])) };
     const countedEmails = new Set();
+    let directAccountCount = 0;
     for (const account of listing.accounts) {
       const email = sub2ApiAccountEmail(account);
       if (email && countedEmails.has(email)) continue;
       if (email) countedEmails.add(email);
       const job = ["sub2api", "plan"].includes(accountProxyMode) ? findJobByEmail(email) : null;
-      const proxy = proxiesById.get(normalizeStoredProxyId(job?.assignedProxyId || account.proxy_id));
+      const proxyId = accountProxyMode === "plan" && hasPlanProxyBinding(job)
+        ? normalizeStoredProxyId(job.assignedProxyId) : normalizeStoredProxyId(job?.assignedProxyId || account.proxy_id);
+      if (!proxyId) directAccountCount += 1;
+      const proxy = proxiesById.get(proxyId);
       if (!proxy) continue;
       const ip = proxyIpKey(proxy);
       proxyCounts.set(ip, (proxyCounts.get(ip) || 0) + 1);
@@ -738,6 +743,7 @@ async function handleApi(req, res, requestUrl) {
     if (["sub2api", "plan"].includes(accountProxyMode)) {
       for (const job of listUniqueJobs()) {
         if (countedEmails.has(job.email.toLowerCase())) continue;
+        if (accountProxyMode === "plan" && hasPlanProxyBinding(job) && !job.assignedProxyId) directAccountCount += 1;
         const proxy = proxiesById.get(normalizeStoredProxyId(job.assignedProxyId));
         if (!proxy) continue;
         const ip = proxyIpKey(proxy);
@@ -747,6 +753,7 @@ async function handleApi(req, res, requestUrl) {
     sendJson(res, 200, {
       groups: groupPayload,
       proxies: [...proxiesById.values()].map((proxy) => ({ ...publicSub2ApiProxy(proxy), accountCount: proxyCounts.get(proxyIpKey(proxy)) || 0 })),
+      directAccountCount,
     });
     return;
   }
@@ -1442,15 +1449,17 @@ function scheduleQueuedJobs() {
 
 async function prepareAndLaunchJob(job, mode, queueRunId) {
   try {
+    const hasBinding = accountProxyMode === "plan" && hasPlanProxyBinding(job);
     if (accountProxyMode === "plan") {
-      if (mode !== "refresh" && !globalProxyUrl) throw httpError(409, "请先在代理 IP 配置中保存网页登录使用的动态代理");
-      job.runProxyFixed = false;
+      if (hasBinding) await restorePlanProxyBinding(job);
+      else if (mode !== "refresh" && !globalProxyUrl) throw httpError(409, "请先在代理 IP 配置中保存首次网页登录使用的动态代理");
+      job.runProxyFixed = hasBinding;
     } else await refreshJobProxyBinding(job);
     if (!job.proxyFallbackActive && accountProxyMode !== "plan") job.proxyUrl = effectiveAccountProxyUrl(job.proxyUrl, globalProxyUrl);
-    const oauthSettings = accountProxyMode === "plan" && mode === "full"
+    const oauthSettings = accountProxyMode === "plan" && !hasBinding && mode === "full"
       ? { codexAuthMode, phasedProxy: true, loginProxyUrl: globalProxyUrl }
       : ["full", "refresh"].includes(mode) ? await codexOAuthSettingsForJob(job)
-        : { codexAuthMode: "local", ...(accountProxyMode === "plan" ? { phasedProxy: true, loginProxyUrl: globalProxyUrl } : {}) };
+        : { codexAuthMode: "local", ...(accountProxyMode === "plan" && !hasBinding ? { phasedProxy: true, loginProxyUrl: globalProxyUrl } : {}) };
     if (["full", "totp_setup", "password_add"].includes(mode) && job.mailApiUrl) await loadMailboxBaseline(job);
     if (!isActive(job.status) || job.status === "queued" || job.queueRunId !== queueRunId) return;
     launchJob(job, { mode, ...oauthSettings });
@@ -1569,7 +1578,7 @@ function launchJob(job, options = {}) {
 
   child.on("message", (message) => {
     if (!options.phasedProxy || job.runId !== runId || job.child !== child || !isActive(job.status)) return;
-    if (message?.type === "web-proxy-phase") { job.runProxyFixed = false; return; }
+    if (message?.type === "web-proxy-phase") { job.runProxyFixed = message.fixed === true; return; }
     if (message?.type !== "codex-proxy-request" || typeof message.id !== "string") return;
     void withEmailJobLock(job.email, async () => {
       if (job.runId !== runId || job.child !== child || !isActive(job.status)) return;
@@ -4466,14 +4475,18 @@ async function fallBackExpiredSub2ApiProxies(config, profileState, accounts, sum
   if (["sub2api", "plan"].includes(accountProxyMode)) {
     for (const account of accounts) {
       if (shuttingDown) return;
-      if (accountProxyMode === "plan" && resolveSub2ApiConfigForAccount(config, account, profileState).proxyId !== SUB2API_PROXY_BALANCED) continue;
+      const job = findJobByEmail(sub2ApiAccountEmail(account));
+      if (accountProxyMode === "plan" && !hasPlanProxyBinding(job)) continue;
       const accountId = normalizeSub2ApiAccountId(account?.id);
-      const assignedProxyId = normalizeStoredProxyId(findJobByEmail(sub2ApiAccountEmail(account))?.assignedProxyId);
-      if (!accountId || !assignedProxyId) continue;
+      const assignedProxyId = normalizeStoredProxyId(job?.assignedProxyId);
+      if (!accountId || (!assignedProxyId && accountProxyMode !== "plan")) continue;
       try {
-        const state = await getSub2ApiProxyState(config, assignedProxyId);
-        if (state.found !== true || isSub2ApiProxyExpired(state.proxy)) throw new Error("账号绑定代理已失效或状态未知，请修复代理或手动切换 IP");
-        const proxyId = assignedProxyId;
+        if (assignedProxyId) {
+          const state = await getSub2ApiProxyState(config, assignedProxyId);
+          if (state.found !== true || isSub2ApiProxyExpired(state.proxy)) throw new Error("账号绑定代理已失效或状态未知，请修复代理或手动切换 IP");
+          if (accountProxyMode === "plan") assertBoundProxyIp(job, normalizeSub2ApiProxyList([state.proxy])[0]);
+        }
+        const proxyId = assignedProxyId || 0;
         if (Number(account?.proxy_id) === Number(proxyId)) continue;
         await requestSub2Api(config, `/api/v1/admin/accounts/${encodeURIComponent(accountId)}`, {
           method: "PUT",
@@ -4486,7 +4499,7 @@ async function fallBackExpiredSub2ApiProxies(config, profileState, accounts, sum
       }
     }
     if (summary.proxyFallbackUpdated) invalidateSub2ApiAccountStatusCache();
-    if (accountProxyMode === "sub2api") return;
+    return;
   }
   const proxyIds = [...new Set([...profileState.profiles.values()]
     .map((profile) => Number(profile.proxyId))
@@ -4498,7 +4511,6 @@ async function fallBackExpiredSub2ApiProxies(config, profileState, accounts, sum
     for (const account of accounts) {
       const accountId = normalizeSub2ApiAccountId(account?.id);
       if (!accountId || Number(account?.proxy_id) !== proxyId) continue;
-      if (accountProxyMode === "plan" && resolveSub2ApiConfigForAccount(config, account, profileState).proxyId !== proxyId) continue;
       try {
         await requestSub2Api(config, `/api/v1/admin/accounts/${encodeURIComponent(accountId)}`, {
           method: "PUT",
@@ -4543,7 +4555,7 @@ function diffSub2ApiProfileSyncTargets(previous, next) {
 function unsyncableSub2ApiProfileFields(accountConfig, fields) {
   return fields.filter((field) => {
     if (field === "groupIds") return !accountConfig.groupIds.length;
-    if (field === "proxyId") return accountProxyMode === "sub2api" || !accountConfig.proxyId || (accountConfig.proxyId === SUB2API_PROXY_BALANCED && accountProxyMode !== "plan");
+    if (field === "proxyId") return ["sub2api", "plan"].includes(accountProxyMode) || !accountConfig.proxyId || accountConfig.proxyId === SUB2API_PROXY_BALANCED;
     if (["concurrency", "loadFactor", "priority"].includes(field)) return accountConfig[field] === null;
     if (field === "accountNameTemplate") return !accountConfig.accountNameTemplate;
     if (field === "modelWhitelist") return !accountConfig.modelWhitelist.length;
@@ -4742,12 +4754,8 @@ async function buildSub2ApiAccountUpdate(localAccount, accountConfig, remoteAcco
 
 async function sub2ApiProxyFieldsForAccount(accountConfig, email, remoteAccount = {}) {
   if (accountProxyMode === "plan") {
-    if (accountConfig.proxyId !== SUB2API_PROXY_BALANCED) return sub2ApiProxyFields(accountConfig);
     const job = findJobByEmail(email);
-    const assignment = (await assignSub2ApiProxies([{ email, assignedProxyId: job?.assignedProxyId || remoteAccount.proxy_id }])).get(email.toLowerCase());
-    if (!assignment) throw httpError(409, "均衡分配未返回可用代理");
-    if (job) await saveJobProxyBinding(job, assignment);
-    return { proxy_id: assignment.id };
+    return hasPlanProxyBinding(job) ? { proxy_id: normalizeStoredProxyId(job.assignedProxyId) || 0 } : {};
   }
   if (accountProxyMode !== "sub2api") return sub2ApiProxyFields(accountConfig);
   const assignedProxyId = normalizeStoredProxyId(findJobByEmail(email)?.assignedProxyId)
@@ -5193,6 +5201,7 @@ function publicSub2ApiAccountStatusEntry(entry) {
     accountIds: [...(entry.accountIds || [])],
     proxyIds: [...(entry.proxyIds || [])],
     boundIps: publicBoundIps(entry.proxyIds || []),
+    boundProxies: publicBoundProxies(entry.proxyIds || []),
     inPool: true,
     enabled: entry.enabled ?? null,
     priority: entry.priority ?? null,
@@ -5570,7 +5579,7 @@ async function prepareAccountProxyModeChange(nextMode) {
 
 async function applyAccountProxyModeChange(change) {
   if (!change) return;
-  for (const job of jobs.values()) job.fixedProxy = change.nextMode === "sub2api" || (change.nextMode === "plan" && Boolean(job.assignedProxyId));
+  for (const job of jobs.values()) job.fixedProxy = change.nextMode === "sub2api" || (change.nextMode === "plan" && hasPlanProxyBinding(job));
   await Promise.all(change.pending.map((job) => withEmailJobLock(job.email, async () => {
     const proxy = change.assignments.get(job.id);
     if (!proxy) return;
@@ -5659,16 +5668,25 @@ async function listSub2ApiProxies(config = sub2ApiSettingsConfig) {
 }
 
 function publicBoundIps(proxyIds, job = null) {
+  return [...new Set(publicBoundProxies(proxyIds, job).map((proxy) => proxy.ipAddress).filter(Boolean))];
+}
+
+function publicBoundProxies(proxyIds, job = null) {
   const config = sub2ApiSettingsConfig || sub2ApiMonitorConfig;
-  if (!config || publicProxyCatalog.backend !== monitorBackendIdentity(config)) return job?.boundIp ? [job.boundIp] : [];
-  return [...new Set(proxyIds.map((id) => publicProxyCatalog.proxies.get(id)?.ipAddress || (job?.assignedProxyId === id ? job.boundIp : null)).filter(Boolean))];
+  const catalog = config && publicProxyCatalog.backend === monitorBackendIdentity(config) ? publicProxyCatalog.proxies : new Map();
+  return [...new Set(proxyIds.map(normalizeStoredProxyId).filter(Boolean))].map((id) => {
+    const proxy = catalog.get(id);
+    const local = normalizeStoredProxyId(job?.assignedProxyId) === id ? job : null;
+    return { id, name: proxy?.name || local?.boundProxyName || `代理 ${id}`, ipAddress: proxy?.ipAddress || local?.boundIp || null };
+  });
 }
 
 // Resolve the saved binding before each login; never silently change its exit IP.
 async function codexOAuthSettingsForJob(job) {
   const selectedMode = codexAuthMode;
   if (accountProxyMode === "plan") {
-    const route = await preparePlanCodexProxy(job, getJobPlanType(job), job.workspaceAccountId);
+    const route = hasPlanProxyBinding(job) ? planCodexProxyRoute(job, job.workspaceAccountId)
+      : await preparePlanCodexProxy(job, getJobPlanType(job), job.workspaceAccountId);
     return { ...route, loginProxyUrl: route.proxyUrl };
   }
   if (selectedMode !== "sub2api") return { codexAuthMode: "local" };
@@ -5695,13 +5713,35 @@ function jobUsesBalancedProxy(job) {
   return accountProxyMode === "sub2api" || (accountProxyMode === "plan" && jobSub2ApiProxyConfig(job)?.proxyId === SUB2API_PROXY_BALANCED);
 }
 
+function hasPlanProxyBinding(job) {
+  return Boolean(job && (job.authorizationProxySelected || normalizeStoredProxyId(job.assignedProxyId)));
+}
+
+function assertBoundProxyIp(job, proxy) {
+  if (job.boundIp && proxy?.ipAddress && job.boundIp !== proxy.ipAddress) {
+    throw httpError(409, "账号绑定节点的出口 IP 已变化，请修复代理或手动切换 IP");
+  }
+}
+
+async function restorePlanProxyBinding(job) {
+  const proxyId = normalizeStoredProxyId(job.assignedProxyId);
+  let proxy = null;
+  if (proxyId) {
+    proxy = (await listSub2ApiProxies()).find((item) => item.id === proxyId);
+    if (!proxy?.url || isSub2ApiProxyExpired(proxy)) throw httpError(409, "账号绑定代理已失效，请修复代理或手动切换 IP");
+    assertBoundProxyIp(job, proxy);
+  }
+  await saveJobProxyBinding(job, proxy);
+  job.proxyFallbackActive = false;
+}
+
 async function saveJobProxyBinding(job, proxy) {
   job.authorizationProxySelected = true;
   job.assignedProxyId = proxy?.id || null;
   job.boundIp = proxy?.ipAddress || null;
   job.boundProxyName = proxy?.name || null;
   job.proxyUrl = proxy?.url || null;
-  job.fixedProxy = Boolean(proxy);
+  job.fixedProxy = accountProxyMode === "plan" || Boolean(proxy);
   accountProxyReservations.delete(job.email.toLowerCase());
   await saveStoredLoginCredentials(job.email, job);
   await saveJobMetadata(job);
@@ -5710,6 +5750,10 @@ async function saveJobProxyBinding(job, proxy) {
 // Called only after the web session has identified its current workspace/PlanType.
 // The dynamic login proxy never becomes the pool binding.
 async function preparePlanCodexProxy(job, rawPlanType, workspaceId) {
+  if (hasPlanProxyBinding(job)) {
+    await restorePlanProxyBinding(job);
+    return planCodexProxyRoute(job, workspaceId);
+  }
   const planType = normalizePlanType(rawPlanType);
   if (!planType) throw httpError(409, "网页登录后未识别到 PlanType，已停止授权，请重试");
   const config = sub2ApiSettingsConfig;
@@ -5735,12 +5779,22 @@ async function preparePlanCodexProxy(job, rawPlanType, workspaceId) {
   job.proxyFallbackActive = false;
   await saveJobProxyBinding(job, proxy);
   touch(job);
-  return { proxyUrl: proxy?.url || null, codexAuthMode,
+  return planCodexProxyRoute(job, workspaceId);
+}
+
+function planCodexProxyRoute(job, workspaceId) {
+  const config = sub2ApiSettingsConfig;
+  return { proxyUrl: job.proxyUrl || null, codexAuthMode,
     workspaceId: typeof workspaceId === "string" ? workspaceId : null,
-    sub2ApiOAuth: codexAuthMode === "sub2api" ? { baseUrl: config.baseUrl, adminApiKey: config.adminApiKey, proxyId: proxy?.id || null } : null };
+    sub2ApiOAuth: codexAuthMode === "sub2api" ? { baseUrl: config.baseUrl, adminApiKey: config.adminApiKey, proxyId: normalizeStoredProxyId(job.assignedProxyId) } : null };
 }
 
 async function refreshJobProxyBinding(job) {
+  if (accountProxyMode === "plan") {
+    if (hasPlanProxyBinding(job)) await restorePlanProxyBinding(job);
+    else job.fixedProxy = false;
+    return;
+  }
   job.fixedProxy = accountProxyMode === "sub2api";
   if (!job.fixedProxy) return;
   if (!job.assignedProxyId) {
@@ -6183,6 +6237,7 @@ function publicJob(job) {
     proxyConfigured: Boolean(job.proxyUrl),
     assignedProxyId: normalizeStoredProxyId(job.assignedProxyId),
     boundIps: publicBoundIps(sub2ApiStatus.inPool === true ? sub2ApiStatus.proxyIds || [] : [job.assignedProxyId].filter(Boolean), job),
+    boundProxies: publicBoundProxies(sub2ApiStatus.inPool === true ? sub2ApiStatus.proxyIds || [] : [job.assignedProxyId].filter(Boolean), job),
     boundProxyStatus: sub2ApiStatus.inPool === true ? (sub2ApiStatus.proxyIds?.length ? "bound" : "direct")
       : job.assignedProxyId ? "bound" : job.authorizationProxySelected ? "direct" : "unbound",
     canSwitchProxy: jobUsesBalancedProxy(job),
@@ -6879,7 +6934,7 @@ async function syncCompletedOutputs(force = false) {
           authorizationProxySelected: metadata.authorization_proxy_selected === true,
           boundIp: metadata.bound_ip || null,
           boundProxyName: metadata.bound_proxy_name || null,
-          fixedProxy: accountProxyMode === "sub2api" || (accountProxyMode === "plan" && Boolean(metadata.assigned_proxy_id)),
+          fixedProxy: accountProxyMode === "sub2api" || (accountProxyMode === "plan" && (metadata.authorization_proxy_selected === true || Boolean(metadata.assigned_proxy_id))),
           poolRefreshReady: metadata.pool_refresh_ready === true,
           poolRefreshAction: normalizePoolRefreshAction(metadata.pool_refresh_action),
           poolRefreshDueAt: metadata.pool_refresh_due_at || null,
@@ -6994,7 +7049,7 @@ async function syncCompletedOutputs(force = false) {
           authorizationProxySelected: metadata.authorization_proxy_selected === true,
           boundIp: metadata.bound_ip || null,
           boundProxyName: metadata.bound_proxy_name || null,
-          fixedProxy: accountProxyMode === "sub2api" || (accountProxyMode === "plan" && Boolean(metadata.assigned_proxy_id)),
+          fixedProxy: accountProxyMode === "sub2api" || (accountProxyMode === "plan" && (metadata.authorization_proxy_selected === true || Boolean(metadata.assigned_proxy_id))),
           poolRefreshReady: metadata.pool_refresh_ready === true,
           poolRefreshAction: normalizePoolRefreshAction(metadata.pool_refresh_action),
           poolRefreshDueAt: metadata.pool_refresh_due_at || null,
@@ -7100,7 +7155,7 @@ async function syncCompletedOutputs(force = false) {
           authorizationProxySelected: metadata.authorization_proxy_selected === true,
           boundIp: metadata.bound_ip || null,
           boundProxyName: metadata.bound_proxy_name || null,
-          fixedProxy: accountProxyMode === "sub2api" || (accountProxyMode === "plan" && Boolean(metadata.assigned_proxy_id)),
+          fixedProxy: accountProxyMode === "sub2api" || (accountProxyMode === "plan" && (metadata.authorization_proxy_selected === true || Boolean(metadata.assigned_proxy_id))),
           poolRefreshReady: metadata.pool_refresh_ready === true,
           poolRefreshAction: normalizePoolRefreshAction(metadata.pool_refresh_action),
           poolRefreshDueAt: metadata.pool_refresh_due_at || null,

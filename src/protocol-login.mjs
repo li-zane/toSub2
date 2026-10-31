@@ -335,7 +335,8 @@ async function run() {
   }
   const outPath = path.resolve(args.out || DEFAULT_OUT);
   const sub2apiOutPath = path.resolve(args.sub2apiOut || DEFAULT_SUB2API_OUT);
-  const proxyTemplate = normalizeProxyUrl(args.proxy || process.env.CHATGPT_PROXY_URL);
+  let proxyTemplate = normalizeProxyUrl(args.proxy || process.env.CHATGPT_PROXY_URL);
+  let planProxyBound = false;
   const transport = new TlsFingerprintTransport({
     enabled: shouldUseTlsTransport({ chatgptBase, authBase, nativeHttp: args.nativeHttp }),
     profile:
@@ -348,7 +349,8 @@ async function run() {
     sameProxyRiskRetryDelayMs: process.env.CHATGPT_SAME_PROXY_RISK_RETRY_DELAY_MS,
   });
   async function prepareLoginProxy(url) {
-    if (process.env.TOSUB2_PHASED_PROXY === "1" && process.connected) process.send({ type: "web-proxy-phase" });
+    if (planProxyBound) transport.rotateProxySessions = false;
+    if (process.env.TOSUB2_PHASED_PROXY === "1" && process.connected) process.send({ type: "web-proxy-phase", fixed: planProxyBound });
     try {
       await transport.prepareProxy(proxyTemplate, url);
     } catch (error) {
@@ -589,6 +591,8 @@ async function run() {
       if (process.env.TOSUB2_PHASED_PROXY !== "1") return;
       const identity = await identifyWebPlan(client, { chatgptBase, web });
       const route = await requestCodexProxy(identity);
+      proxyTemplate = route.proxyUrl || null;
+      planProxyBound = true;
       codexAuthMode = route.codexAuthMode;
       sub2ApiOAuth = route.sub2ApiOAuth;
       codexOptions.codexAuthMode = codexAuthMode;
