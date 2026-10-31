@@ -413,6 +413,7 @@ col:nth-child(8) { width: 120px; }
 col:nth-child(9) { width: 220px; }
 col:nth-child(10) { width: 120px; }
 col:nth-child(11) { width: 160px; }
+col.overload-column { width: 228px; }
 col.actions-column { width: 180px; }
 th {
   position: sticky;
@@ -442,16 +443,42 @@ th:nth-child(8) { width: 120px; }
 th:nth-child(9) { width: 220px; }
 th:nth-child(10) { width: 120px; }
 th:nth-child(11) { width: 160px; }
-th:nth-child(12) { width: 180px; min-width: 180px; }
+th.overload-heading { width: 228px; min-width: 228px; }
+th.actions-heading { width: 180px; min-width: 180px; }
 /* Pin the checkbox, account, and action columns while scrolling horizontally. */
 th:nth-child(1), .job-row > td:nth-child(1) { position: sticky; left: 0; }
 th:nth-child(2), .job-row > td:nth-child(2) { position: sticky; left: 48px; box-shadow: inset -1px 0 0 var(--line); }
 th:nth-child(1), th:nth-child(2) { z-index: 4; }
 .job-row > td:nth-child(1), .job-row > td:nth-child(2) { z-index: 1; background: var(--surface); }
-th:nth-child(12), .job-row > td:nth-child(12) { position: sticky; right: 0; box-shadow: inset 1px 0 0 var(--line); }
-th:nth-child(12) { z-index: 4; background: #f7f9f8; }
-.job-row > td:nth-child(12) { z-index: 2; background: var(--surface); }
-.job-row:hover > td:nth-child(12), .job-row:has(.select-cell input:checked) > td:nth-child(12) { background: var(--surface); }
+th.actions-heading, .job-row > .actions-cell { position: sticky; right: 0; box-shadow: inset 1px 0 0 var(--line); }
+th.actions-heading { z-index: 4; background: #f7f9f8; }
+.job-row > .actions-cell { z-index: 2; background: var(--surface); }
+.job-row:hover > .actions-cell, .job-row:has(.select-cell input:checked) > .actions-cell { background: var(--surface); }
+.overload-detection { display: flex; align-items: center; gap: 8px; min-width: 204px; }
+.overload-switch { display: grid; place-items: center; flex: 0 0 32px; width: 32px; height: 32px; padding: 5px; border: 1px solid var(--line-strong); border-radius: 50%; background: var(--surface); cursor: pointer; }
+.overload-switch > span { display: block; width: 16px; height: 16px; border-radius: 50%; background: var(--danger); }
+.overload-switch.enabled > span { background: var(--green); }
+.overload-switch:hover:not(:disabled) { border-color: var(--ink-2); box-shadow: var(--shadow-sm); }
+.overload-switch:disabled { cursor: not-allowed; opacity: .55; }
+.overload-switch[aria-busy="true"] { opacity: .65; }
+.overload-chart { position: relative; width: 164px; height: 56px; flex: 0 0 164px; }
+.overload-chart > svg { display: block; width: 164px; height: 56px; overflow: visible; }
+.overload-zero { stroke: var(--line-strong); stroke-width: 1; stroke-dasharray: 3 3; }
+.overload-zero-label { font-size: 13px; fill: var(--muted); }
+.overload-line { fill: none; stroke: var(--green); stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.overload-dot { fill: var(--green); stroke: var(--surface); stroke-width: 1.5; pointer-events: none; }
+.overload-dot.active { stroke-width: 2; }
+.overload-hit-area { fill: transparent; cursor: crosshair; }
+.overload-point:focus { outline: none; }
+.overload-point:focus-visible .overload-hit-area { stroke: var(--blue); stroke-width: 1; rx: 3; }
+.overload-tooltip { position: absolute; z-index: 6; bottom: 50px; left: -42px; display: grid; gap: 3px; width: max-content; max-width: 245px; padding: 8px 10px; background: var(--ink); color: white; border-radius: var(--radius-sm); box-shadow: var(--shadow); font-size: 13px; pointer-events: none; white-space: nowrap; }
+.overload-tooltip strong { font-size: 14px; }
+.job-row:first-child .overload-tooltip { top: 50px; bottom: auto; }
+.overload-error { position: absolute; right: 0; top: 0; display: grid; place-items: center; width: 16px; height: 16px; color: var(--danger); background: var(--danger-soft); border: 1px solid var(--danger-line); border-radius: 50%; font-size: 13px; font-weight: 700; cursor: help; }
+@media (max-width: 700px) {
+  th:nth-child(1), th:nth-child(2), th.actions-heading,
+  .job-row > td:nth-child(1), .job-row > td:nth-child(2), .job-row > .actions-cell { position: static; }
+}
 .actions-heading { text-align: left; }
 .priority-heading { white-space: nowrap; }
 .column-filter-heading { display: grid; gap: 5px; min-width: 0; }

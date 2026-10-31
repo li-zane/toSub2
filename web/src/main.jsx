@@ -41,6 +41,7 @@ import {
 } from "lucide-react";
 import "./styles.css";
 import { logoutAccountSessions } from "./account-session-actions.mjs";
+import { OverloadDetection } from "./overload-detection.jsx";
 
 const POLL_INTERVAL_MS = 900;
 const SUB2API_PIPELINE_TIMEOUT_MS = 15 * 60_000;
@@ -1927,6 +1928,7 @@ function App() {
               <col />
               <col />
               <col />
+              <col className="overload-column" />
               <col className="actions-column" />
             </colgroup>
             <thead>
@@ -2018,6 +2020,7 @@ function App() {
                 <th>当前操作</th>
                 <th>开始时间</th>
                 <th>最近操作时间</th>
+                <th className="overload-heading">过载检测</th>
                 <th className="actions-heading">操作</th>
               </tr>
             </thead>
@@ -2070,7 +2073,7 @@ function App() {
                   />
                   {expandedJobId === job.id && (
                     <tr className="log-row">
-                      <td colSpan="12"><JobLogs token={token} jobId={job.id} /></td>
+                      <td colSpan="13"><JobLogs token={token} jobId={job.id} /></td>
                     </tr>
                   )}
                 </React.Fragment>
@@ -2812,7 +2815,7 @@ function App() {
 function EmptyState({ filtered = false }) {
   return (
     <tr>
-      <td colSpan="12">
+      <td colSpan="13">
         <div className="empty-state">
           <div className="empty-state-icon"><Mail size={24} /></div>
           <h3>{filtered ? "没有匹配账号" : "暂无授权任务"}</h3>
@@ -3291,6 +3294,7 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
         <time dateTime={job.lastOperationAt || job.createdAt}>{formatDateTime(job.lastOperationAt || job.createdAt)}</time>
         <span>{operationLabel(job.lastOperationType)}</span>
       </td>
+      <td className="overload-cell"><OverloadDetection job={job} token={token} onError={onError} /></td>
       <td className="actions-cell">
         <div className="row-actions">
           {credentialsAvailable && (

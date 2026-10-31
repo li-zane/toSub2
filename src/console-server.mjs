@@ -28,6 +28,7 @@ import { createSmsProvider, publicSmsProviderDefinitions } from "./sms-providers
 import { hasJobTotpKey, isReauthorizationComplete, isTotpRotationComplete } from "./task-auto-state.mjs";
 import { normalizeCodexAuthMode } from "./sub2api-oauth.mjs";
 import { DirectTlsProfileProbe, proxySupportsSessionRotation } from "./tls-transport.mjs";
+import { OverloadMonitor } from "./overload-monitor.mjs";
 
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 4399;
@@ -195,6 +196,25 @@ const sub2ApiMonitorState = {
   planTypesBackend: null,
 };
 
+const overloadMonitor = new OverloadMonitor({
+  filePath: path.join(OUTPUT_ROOT, "overload-monitor.json"),
+  getConfig: () => sub2ApiSettingsConfig || sub2ApiMonitorConfig,
+  backendIdentity: monitorBackendIdentity,
+  request: requestSub2Api,
+  listAccounts: async (config) => {
+    const listing = await listSub2ApiAccounts(config, { withMeta: true });
+    if (!listing.complete) throw new Error("Sub2API 账号列表不完整，过载统计未完成");
+    const mapping = new Map();
+    for (const account of listing.accounts) {
+      const email = sub2ApiAccountEmail(account);
+      const id = normalizeSub2ApiAccountId(account.id);
+      if (!email || !id || (account.platform && account.platform !== "openai")) continue;
+      mapping.set(email, [...new Set([...(mapping.get(email) || []), id])]);
+    }
+    return mapping;
+  },
+});
+
 const hostArg = process.argv.find((item) => item.startsWith("--host="));
 const hostIndex = process.argv.indexOf("--host");
 const requestedHost = String(
@@ -223,6 +243,7 @@ await loadTaskSettings();
 await loadPlanTypeLabelMapping();
 await loadSub2ApiSettingsConfiguration();
 await loadSub2ApiMonitorConfiguration();
+await overloadMonitor.load();
 await syncCompletedOutputs(true);
 for (const job of jobs.values()) {
   if (job.poolRefreshAction) {
@@ -234,6 +255,7 @@ for (const job of jobs.values()) {
 resumePendingTaskAutoActions();
 scheduleQueuedJobs();
 scheduleSub2ApiMonitor();
+overloadMonitor.start();
 
 const vite = await createViteServer({
   root: WEB_ROOT,
@@ -343,6 +365,7 @@ async function handleApi(req, res, requestUrl) {
         sub2apiAccountToggle: true,
         sub2apiAccountPriority: true,
         accountRemarks: true,
+        overloadDetection: true,
       },
     });
     return;
@@ -738,6 +761,21 @@ async function handleApi(req, res, requestUrl) {
     return;
   }
 
+  const overloadMatch = /^\/api\/jobs\/([a-f0-9-]+)\/overload-detection$/.exec(requestUrl.pathname);
+  if (req.method === "POST" && overloadMatch) {
+    const job = jobs.get(overloadMatch[1]);
+    if (!job) throw httpError(404, "Login flow not found");
+    const body = await readJson(req);
+    if (typeof body.enabled !== "boolean") throw httpError(400, "检测状态必须是布尔值");
+    if (body.enabled && !overloadMonitor.snapshot(job.email).configured) {
+      throw httpError(409, "请先配置 Sub2API 后端地址和管理员 API Key");
+    }
+    await withEmailJobLock(job.email, () => overloadMonitor.setEnabled(job.email, body.enabled));
+    if (body.enabled) overloadMonitor.trigger();
+    sendJson(res, 200, { job: publicJob(job) });
+    return;
+  }
+
   const remarkMatch = /^\/api\/jobs\/([a-f0-9-]+)\/remark$/.exec(requestUrl.pathname);
   if ((req.method === "POST" || req.method === "PUT") && remarkMatch) {
     const body = await readJson(req);
@@ -866,6 +904,7 @@ async function handleApi(req, res, requestUrl) {
     await persistSub2ApiSettingsConfiguration();
     const profileSync = await syncSub2ApiProfileChanges(config, profileSyncTargets, snapshotSub2ApiProfileState());
     const datePrioritySync = await refreshImportDatePriorities(config);
+    overloadMonitor.trigger();
     sendJson(res, 200, { ...publicSub2ApiSettingsState(), profileSync, datePrioritySync });
     return;
   }
@@ -889,6 +928,7 @@ async function handleApi(req, res, requestUrl) {
     scheduleSub2ApiMonitor();
     const profileSync = await syncSub2ApiProfileChanges(config, profileSyncTargets, snapshotSub2ApiProfileState());
     const datePrioritySync = await refreshImportDatePriorities(config);
+    overloadMonitor.trigger();
     sendJson(res, 200, { ...publicSub2ApiMonitorState(), profileSync, datePrioritySync });
     return;
   }
@@ -5980,6 +6020,7 @@ function publicJob(job) {
     sub2apiRemoteStatus: sub2ApiStatus.remoteStatus,
     sub2apiPlanType: sub2ApiStatus.planType,
     sub2apiUsage: publicSub2ApiUsage(sub2ApiStatus.usage),
+    overloadDetection: overloadMonitor.snapshot(job.email),
     lastError: job.lastError,
     canDownload: Boolean(job.resultSaved),
     poolOnly: Boolean(job.poolOnly),
@@ -6598,6 +6639,7 @@ async function deleteSub2ApiAccountsByEmail(email) {
 
 async function deleteJobsByEmail(email) {
   const sub2api = await deleteSub2ApiAccountsByEmail(email);
+  await overloadMonitor.remove(email);
   const matching = [...jobs.values()].filter((job) => job.email.toLowerCase() === email);
   const directories = new Set();
   matching.forEach((job) => {
@@ -8295,6 +8337,7 @@ async function shutdown() {
     }
     for (const controller of sub2ApiRequestControllers) controller.abort();
     await Promise.allSettled([
+      overloadMonitor.stop(),
       sub2ApiMonitorPromise,
       taskSettingsWritePromise,
       ...sub2ApiRequestPromises,
