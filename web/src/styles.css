@@ -414,6 +414,10 @@ col:nth-child(9) { width: 220px; }
 col:nth-child(10) { width: 120px; }
 col:nth-child(11) { width: 160px; }
 col.overload-column { width: 228px; }
+col.bound-ip-column { width: 160px; }
+th.bound-ip-heading { width: 160px; min-width: 160px; }
+.bound-ip-cell { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; font-variant-numeric: tabular-nums; }
+.bound-ip-cell > span { display: block; max-width: 240px; overflow-wrap: anywhere; }
 col.actions-column { width: 180px; }
 th {
   position: sticky;

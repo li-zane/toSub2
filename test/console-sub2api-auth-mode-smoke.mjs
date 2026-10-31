@@ -17,6 +17,8 @@ const base = `http://127.0.0.1:${port}`;
 const officialBase = `http://127.0.0.1:${officialPort}`;
 const poolBase = `http://127.0.0.1:${poolPort}`;
 const email = "add-phone-page@example.com";
+const phased = process.argv.includes("--plan-proxy");
+const proxies = [{ id: 17, name: "Plan proxy", protocol: "http", host: "plan.invalid", port: 8080, ip_address: "198.51.100.17", status: "active" }];
 const poolRequests = [];
 const tokenRequests = [];
 const accounts = [];
@@ -56,7 +58,9 @@ const pool = http.createServer(async (req, res) => {
     if (invalidRefresh) return send(res, 400, { error: "invalid_grant" });
     return send(res, 200, { code: 0, data: tokens("pool-refreshed-access", "pool-refreshed-refresh") });
   }
-  if (url.pathname === "/api/v1/admin/groups/all" || url.pathname === "/api/v1/admin/proxies/all") return send(res, 200, []);
+  if (url.pathname === "/api/v1/admin/groups/all") return send(res, 200, []);
+  if (url.pathname === "/api/v1/admin/proxies/all") return send(res, 200, phased ? proxies : []);
+  if (url.pathname === "/api/v1/admin/proxies/17") return send(res, 200, { data: proxies[0] });
   if (url.pathname === "/api/v1/admin/accounts" && req.method === "GET") return send(res, 200, { data: { items: accounts, total: accounts.length, pages: 1 } });
   if (url.pathname === "/api/v1/admin/accounts/batch") {
     body.accounts.forEach((account) => accounts.push({ ...account, id: 501, status: "active" }));
@@ -76,8 +80,12 @@ try {
   await start();
   let response = await post("/api/task-settings", { codexAuthMode: "sub2api" });
   assert.equal(response.status, 409);
-  response = await post("/api/sub2api/settings", { config: { baseUrl: poolBase, adminApiKey: "fixture-key", groupIds: [] } });
+  response = await post("/api/sub2api/settings", { config: { baseUrl: poolBase, adminApiKey: "fixture-key", groupIds: [], ...(phased ? { proxyId: "balanced" } : {}) } });
   assert.equal(response.status, 200, JSON.stringify(response.body));
+  if (phased) {
+    response = await post("/api/account-proxy-settings", { mode: "plan", proxyUrl: "http://login-sid-original:fixture@dynamic.invalid:8080", allowDirectFallback: false });
+    assert.equal(response.status, 200, JSON.stringify(response.body));
+  }
   response = await post("/api/task-settings", { codexAuthMode: "sub2api", maxActiveJobs: 1 });
   assert.equal(response.status, 200, JSON.stringify(response.body));
   await stop(); await start();
@@ -94,10 +102,18 @@ try {
   assert.equal(bundle.accounts[0].credentials.access_token, "pool-access-1");
   assert.equal(bundle.accounts[0].credentials.chatgpt_account_id, "pool-account");
   assert.equal(tokenRequests.filter((request) => request.kind === "exchange").length, 1);
+  if (phased) {
+    assert.equal(job.assignedProxyId, 17);
+    assert.deepEqual(job.boundIps, ["198.51.100.17"]);
+    assert.equal(poolRequests.find((request) => request.path.endsWith("generate-auth-url")).body.proxy_id, 17);
+    assert.equal(tokenRequests[0].body.proxy_id, 17);
+    assert.match((await (await fetch(`${base}/api/jobs/${id}/logs`, { headers })).json()).logs || "", /proxy-phase/);
+  }
   assert.equal(JSON.stringify(await jobFor(id)).includes("fixture-key"), false);
-  response = await post("/api/sub2api/upload", { ids: [id], config: { baseUrl: poolBase, adminApiKey: "fixture-key", groupIds: [] } });
+  response = await post("/api/sub2api/upload", { ids: [id], config: { baseUrl: poolBase, adminApiKey: "fixture-key", groupIds: [], ...(phased ? { proxyId: "balanced" } : {}) } });
   assert.equal(response.status, 200, JSON.stringify(response.body));
   assert.equal(accounts.length, 1);
+  if (phased) assert.equal(accounts[0].proxy_id, 17);
   response = await post(`/api/jobs/${id}/regenerate`, {});
   assert.equal(response.status, 200);
   await waitFor(async () => { const current = await jobFor(id); return current.status === "completed" && !current.poolRefreshAction && current.attempt > job.attempt; });
@@ -131,7 +147,19 @@ try {
   assert.equal(accounts[0].credentials.access_token, "pool-access-3");
   assert.ok(!logs.includes("private response must not appear in logs"));
   assert.ok(!logs.includes("fixture-key"));
-  console.log("console Sub2API auth mode passed: task setting/restart, real protocol login, remote credentials, refresh, invalid-grant reauthorization, relogin pool update, failed-exchange preservation");
+  if (phased) {
+    assert(tokenRequests.every((request) => request.body.proxy_id === 17), "generation, exchange and refresh keep the selected PlanType proxy");
+    const remoteExchanges = tokenRequests.length;
+    failExchange = false;
+    assert.equal((await post("/api/task-settings", { codexAuthMode: "local" })).status, 200);
+    assert.equal((await post(`/api/jobs/${id}/relogin`, {})).status, 200);
+    await authorize(id);
+    await waitFor(async () => !(await jobFor(id)).poolRefreshAction);
+    assert.equal(accounts[0].credentials.access_token, "mock-access-token");
+    assert.equal(accounts[0].proxy_id, 17);
+    assert.equal(tokenRequests.length, remoteExchanges, "local provider uses the same PlanType proxy without remote token exchange");
+    console.log("PASS: real phased protocol login, web PlanType discovery, IPC proxy selection, local+remote OAuth, refresh/relogin, pool update and failed-exchange preservation");
+  } else console.log("console Sub2API auth mode passed: task setting/restart, real protocol login, remote credentials, refresh, invalid-grant reauthorization, relogin pool update, failed-exchange preservation");
 } catch (error) {
   error.message += `\nConsole output:\n${logs}`;
   throw error;

@@ -316,8 +316,8 @@ class ProtocolClient {
 
 async function run() {
   const args = parseArgs(process.argv.slice(2));
-  const codexAuthMode = normalizeCodexAuthMode(process.env.TOSUB2_CODEX_AUTH_MODE);
-  const sub2ApiOAuth = codexAuthMode === "sub2api" ? {
+  let codexAuthMode = normalizeCodexAuthMode(process.env.TOSUB2_CODEX_AUTH_MODE);
+  let sub2ApiOAuth = codexAuthMode === "sub2api" ? {
     baseUrl: process.env.TOSUB2_OAUTH_BASE_URL,
     adminApiKey: process.env.TOSUB2_OAUTH_ADMIN_KEY,
     proxyId: process.env.TOSUB2_OAUTH_PROXY_ID || null,
@@ -348,6 +348,7 @@ async function run() {
     sameProxyRiskRetryDelayMs: process.env.CHATGPT_SAME_PROXY_RISK_RETRY_DELAY_MS,
   });
   async function prepareLoginProxy(url) {
+    if (process.env.TOSUB2_PHASED_PROXY === "1" && process.connected) process.send({ type: "web-proxy-phase" });
     try {
       await transport.prepareProxy(proxyTemplate, url);
     } catch (error) {
@@ -584,6 +585,23 @@ async function run() {
     };
     let checkpoint = null;
 
+    async function selectCodexProxy() {
+      if (process.env.TOSUB2_PHASED_PROXY !== "1") return;
+      const identity = await identifyWebPlan(client, { chatgptBase, web });
+      const route = await requestCodexProxy(identity);
+      codexAuthMode = route.codexAuthMode;
+      sub2ApiOAuth = route.sub2ApiOAuth;
+      codexOptions.codexAuthMode = codexAuthMode;
+      codexOptions.sub2ApiOAuth = sub2ApiOAuth;
+      codexOptions.currentWorkspaceId = identity.workspaceId || undefined;
+      codexOptions.allowedWorkspaceIds = identity.workspaceId ? [identity.workspaceId] : undefined;
+      // configure() creates a fresh transport session. ProtocolClient carries
+      // the verified cookie jar across the explicit proxy boundary.
+      transport.rotateProxySessions = false;
+      await transport.prepareProxy(route.proxyUrl, `${authBase}/`);
+      console.log(`[proxy-phase] Codex authorization proxy selected for PlanType ${identity.planType}.`);
+    }
+
     if (args.resumeCheckpoint) {
       try {
         checkpoint = await readProtocolCheckpoint(path.resolve(args.resumeCheckpoint));
@@ -599,14 +617,17 @@ async function run() {
     if (checkpoint && !args.webOnly) {
       email = checkpoint.email || email;
       client = new ProtocolClient({ verbose: args.verbose, jar: CookieJar.fromJSON(checkpoint.cookies), transport });
+      web = checkpoint.web || null;
       const saveCheckpoint = createCheckpointWriter(checkpointPath, {
         client,
         email,
         chatgptBase,
         authBase,
+        web,
       });
       console.log(`[resume] Continue saved login flow from ${checkpoint.stage}.`);
       try {
+        await selectCodexProxy();
         codex = await resumeCodexOauth(client, { ...codexOptions, expectedEmail: email, saveCheckpoint }, checkpoint);
         web = checkpoint.web || null;
       } catch (error) {
@@ -617,6 +638,7 @@ async function run() {
         checkpoint = null;
           client = null;
           codex = null;
+          transport.rotateProxySessions = process.env.CHATGPT_PROXY_FIXED !== "1";
           await prepareLoginProxy(`${chatgptBase}/`);
           }
     }
@@ -655,6 +677,7 @@ async function run() {
       if (!args.webOnly) {
         console.log("[2/5] Start Codex OAuth flow");
         try {
+          await selectCodexProxy();
           codex = await runCodexOauth(client, { ...codexOptions, expectedEmail: email, saveCheckpoint });
         } catch (error) {
           if (isSecurityCheckRequiredError(error)) throw error;
@@ -666,6 +689,7 @@ async function run() {
           client = null;
           web = null;
           codex = null;
+          transport.rotateProxySessions = process.env.CHATGPT_PROXY_FIXED !== "1";
           await prepareLoginProxy(`${chatgptBase}/`);
           continue;
         }
@@ -1276,6 +1300,7 @@ async function loginChatgptWeb(client, { chatgptBase, authBase, email, rl, passw
     deviceId,
     payload: authenticated,
   });
+  const workspaceId = isWorkspaceSelectionPayload(authenticated) ? pickWorkspaceId(authenticated) : null;
   authenticated = await selectChatgptLoginWorkspaceIfNeeded(client, {
     authBase,
     payload: authenticated,
@@ -1285,6 +1310,7 @@ async function loginChatgptWeb(client, { chatgptBase, authBase, email, rl, passw
     deviceId,
     authSessionLoggingId,
     callbackUrl: callback?.finalUrl || null,
+    workspaceId,
     emailVerified: true,
     loginMethod,
     mfaVerified: mfaRequired,
@@ -1589,6 +1615,54 @@ function decodeBase32Secret(value) {
   return Buffer.from(bytes);
 }
 
+export async function identifyWebPlan(client, { chatgptBase, web = null }) {
+  const { data: session } = await client.getJson("GET", `${chatgptBase}/api/auth/session`, { referer: `${chatgptBase}/` });
+  const accessToken = session?.accessToken || session?.access_token;
+  if (!accessToken) throw new Error("WEB_PLAN_UNAVAILABLE: 网页登录会话未返回访问令牌，请重新登录");
+  let claims = {};
+  try { claims = decodeJwtPayload(accessToken); } catch {}
+  const tokenAccountId = claims?.["https://api.openai.com/auth"]?.chatgpt_account_id;
+  const { data: payload } = await client.getJson("GET", `${chatgptBase}/backend-api/accounts/check/v4-2023-04-27`, {
+    referer: `${chatgptBase}/`, headers: { authorization: `Bearer ${accessToken}` },
+  });
+  const raw = payload?.accounts;
+  const entries = Array.isArray(raw) ? raw : raw && typeof raw === "object"
+    ? Object.entries(raw).map(([id, value]) => ({ ...value, id: value?.id || id })) : [];
+  const accounts = entries.map((entry) => ({ ...entry, ...(entry.account || {}) }));
+  const explicitId = web?.workspaceId || payload?.current_account_id;
+  const currentId = explicitId || payload?.default_account_id || payload?.default_account || session?.account?.id
+    || tokenAccountId;
+  const selected = accounts.find((account) => (account.account_id || account.id) === currentId)
+    || (!explicitId && accounts.length === 1 ? accounts[0] : null);
+  if (!selected || selected.can_access_with_session === false || selected.is_deactivated === true) {
+    throw new Error("WEB_PLAN_UNAVAILABLE: 未确认当前工作空间，已停止按 PlanType 选择代理");
+  }
+  const workspaceId = selected.account_id || selected.id;
+  const planType = (tokenAccountId === workspaceId ? planTypeFromClaims(claims) : null)
+    || normalizePlanType(selected.plan_type || selected.planType);
+  if (!planType) throw new Error("WEB_PLAN_UNAVAILABLE: 当前工作空间未返回 PlanType");
+  return { planType, workspaceId };
+}
+
+function requestCodexProxy(identity) {
+  if (!process.send) throw new Error("CODEX_PROXY_CHANNEL: 分阶段代理需要由 toSub2 控制台启动");
+  const id = crypto.randomUUID();
+  return new Promise((resolve, reject) => {
+    const cleanup = () => { clearTimeout(timer); process.off("message", onMessage); process.off("disconnect", onDisconnect); };
+    const onDisconnect = () => { cleanup(); reject(new Error("CODEX_PROXY_CHANNEL: 控制台连接已断开")); };
+    const onMessage = (message) => {
+      if (message?.type !== "codex-proxy-response" || message.id !== id) return;
+      cleanup();
+      if (message.error) reject(new Error(`CODEX_PROXY_SELECTION: ${message.error}`));
+      else resolve(message.route);
+    };
+    const timer = setTimeout(() => { cleanup(); reject(new Error("CODEX_PROXY_CHANNEL: 代理选择超时")); }, 120_000);
+    process.on("message", onMessage);
+    process.once("disconnect", onDisconnect);
+    process.send({ type: "codex-proxy-request", id, ...identity }, (error) => { if (error) { cleanup(); reject(error); } });
+  });
+}
+
 async function runCodexOauth(client, options) {
   if (options.codexAuthMode === "sub2api") {
     const oauth = await generateSub2ApiOAuth(options.sub2ApiOAuth, options);
@@ -1741,7 +1815,7 @@ async function resumeCodexOauth(client, options, checkpoint) {
 async function finishCodexOauth(client, options, initial, oauth) {
   let current = initial;
 
-  const workspaceId = pickWorkspaceId(current);
+  const workspaceId = options.currentWorkspaceId || pickWorkspaceId(current);
   if (workspaceId) {
     console.log("[5/5] Select workspace");
     const consentUrl = getContinueUrl(current);

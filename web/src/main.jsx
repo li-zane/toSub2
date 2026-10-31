@@ -255,7 +255,7 @@ function App() {
         if (stopped) return;
         if (!proxySettingsDirty) {
           setAccountProxyUrl(data.settings.proxyUrl || "");
-          setAccountProxyMode(data.settings.mode === "sub2api" ? "sub2api" : "global");
+          setAccountProxyMode(["sub2api", "plan"].includes(data.settings.mode) ? data.settings.mode : "global");
           setAllowDirectFallback(data.settings.allowDirectFallback === true);
         }
         setProxySettingsLoaded(true);
@@ -269,7 +269,7 @@ function App() {
   }, [token, proxySettingsDirty]);
 
   useEffect(() => {
-    if (!token || accountProxyMode !== "sub2api" || !hasUsableSub2ApiSettings(sub2apiSettings)) return undefined;
+    if (!token || !["sub2api", "plan"].includes(accountProxyMode) || !hasUsableSub2ApiSettings(sub2apiSettings)) return undefined;
     let stopped = false;
     const refresh = () => apiFetch(token, "/api/sub2api/options", {
       method: "POST", body: JSON.stringify({ config: sub2apiSettings }),
@@ -290,7 +290,7 @@ function App() {
         body: JSON.stringify({ proxyUrl: String(accountProxyUrl).trim(), allowDirectFallback }),
       });
       setAccountProxyUrl(data.settings.proxyUrl || "");
-      setAccountProxyMode(data.settings.mode === "sub2api" ? "sub2api" : "global");
+      setAccountProxyMode(["sub2api", "plan"].includes(data.settings.mode) ? data.settings.mode : "global");
       setAllowDirectFallback(data.settings.allowDirectFallback === true);
       setProxySettingsDirty(false);
       setProxySettingsLoaded(true);
@@ -519,7 +519,8 @@ function App() {
   const sessionEligibleSelectedCount = selectedJobs.filter((job) => job.canLogoutAllSessions && job.canForceRelogin).length;
   const canCooldownSelected = selectedJobs.length > 0 && selectedJobs.length === selectedJobIds.size
     && sessionEligibleSelectedCount > 0;
-  const canSwitchProxySelected = accountProxyMode === "sub2api" && !proxySettingsDirty && canCooldownSelected
+  const canSwitchProxySelected = ["sub2api", "plan"].includes(accountProxyMode) && !proxySettingsDirty && canCooldownSelected
+    && selectedJobs.every((job) => job.canSwitchProxy)
     && hasUsableSub2ApiSettings(sub2apiSettings);
   const canUploadSelected = selectedJobs.length > 0 && downloadableSelectedCount > 0;
   const canRotateAndUploadSelected = selectedJobs.length > 0
@@ -1387,7 +1388,7 @@ function App() {
 
   async function runSelectedPoolAction(action) {
     if (!selectedJobIds.size || batchAction) return;
-    if (action === "switch-proxy" && (accountProxyMode !== "sub2api" || proxySettingsDirty)) {
+    if (action === "switch-proxy" && (!["sub2api", "plan"].includes(accountProxyMode) || proxySettingsDirty)) {
       setProxySettingsError("请先切换到 Sub2API 代理模式");
       return;
     }
@@ -1697,7 +1698,7 @@ function App() {
               <span className={`provider-ready ${hasUsableSub2ApiSettings(sub2apiSettings) ? "" : "incomplete"}`}>
                 {hasUsableSub2ApiSettings(sub2apiSettings) ? <Check size={14} /> : <CircleAlert size={14} />}
                 {hasUsableSub2ApiSettings(sub2apiSettings)
-                  ? `${sub2apiSettings.groupIds.length ? `已配置 · ${sub2apiSettings.groupIds.length} 个号池` : "已配置 · 默认号池"}${sub2apiSettings.proxyId ? " · 已指定代理" : ""} · WS ${SUB2API_WS_MODE_LABELS[sub2apiSettings.wsMode] || sub2apiSettings.wsMode}`
+                  ? `${sub2apiSettings.groupIds.length ? `已配置 · ${sub2apiSettings.groupIds.length} 个号池` : "已配置 · 默认号池"}${sub2apiSettings.proxyId === "balanced" ? " · 均衡分配" : sub2apiSettings.proxyId ? " · 已指定代理" : ""} · WS ${SUB2API_WS_MODE_LABELS[sub2apiSettings.wsMode] || sub2apiSettings.wsMode}`
                   : "未完成配置"}
               </span>
               {features.sub2apiMonitor && (
@@ -1731,7 +1732,7 @@ function App() {
             <div className="provider-card-body">
               <span className="provider-ready">
                 <Globe2 size={14} />
-                {accountProxyMode === "sub2api" ? "任务设置：Sub2API 出口 IP 均衡分配" : "任务设置：全局代理"}
+                {accountProxyMode === "plan" ? "任务设置：动态登录 · 按 PlanType 授权" : accountProxyMode === "sub2api" ? "任务设置：Sub2API 出口 IP 均衡分配" : "任务设置：全局代理"}
               </span>
               {accountProxyMode === "sub2api" ? (
                 <>
@@ -1929,6 +1930,7 @@ function App() {
               <col />
               <col />
               <col />
+              <col className="bound-ip-column" />
               <col className="overload-column" />
               <col className="actions-column" />
             </colgroup>
@@ -2021,6 +2023,7 @@ function App() {
                 <th>当前操作</th>
                 <th>开始时间</th>
                 <th>最近操作时间</th>
+                <th className="bound-ip-heading">绑定 IP</th>
                 <th className="overload-heading">过载检测</th>
                 <th className="actions-heading">操作</th>
               </tr>
@@ -2074,7 +2077,7 @@ function App() {
                   />
                   {expandedJobId === job.id && (
                     <tr className="log-row">
-                      <td colSpan="13"><JobLogs token={token} jobId={job.id} /></td>
+                      <td colSpan="14"><JobLogs token={token} jobId={job.id} /></td>
                     </tr>
                   )}
                 </React.Fragment>
@@ -2538,8 +2541,10 @@ function App() {
                 >
                   <option value="">使用账号原配置</option>
                   <option value="direct">直连（无代理）</option>
+                  <option value="balanced">均衡分配（toSub2）</option>
                   {sub2apiProxies.map((proxy) => <option key={proxy.id} value={String(proxy.id)}>{formatSub2ApiProxy(proxy)}</option>)}
                 </select>
+                <small>“均衡分配”由 toSub2 按出口 IP 的账号数分配；在任务设置中启用“动态登录 + 按 PlanType 授权”后生效。</small>
               </label>
               <label className="settings-field wide-settings-field">
                 <span>Codex 指纹收敛</span>
@@ -2663,7 +2668,7 @@ function App() {
           onClose={() => setTaskSettingsOpen(false)}
           onSaved={(settings) => {
             setTaskSettings(settings);
-            setAccountProxyMode(settings.accountProxyMode === "sub2api" ? "sub2api" : "global");
+            setAccountProxyMode(["sub2api", "plan"].includes(settings.accountProxyMode) ? settings.accountProxyMode : "global");
             setProxySettingsDirty(false);
             setTaskSettingsOpen(false);
             setUploadNotice(`任务设置已保存，最多同时运行 ${settings.maxActiveJobs} 条任务`);
@@ -2816,7 +2821,7 @@ function App() {
 function EmptyState({ filtered = false }) {
   return (
     <tr>
-      <td colSpan="13">
+      <td colSpan="14">
         <div className="empty-state">
           <div className="empty-state-icon"><Mail size={24} /></div>
           <h3>{filtered ? "没有匹配账号" : "暂无授权任务"}</h3>
@@ -3295,6 +3300,9 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
         <time dateTime={job.lastOperationAt || job.createdAt}>{formatDateTime(job.lastOperationAt || job.createdAt)}</time>
         <span>{operationLabel(job.lastOperationType)}</span>
       </td>
+      <td className="bound-ip-cell" title={job.boundIps?.join("、") || (job.boundProxyStatus === "direct" ? "直连（无代理）" : job.boundProxyStatus === "bound" ? "已绑定代理，尚未获取出口 IP" : "尚未绑定授权代理")} >
+        {job.boundIps?.length ? job.boundIps.map((ip) => <span key={ip}>{ip}</span>) : <span className="muted">{job.boundProxyStatus === "direct" ? "直连" : job.boundProxyStatus === "bound" ? "待获取" : "未绑定"}</span>}
+      </td>
       <td className="overload-cell"><OverloadDetection job={job} token={token} onError={onError} /></td>
       <td className="actions-cell">
         <div className="row-actions">
@@ -3387,7 +3395,7 @@ function TaskSettingsDialog({ token, settings, availablePlanTypes, planTypeMappi
   const dialogRef = useRef(null);
   const [limit, setLimit] = useState(() => String(settings.maxActiveJobs));
   const [cooldownMinutes, setCooldownMinutes] = useState(() => String(settings.accountProxyCooldownMinutes || 60));
-  const [accountProxyMode, setAccountProxyMode] = useState(() => settings.accountProxyMode === "sub2api" ? "sub2api" : "global");
+  const [accountProxyMode, setAccountProxyMode] = useState(() => ["sub2api", "plan"].includes(settings.accountProxyMode) ? settings.accountProxyMode : "global");
   const [codexAuthMode, setCodexAuthMode] = useState(() => settings.codexAuthMode || "local");
   const [autoRows, setAutoRows] = useState(() => taskAutoActionRows(settings.autoActions));
   const [saving, setSaving] = useState(false);
@@ -3485,9 +3493,12 @@ function TaskSettingsDialog({ token, settings, availablePlanTypes, planTypeMappi
           <span>账号代理分配</span>
           <select id="task-proxy-mode" value={accountProxyMode} onChange={(event) => setAccountProxyMode(event.target.value)} disabled={saving}>
             <option value="global">全局代理</option>
-            <option value="sub2api">Sub2API 均衡分配</option>
+            <option value="sub2api">Sub2API 均衡分配（登录前绑定）</option>
+            <option value="plan">动态登录 + 按 PlanType 授权</option>
           </select>
-          <small>{accountProxyMode === "sub2api"
+          <small>{accountProxyMode === "plan"
+            ? "网页登录使用全局动态代理；识别当前工作空间的 PlanType 后，Codex 授权按绑定的 Sub2API 方案选择代理。只有方案选择“均衡分配（toSub2）”的账号会自动均衡分配 IP。"
+            : accountProxyMode === "sub2api"
             ? "导入任务开始时按出口 IP 负载分配并绑定，登录、授权和号池同步沿用同一代理。需先在 Sub2API 设置中读取可用代理。"
             : "所有任务使用代理 IP 配置中的全局代理；未配置时使用账号原代理或服务器出口。"}</small>
         </label>
@@ -5132,6 +5143,7 @@ function sub2ApiStatusJobFields(status) {
     sub2apiPriority: status?.priority ?? null,
     sub2apiAccountId: status?.accountId || null,
     sub2apiAccountIds: Array.isArray(status?.accountIds) ? status.accountIds : [],
+    ...(Array.isArray(status?.boundIps) ? { boundIps: status.boundIps, boundProxyStatus: status.proxyIds?.length ? "bound" : "direct" } : {}),
     sub2apiGroupIds: Array.isArray(status?.groupIds) ? status.groupIds : [],
     sub2apiRemoteStatus: status?.remoteStatus || null,
     sub2apiUsage: status?.usage || null,
