@@ -65,6 +65,7 @@ const DEFAULT_PLAN_TYPE_MAPPING = {
 const DEFAULT_TASK_AUTO_ACTION_OPTIONS = [
   { value: "upload", label: "上传到 Sub2API" },
   { value: "rotate-logout-reauthorize-upload", label: "一键轮换并上传" },
+  { value: "enable-overload-detection", label: "自动开启过载检测" },
 ];
 const JOB_STATUS_LABELS = {
   queued: "排队中",

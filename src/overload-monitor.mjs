@@ -90,6 +90,55 @@ export async function collectOverloadHours({ config, accountIds, request, now = 
   return points.map((point, index) => ({ ...point, count: counts[index] }));
 }
 
+// Count request-level success + failure records, not upstream retry/error attempts.
+// Bin timestamps locally so an inclusive upstream end_time never leaks the next hour.
+export async function collectRequestHours({ config, accountIds, request, now = Date.now(), isEnabled = () => true }) {
+  const points = completedHours(now);
+  const start = Date.parse(points[0].start);
+  const end = Date.parse(points.at(-1).end);
+  const counts = Array(HOURS).fill(0);
+  const seen = new Set();
+  for (const accountId of new Set(accountIds.map(String))) {
+    let expectedTotal = null;
+    let received = 0;
+    for (let page = 1; ; page += 1) {
+      if (!isEnabled()) return null;
+      if (page > 1000) throw new Error("请求日志分页超过上限，统计未完成");
+      const query = new URLSearchParams({
+        page: String(page), page_size: "100", platform: "openai", account_id: accountId,
+        start_time: points[0].start, end_time: points.at(-1).end,
+        kind: "all", sort: "created_at_desc",
+      });
+      const payload = await request(config, `/api/v1/admin/ops/requests?${query}`);
+      const data = payload?.data ?? payload;
+      if (!data || !Array.isArray(data.items)) throw new Error("请求日志响应格式无效");
+      const total = Number(data.total);
+      if (data.total === null || data.total === "" || !Number.isSafeInteger(total) || total < 0 || (expectedTotal !== null && total !== expectedTotal)) {
+        throw new Error("请求日志列表发生变化或总数无效，请重试");
+      }
+      expectedTotal = total;
+      received += data.items.length;
+      for (const item of data.items) {
+        if (String(item.account_id) !== accountId) continue;
+        const timestamp = Date.parse(item.created_at);
+        if (!Number.isFinite(timestamp)) throw new Error("请求日志缺少有效时间");
+        if (timestamp < start || timestamp >= end) continue;
+        if (!["success", "error"].includes(item.kind)) throw new Error("请求日志类型无效");
+        const identity = item.request_id || (item.error_id ? `error:${item.error_id}` : null);
+        if (identity) {
+          const key = `${accountId}:${identity}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+        }
+        counts[Math.floor((timestamp - start) / HOUR_MS)] += 1;
+      }
+      if (received >= total) break;
+      if (!data.items.length) throw new Error("请求日志分页不完整");
+    }
+  }
+  return points.map((point, index) => ({ ...point, requestCount: counts[index] }));
+}
+
 export class OverloadMonitor {
   constructor({ filePath, getConfig, backendIdentity, listAccounts, request, now = Date.now, setTimer = setTimeout, clearTimer = clearTimeout }) {
     Object.assign(this, { filePath, getConfig, backendIdentity, listAccounts, request, now, setTimer, clearTimer });
@@ -110,7 +159,8 @@ export class OverloadMonitor {
       for (const [email, entry] of Object.entries(data.accounts)) {
         if (entry && typeof entry.enabled === "boolean") this.accounts.set(email, {
           enabled: entry.enabled, points: Array.isArray(entry.points) ? entry.points.slice(-HOURS) : [],
-          updatedAt: entry.updatedAt || null, lastError: entry.lastError || null,
+          revision: Number.isSafeInteger(entry.revision) && entry.revision >= 0 ? entry.revision : 0,
+          updatedAt: entry.updatedAt || null, lastError: entry.lastError || null, requestError: entry.requestError || null,
         });
       }
     } catch (error) {
@@ -123,7 +173,7 @@ export class OverloadMonitor {
     const backend = config?.baseUrl && config?.adminApiKey ? this.backendIdentity(config) : null;
     if (backend !== this.backend) {
       this.backend = backend;
-      for (const [email, entry] of this.accounts) this.accounts.set(email, { ...entry, points: [], updatedAt: null, lastError: null });
+      for (const [email, entry] of this.accounts) this.accounts.set(email, { ...entry, points: [], updatedAt: null, lastError: null, requestError: null });
     }
     return backend;
   }
@@ -133,9 +183,11 @@ export class OverloadMonitor {
     const entry = this.accounts.get(email.toLowerCase());
     const stored = new Map((entry?.points || []).map((point) => [point.start, point]));
     return {
-      configured, enabled: entry?.enabled === true, updatedAt: entry?.updatedAt || null,
-      lastError: entry?.lastError || null,
-      points: completedHours(this.now()).map((point) => ({ ...point, count: stored.get(point.start)?.count ?? null })),
+      configured, enabled: entry?.enabled === true, revision: entry?.revision || 0, updatedAt: entry?.updatedAt || null,
+      lastError: entry?.lastError || null, requestError: entry?.requestError || null,
+      points: completedHours(this.now()).map((point) => ({ ...point,
+        count: stored.get(point.start)?.count ?? null, requestCount: stored.get(point.start)?.requestCount ?? null,
+      })),
     };
   }
 
@@ -156,7 +208,7 @@ export class OverloadMonitor {
     if (enabled && !this.backend) throw new Error("请先配置 Sub2API 后端地址和管理员 API Key");
     email = email.toLowerCase();
     const previous = this.accounts.get(email);
-    const entry = { ...previous, enabled, points: previous?.points || [], lastError: null };
+    const entry = { ...previous, enabled, revision: (previous?.revision || 0) + 1, points: previous?.points || [], lastError: null, requestError: null };
     this.accounts.set(email, entry);
     try { await this.persist(); }
     catch (error) {
@@ -195,7 +247,7 @@ export class OverloadMonitor {
       if (Math.floor(this.now() / HOUR_MS) !== startedHour) this.rerun = true;
       if (this.rerun) { this.trigger(); return; }
       const nextHour = HOUR_MS - (this.now() % HOUR_MS);
-      const failed = [...this.accounts.values()].some((entry) => entry.enabled && entry.lastError);
+      const failed = [...this.accounts.values()].some((entry) => entry.enabled && (entry.lastError || entry.requestError));
       this.timer = this.setTimer(() => this.trigger(), failed ? Math.min(60_000, nextHour) : nextHour);
       this.timer.unref?.();
     });
@@ -214,7 +266,7 @@ export class OverloadMonitor {
     try { mapping = await this.listAccounts(config); }
     catch (error) {
       if (this.stopped || this.backendIdentity(this.getConfig()) !== backend) return;
-      for (const [email, entry] of entries) if (this.accounts.get(email) === entry) this.accounts.set(email, { ...entry, lastError: error.message });
+      for (const [email, entry] of entries) if (this.accounts.get(email) === entry) this.accounts.set(email, { ...entry, lastError: error.message, requestError: error.message });
       await this.persist();
       return;
     }
@@ -228,10 +280,21 @@ export class OverloadMonitor {
         try {
           const accountIds = mapping.get(email) || [];
           if (!accountIds.length) throw new Error("该账号尚未加入 Sub2API 号池");
-          const points = await collectOverloadHours({ config, accountIds, request: this.request, now, isEnabled });
-          if (points && isEnabled()) this.accounts.set(email, { ...entry, points, updatedAt: new Date(this.now()).toISOString(), lastError: null });
+          const options = { config, accountIds, request: this.request, now, isEnabled };
+          const [overloads, requests] = await Promise.allSettled([collectOverloadHours(options), collectRequestHours(options)]);
+          if (!isEnabled()) continue;
+          const previous = new Map((entry.points || []).map((point) => [point.start, point]));
+          const points = completedHours(now).map((point, index) => ({ ...point,
+            count: overloads.status === "fulfilled" ? overloads.value?.[index].count ?? null : previous.get(point.start)?.count ?? null,
+            requestCount: requests.status === "fulfilled" ? requests.value?.[index].requestCount ?? null : previous.get(point.start)?.requestCount ?? null,
+          }));
+          this.accounts.set(email, { ...entry, points,
+            updatedAt: overloads.status === "fulfilled" || requests.status === "fulfilled" ? new Date(this.now()).toISOString() : entry.updatedAt || null,
+            lastError: overloads.status === "rejected" ? String(overloads.reason?.message || overloads.reason).slice(0, 500) : null,
+            requestError: requests.status === "rejected" ? String(requests.reason?.message || requests.reason).slice(0, 500) : null,
+          });
         } catch (error) {
-          if (isEnabled()) this.accounts.set(email, { ...entry, lastError: String(error.message).slice(0, 500) });
+          if (isEnabled()) this.accounts.set(email, { ...entry, lastError: String(error.message).slice(0, 500), requestError: String(error.message).slice(0, 500) });
         }
       }
     };

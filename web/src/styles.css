@@ -455,24 +455,31 @@ th.actions-heading { z-index: 4; background: #f7f9f8; }
 .job-row > .actions-cell { z-index: 2; background: var(--surface); }
 .job-row:hover > .actions-cell, .job-row:has(.select-cell input:checked) > .actions-cell { background: var(--surface); }
 .overload-detection { display: flex; align-items: center; gap: 8px; min-width: 204px; }
-.overload-switch { display: grid; place-items: center; flex: 0 0 32px; width: 32px; height: 32px; padding: 5px; border: 1px solid var(--line-strong); border-radius: 50%; background: var(--surface); cursor: pointer; }
-.overload-switch > span { display: block; width: 16px; height: 16px; border-radius: 50%; background: var(--danger); }
-.overload-switch.enabled > span { background: var(--green); }
-.overload-switch:hover:not(:disabled) { border-color: var(--ink-2); box-shadow: var(--shadow-sm); }
+.overload-switch { display: grid; place-items: center; flex: 0 0 32px; width: 32px; height: 32px; padding: 8px; border: 0; border-radius: 50%; background: transparent; cursor: pointer; touch-action: manipulation; }
+.overload-switch > span { display: block; width: 14px; height: 14px; border: 1px solid #e0443e; border-radius: 50%; background: #ff5f57; box-shadow: inset 0 1px 1px rgba(255,255,255,.25), 0 1px 1px rgba(0,0,0,.08); }
+.overload-switch.enabled > span { border-color: #1dad34; background: #28c840; }
+.overload-switch:hover:not(:disabled) > span { filter: brightness(.94); }
 .overload-switch:disabled { cursor: not-allowed; opacity: .55; }
 .overload-switch[aria-busy="true"] { opacity: .65; }
 .overload-chart { position: relative; width: 164px; height: 56px; flex: 0 0 164px; }
 .overload-chart > svg { display: block; width: 164px; height: 56px; overflow: visible; }
 .overload-zero { stroke: var(--line-strong); stroke-width: 1; stroke-dasharray: 3 3; }
 .overload-zero-label { font-size: 13px; fill: var(--muted); }
-.overload-line { fill: none; stroke: var(--green); stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
-.overload-dot { fill: var(--green); stroke: var(--surface); stroke-width: 1.5; pointer-events: none; }
+.overload-line { fill: none; stroke: #d97706; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.overload-request-line { fill: none; stroke: var(--blue); stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; stroke-dasharray: 4 2; }
+.overload-dot { fill: #d97706; stroke: var(--surface); stroke-width: 1.5; pointer-events: none; }
+.overload-request-dot { fill: none; stroke: var(--blue); stroke-width: 1.5; pointer-events: none; }
 .overload-dot.active { stroke-width: 2; }
 .overload-hit-area { fill: transparent; cursor: crosshair; }
 .overload-point:focus { outline: none; }
 .overload-point:focus-visible .overload-hit-area { stroke: var(--blue); stroke-width: 1; rx: 3; }
 .overload-tooltip { position: absolute; z-index: 6; bottom: 50px; left: -42px; display: grid; gap: 3px; width: max-content; max-width: 245px; padding: 8px 10px; background: var(--ink); color: white; border-radius: var(--radius-sm); box-shadow: var(--shadow); font-size: 13px; pointer-events: none; white-space: nowrap; }
 .overload-tooltip strong { font-size: 14px; }
+.overload-tooltip strong { display: flex; align-items: center; gap: 6px; font-weight: 500; }
+.overload-tooltip strong b { margin-left: auto; padding-left: 12px; font-variant-numeric: tabular-nums; }
+.overload-tooltip strong i { width: 7px; height: 7px; border-radius: 50%; background: #fbbf24; }
+.overload-tooltip .overload-tooltip-requests i { background: #93c5fd; }
+.overload-scale-note { color: #bdc9c4; font-size: 13px; }
 .job-row:first-child .overload-tooltip { top: 50px; bottom: auto; }
 .overload-error { position: absolute; right: 0; top: 0; display: grid; place-items: center; width: 16px; height: 16px; color: var(--danger); background: var(--danger-soft); border: 1px solid var(--danger-line); border-radius: 50%; font-size: 13px; font-weight: 700; cursor: help; }
 @media (max-width: 700px) {
@@ -952,6 +959,8 @@ tbody tr:last-child td { border-bottom: 0; }
 .task-auto-settings-heading .secondary-button { flex: 0 0 auto; padding: 8px 10px; }
 .task-auto-rule-list { display: grid; gap: 10px; }
 .task-auto-rule { display: grid; grid-template-columns: minmax(150px, 1fr) minmax(0, 1.3fr) auto; align-items: end; gap: 10px; padding: 11px; border: 1px solid var(--line); border-radius: 12px; background: #fbfcfb; }
+.task-auto-rule .task-auto-plan-field { grid-column: auto; }
+.task-auto-rule > .icon-button { width: 32px; min-width: 32px; }
 .task-auto-plan-field small { color: var(--muted); font-size: 11px; font-weight: 500; }
 .task-auto-action-options { display: flex; flex-wrap: wrap; align-items: center; gap: 7px 12px; min-height: 42px; }
 .task-auto-action-option { display: inline-flex; align-items: center; gap: 6px; color: var(--ink); font-size: 12px; font-weight: 600; }

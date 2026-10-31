@@ -14,6 +14,7 @@ const ids = ["11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-22
 const emails = ["overload@example.test", "paused@example.test"];
 const records = [7, 8, 9].map((id, index) => ({ id, platform: "openai", type: "oauth", name: emails[index === 2 ? 1 : 0], status: "active", credentials: { email: emails[index === 2 ? 1 : 0] }, extra: {}, group_ids: [] }));
 const counts = [0, 2, 5, 1, 3, 0];
+const requestCounts = [198, 204, 210, 202, 196, 200];
 const logRequests = [];
 let child;
 let headers;
@@ -23,6 +24,16 @@ const remote = http.createServer(async (req, res) => {
   if (req.headers["x-api-key"] !== "fixture-admin-key") { res.statusCode = 401; return res.end("{}"); }
   const url = new URL(req.url, "http://fixture.test");
   if (url.pathname === "/api/v1/admin/accounts") return res.end(JSON.stringify({ data: { items: records, pages: 1, total: records.length } }));
+  if (url.pathname === "/api/v1/admin/ops/requests") {
+    const accountId = Number(url.searchParams.get("account_id"));
+    const start = Date.parse(url.searchParams.get("start_time"));
+    const page = Number(url.searchParams.get("page"));
+    const items = accountId === 7 ? requestCounts.flatMap((count, index) => Array.from({ length: count }, (_, number) => ({
+      request_id: `request-${index}-${number}`, account_id: accountId, kind: number % 2 ? "success" : "error",
+      created_at: new Date(start + index * HOUR_MS + 10_000 + number).toISOString(),
+    }))) : [];
+    return res.end(JSON.stringify({ data: { items: items.slice((page - 1) * 100, page * 100), total: items.length } }));
+  }
   if (url.pathname === "/api/v1/admin/ops/upstream-errors") {
     logRequests.push(url);
     const accountId = Number(url.searchParams.get("account_id"));
@@ -81,7 +92,7 @@ async function toggle(enabled, { id = ids[0], expected = 200, authorized = true 
 async function populated() {
   for (let i = 0; i < 100; i++) {
     const entry = await job();
-    if (entry.overloadDetection.updatedAt && entry.overloadDetection.points.every((point) => point.count !== null)) return entry;
+    if (entry.overloadDetection.updatedAt && entry.overloadDetection.points.every((point) => point.count !== null && point.requestCount !== null)) return entry;
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
   throw new Error(`statistics timeout ${logs}`);
@@ -91,8 +102,8 @@ try {
   for (let index = 0; index < ids.length; index++) {
     const dir = path.join(output, ids[index]);
     await fs.mkdir(dir, { recursive: true });
-    await fs.writeFile(path.join(dir, "job-meta.json"), JSON.stringify({ email: emails[index], status: "completed", pool_only: true, created_at: new Date().toISOString() }));
-    await fs.writeFile(path.join(dir, "sub2api-import-oauth.json"), JSON.stringify({ type: "sub2api-data", accounts: [{ name: emails[index], platform: "openai", type: "oauth", credentials: { email: emails[index] }, extra: { email: emails[index] } }] }));
+    await fs.writeFile(path.join(dir, "job-meta.json"), JSON.stringify({ email: emails[index], status: "completed", plan_type: "plus", pool_only: true, created_at: new Date().toISOString() }));
+    await fs.writeFile(path.join(dir, "sub2api-import-oauth.json"), JSON.stringify({ type: "sub2api-data", accounts: [{ name: emails[index], platform: "openai", type: "oauth", credentials: { email: emails[index], plan_type: "plus" }, extra: { email: emails[index], plan_type: "plus" } }] }));
   }
   await start();
   assert.equal((await job()).overloadDetection.configured, false);
@@ -108,6 +119,7 @@ try {
   await toggle(true);
   const entry = await populated();
   assert.deepEqual(entry.overloadDetection.points.map((point) => point.count), counts);
+  assert.deepEqual(entry.overloadDetection.points.map((point) => point.requestCount), requestCounts);
   assert.equal((await job(ids[1])).overloadDetection.enabled, false);
   assert(logRequests.every((url) => ["7", "8"].includes(url.searchParams.get("account_id"))), "each remote account for this email is included");
   assert(logRequests.every((url) => url.searchParams.get("status_codes") === "503"));
@@ -120,11 +132,27 @@ try {
   await stop(); await start();
   assert.equal((await job()).overloadDetection.enabled, false);
   assert.deepEqual((await job()).overloadDetection.points.map((point) => point.count), counts);
+  assert.deepEqual((await job()).overloadDetection.points.map((point) => point.requestCount), requestCounts, "request history survives restart");
   await toggle(true);
   await populated();
   await stop(); await start(); await populated();
   assert.equal((await job()).overloadDetection.enabled, true);
-  console.log("PASS: overload HTTP auth, validation, missing config/job, default-off, exact per-email remote IDs, six hourly counts, switch persistence, paused history, enabled restart/backfill");
+  await toggle(false);
+  const settingsResponse = await fetch(`${base}/api/task-settings`, { method: "POST", headers, body: JSON.stringify({
+    autoActions: { plus: ["enable-overload-detection"] },
+  }) });
+  assert.equal(settingsResponse.status, 200);
+  const imported = await fetch(`${base}/api/jobs/batch`, { method: "POST", headers, body: JSON.stringify({ text: emails[0] }) });
+  assert.equal(imported.status, 201, await imported.clone().text());
+  for (let i = 0; i < 100; i++) {
+    const entry = await job();
+    if (entry.overloadDetection.enabled && entry.autoTaskStatus === "completed") break;
+    if (i === 99) throw new Error(`automatic detection did not complete: ${JSON.stringify({ status: entry.autoTaskStatus, error: entry.autoTaskError, plan: entry.planType })}`);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.equal((await job(ids[1])).overloadDetection.enabled, false, "auto action affects only imported account");
+  await populated();
+  console.log("PASS: overload HTTP auth, validation, six-hour overload+request counts, success+failure pagination, switch/history persistence, enabled restart/backfill, imported PlanType auto-enables detection and isolates other accounts");
   if (process.argv.includes("--serve")) {
     const metadata = { url: base, output, emails, ids };
     await fs.writeFile(path.join(root, "tmp/overload-detection-20261031/browser-fixture.json"), JSON.stringify(metadata, null, 2));
